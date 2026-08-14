@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Vet & format
+        run: |
+          go vet ./...
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: Test
+        run: go test -race ./...
+      - name: Validate example config
+        run: go run ./cmd/optictrace validate -config optic.yaml
+      - name: Build Gin SDK
+        working-directory: sdks/gin
+        run: go build ./... && go vet ./...
+
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build dashboard
+        working-directory: ui
+        run: npm ci --no-audit --no-fund && npm run build
+
+  sdks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Express SDK tests
+        working-directory: sdks/express
+        run: npm install --no-audit --no-fund && npm test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: FastAPI SDK tests
+        working-directory: sdks/fastapi
+        run: pip install pyyaml && python test_middleware.py
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t optictrace:ci .

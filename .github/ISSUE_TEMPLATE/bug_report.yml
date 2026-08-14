@@ -1,0 +1,40 @@
+name: Bug report
+description: Something misbehaves (NOT for telemetry leaks — see SECURITY note in CONTRIBUTING.md)
+labels: [bug, triage]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did you observe instead?
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: optic.yaml (redact anything sensitive)
+      render: yaml
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Start the agent with ...
+        2. curl ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: output of `optictrace version` / SDK package version
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options: [agent (proxy), agent (metrics/store/admin), dashboard, express sdk, fastapi sdk, gin sdk, docs]
+    validations:
+      required: true

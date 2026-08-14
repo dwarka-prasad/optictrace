@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "optictrace-fastapi"
+version = "0.2.0"
+description = "OpticTrace middleware for FastAPI/ASGI — config-driven API telemetry & governance"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+dependencies = ["pyyaml>=6.0"]
+keywords = ["observability", "api", "monitoring", "redaction", "fastapi", "asgi"]
+
+[project.urls]
+Homepage = "https://github.com/dwarka-prasad/optictrace"

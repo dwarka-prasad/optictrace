@@ -1,0 +1,51 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/dwarka-prasad/optictrace
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  proxyPort: 8080
+  adminPort: 9095
+
+# Prometheus Operator integration (requires the ServiceMonitor CRD).
+serviceMonitor:
+  enabled: false
+  interval: 15s
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+persistence:
+  enabled: false # PVC for the SQLite payload store
+  size: 1Gi
+  storageClass: ""
+
+# Rendered verbatim into the ConfigMap as optic.yaml.
+config:
+  version: 1
+  service:
+    name: my-api
+    listen: ":8080"
+    upstream: "http://my-api-backend:80"
+  telemetry:
+    admin_listen: ":9095"
+    store:
+      driver: sqlite
+      dsn: /data/optictrace.db
+  defaults:
+    capture:
+      request_body: true
+      response_body: true
+      headers: true
+  rules:
+    - name: no-capture-on-auth
+      match:
+        path: "/auth/**"
+      restrict: [request_body, response_body, headers]

@@ -1,0 +1,8 @@
+apiVersion: v2
+name: optictrace
+description: Declarative API telemetry & governance sidecar/gateway
+type: application
+version: 0.2.0
+appVersion: "0.2.0"
+keywords: [observability, api-gateway, prometheus, redaction]
+home: https://github.com/dwarka-prasad/optictrace

@@ -1,0 +1,134 @@
+# =============================================================================
+# optic.yaml — OpticTrace declarative telemetry & governance specification
+# =============================================================================
+# Philosophy: OPT-OUT by default. Everything is captured unless a rule says
+# otherwise. Rules are evaluated top-to-bottom; every rule whose `match` block
+# matches the request contributes to the final policy (later rules win on
+# conflicting capture flags; redactions and labels accumulate).
+#
+# Path globbing:
+#   *   matches exactly one path segment   (/api/*/health)
+#   **  matches zero or more segments      (/api/v1/payments/**)
+#   Standard shell patterns work inside a segment (/api/v1/user-*)
+# =============================================================================
+
+version: 1
+
+service:
+  name: payments-api
+  # Address the OpticTrace proxy listens on (standalone sidecar mode).
+  listen: ":8080"
+  # The upstream service traffic is forwarded to.
+  upstream: "http://localhost:9000"
+
+# Observability sinks: Prometheus /metrics, the developer dashboard, and the
+# payload store all hang off a SEPARATE admin listener so you can firewall it
+# away from proxied traffic.
+telemetry:
+  admin_listen: ":9095"
+  console_log: true          # structured JSON telemetry on stdout
+  metrics:
+    enabled: true
+    # buckets: [0.005, 0.05, 0.5, 5]   # override latency histogram bounds (seconds)
+  store:
+    driver: sqlite            # sqlite | none
+    dsn: optictrace.db
+    queue_size: 4096          # async write queue; overflow drops (never blocks)
+    retention_max_rows: 100000
+  # Output plugins: every governed record (post-restriction, post-redaction)
+  # also fans out to these destinations. Three types are built in:
+  #   file     append JSONL, rotated at max_size_mb
+  #   webhook  POST JSON batches to an HTTP endpoint
+  #   command  CUSTOM PLUGIN — stream JSONL to any executable's stdin
+  # exporters:
+  #   - name: audit-log
+  #     type: file
+  #     path: ./export/audit.jsonl
+  #   - name: siem
+  #     type: webhook
+  #     url: https://siem.internal/ingest
+  #     headers: { Authorization: "Bearer ..." }
+  #     batch_size: 100
+  #     flush_interval: 5s
+  #   - name: my-plugin
+  #     type: command
+  #     command: ["python3", "examples/exporters/csv_exporter.py", "traffic.csv"]
+  # FinOps: attribute usage & cost per consumer (grouped by a label you
+  # already extract, priced by the models below). See the Usage dashboard
+  # page and GET /api/usage.
+  billing:
+    consumer_label: tenant
+    currency: USD
+    prices:
+      per_request: 0.0001
+      per_gb: 0.05
+      per_meter_unit:
+        tokens: 0.000002        # e.g. $2 per 1M LLM tokens
+
+defaults:
+  capture:
+    request_body: true
+    response_body: true
+    headers: true
+  # Max bytes of each body persisted into telemetry (bodies are still proxied
+  # in full — this only bounds what OpticTrace records).
+  capture_limit_bytes: 65536
+
+rules:
+  # ---------------------------------------------------------------------------
+  # RESTRICTION: never capture bodies or headers on authentication routes.
+  # ---------------------------------------------------------------------------
+  - name: no-capture-on-auth
+    match:
+      path: "/api/v1/auth/**"
+    restrict: [request_body, response_body, headers]
+
+  # ---------------------------------------------------------------------------
+  # REDACTION: payments flow — scrub credentials from headers and mask
+  # sensitive JSON fields in captured payloads. Traffic itself is untouched;
+  # redaction applies to what OpticTrace records.
+  # ---------------------------------------------------------------------------
+  - name: redact-payment-secrets
+    match:
+      path: "/api/v1/payments/**"
+      methods: [POST, PUT, PATCH]
+    redact:
+      headers:
+        - Authorization
+        - X-Api-Key
+        - Cookie
+      json_fields:
+        # `**` = recursive descent: match the field at ANY nesting depth,
+        # so an upstream echoing the payload back can't leak it either.
+        - "$.**.credit_card.number"
+        - "$.**.credit_card.cvv"
+        - "$.**.customer.email"
+        - "$.*.ssn"            # `*` = any single key: ssn under any top-level object
+    labels:
+      tenant: "header:X-Tenant-ID"   # becomes a Prometheus dimension + log field
+      region: "header:X-Region"
+    # sample: 0.25   # capture bodies for 25% of matched requests (metrics stay full)
+
+  # ---------------------------------------------------------------------------
+  # METERING: extract numeric usage from responses (here: LLM token counts)
+  # for per-tenant cost attribution. Metering works even when body capture
+  # is restricted — the payload is read for the number, never stored.
+  # ---------------------------------------------------------------------------
+  - name: meter-ai-tokens
+    match:
+      path: "/api/v1/ai/**"
+    restrict: [request_body, response_body]   # prompts/completions stay private
+    meter:
+      tokens: "$.usage.total_tokens"
+    labels:
+      tenant: "header:X-Tenant-ID"
+
+  # ---------------------------------------------------------------------------
+  # RESTRICTION + REDACTION can combine: webhooks keep headers but no bodies.
+  # ---------------------------------------------------------------------------
+  - name: webhooks-metadata-only
+    match:
+      path: "/webhooks/*"
+    restrict: [request_body, response_body]
+    redact:
+      headers: [X-Webhook-Signature]

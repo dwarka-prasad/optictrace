@@ -1,0 +1,41 @@
+# Local evaluation stack: OpticTrace + a demo upstream + Prometheus.
+#
+#   docker compose up --build
+#
+#   http://localhost:8080  -> proxied demo API
+#   http://localhost:9095  -> OpticTrace dashboard, /metrics, /api/*
+#   http://localhost:9090  -> Prometheus (pre-configured scrape)
+
+services:
+  optictrace:
+    build: .
+    ports:
+      - "8080:8080"   # proxied traffic
+      - "9095:9095"   # admin: dashboard + /metrics + APIs
+    volumes:
+      - ./deploy/compose/optic.yaml:/etc/optictrace/optic.yaml:ro
+      - optic-data:/data
+    depends_on:
+      - demo-upstream
+    restart: unless-stopped
+
+  demo-upstream:
+    build:
+      context: .
+      dockerfile: deploy/compose/Dockerfile.mocktarget
+    expose:
+      - "9000"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/compose/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    restart: unless-stopped
+
+volumes:
+  optic-data:
+  prom-data:

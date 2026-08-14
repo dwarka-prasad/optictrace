@@ -1,0 +1,27 @@
+{
+  "name": "@optictrace/express",
+  "version": "0.2.0",
+  "description": "OpticTrace middleware for Express — config-driven API telemetry & governance",
+  "license": "Apache-2.0",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "engine.js"],
+  "scripts": {
+    "test": "node test/smoke.test.js"
+  },
+  "keywords": ["observability", "api", "monitoring", "redaction", "express", "middleware"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dwarka-prasad/optictrace",
+    "directory": "sdks/express"
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.0"
+  },
+  "peerDependencies": {
+    "express": ">=4"
+  },
+  "devDependencies": {
+    "express": "^4.19.0"
+  }
+}

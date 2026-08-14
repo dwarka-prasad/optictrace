@@ -1,0 +1,277 @@
+// Package engine compiles an optic.yaml Config into an immutable, allocation-
+// light rule engine evaluated on every request.
+//
+// Compilation happens once at startup: path globs are pre-split into segments
+// and method lists become sets, so the per-request hot path is a linear scan
+// of cheap comparisons — no regex, no locks, no allocation beyond the Policy.
+package engine
+
+import (
+	"net/http"
+	"path"
+	"regexp"
+	"sort"
+	"strings"
+
+	"github.com/dwarka-prasad/optictrace/internal/config"
+)
+
+// LabelSource describes where a custom metric label's value comes from.
+type LabelSource struct {
+	Kind string // "header" or "query"
+	Key  string // e.g. "X-Tenant-ID"
+}
+
+// Extract pulls the label value out of a request. Missing values return "".
+func (s LabelSource) Extract(r *http.Request) string {
+	switch s.Kind {
+	case "header":
+		return r.Header.Get(s.Key)
+	case "query":
+		return r.URL.Query().Get(s.Key)
+	}
+	return ""
+}
+
+// Policy is the fully-resolved governance decision for one request:
+// the merge of the defaults and every matching rule, in order.
+type Policy struct {
+	CaptureRequestBody  bool
+	CaptureResponseBody bool
+	CaptureHeaders      bool
+	CaptureLimitBytes   int64
+
+	// RedactHeaders holds canonical header names whose values are masked
+	// in captured telemetry.
+	RedactHeaders map[string]struct{}
+	// RedactJSONPaths holds pre-split dotted paths ($.a.b -> ["a","b"]).
+	RedactJSONPaths [][]string
+	Labels          map[string]LabelSource
+
+	// MatchedRules records which rule names fired (for log transparency).
+	MatchedRules []string
+
+	// RoutePattern is the glob of the last matched rule — a stable,
+	// low-cardinality identifier for metrics ("/api/v1/payments/**" instead
+	// of one series per payment ID). Empty when no rule matched.
+	RoutePattern string
+
+	// SampleRate is the fraction of matched requests whose bodies are
+	// captured (1.0 = all). Metrics and metadata ignore sampling.
+	SampleRate float64
+
+	// Meters maps meter names to pre-split response-body JSON paths whose
+	// numeric values are extracted for usage/cost attribution. Metering is
+	// independent of capture restriction and sampling.
+	Meters map[string][][]string
+}
+
+// CapturesAnything reports whether any telemetry channel is open.
+func (p *Policy) CapturesAnything() bool {
+	return p.CaptureRequestBody || p.CaptureResponseBody || p.CaptureHeaders
+}
+
+type compiledRule struct {
+	name        string
+	rawPattern  string
+	sample      *float64
+	pathSegs    []string
+	methods     map[string]struct{} // nil = all methods
+	restrict    []config.CaptureField
+	redactHdrs  []string
+	redactPaths [][]string
+	labels      map[string]LabelSource
+	meters      map[string][]string
+}
+
+// Engine is safe for concurrent use after New returns.
+type Engine struct {
+	defaults config.Defaults
+	rules    []compiledRule
+}
+
+// New compiles a validated Config. Config must have passed Validate().
+func New(cfg *config.Config) *Engine {
+	e := &Engine{defaults: cfg.Defaults}
+	for _, r := range cfg.Rules {
+		cr := compiledRule{
+			name:       r.Name,
+			rawPattern: r.Match.Path,
+			sample:     r.Sample,
+			pathSegs:   splitPath(r.Match.Path),
+			restrict:   r.Restrict,
+		}
+		if len(r.Match.Methods) > 0 {
+			cr.methods = make(map[string]struct{}, len(r.Match.Methods))
+			for _, m := range r.Match.Methods {
+				cr.methods[m] = struct{}{}
+			}
+		}
+		if r.Redact != nil {
+			for _, h := range r.Redact.Headers {
+				cr.redactHdrs = append(cr.redactHdrs, http.CanonicalHeaderKey(h))
+			}
+			for _, jp := range r.Redact.JSONFields {
+				// "$.credit_card.number" -> ["credit_card", "number"]
+				cr.redactPaths = append(cr.redactPaths, strings.Split(strings.TrimPrefix(jp, "$."), "."))
+			}
+		}
+		if len(r.Labels) > 0 {
+			cr.labels = make(map[string]LabelSource, len(r.Labels))
+			for k, src := range r.Labels {
+				kind, key, _ := strings.Cut(src, ":")
+				cr.labels[k] = LabelSource{Kind: kind, Key: key}
+			}
+		}
+		if len(r.Meter) > 0 {
+			cr.meters = make(map[string][]string, len(r.Meter))
+			for name, jp := range r.Meter {
+				cr.meters[name] = strings.Split(strings.TrimPrefix(jp, "$."), ".")
+			}
+		}
+		e.rules = append(e.rules, cr)
+	}
+	return e
+}
+
+// Evaluate resolves the effective Policy for a method + URL path.
+// Rules merge in declaration order: restrictions only ever narrow capture,
+// redactions and labels accumulate.
+func (e *Engine) Evaluate(method, urlPath string) Policy {
+	p := Policy{
+		CaptureRequestBody:  config.Bool(e.defaults.Capture.RequestBody),
+		CaptureResponseBody: config.Bool(e.defaults.Capture.ResponseBody),
+		CaptureHeaders:      config.Bool(e.defaults.Capture.Headers),
+		CaptureLimitBytes:   e.defaults.CaptureLimitBytes,
+		SampleRate:          1.0,
+	}
+	reqSegs := splitPath(urlPath)
+
+	for i := range e.rules {
+		r := &e.rules[i]
+		if r.methods != nil {
+			if _, ok := r.methods[method]; !ok {
+				continue
+			}
+		}
+		if !matchSegments(r.pathSegs, reqSegs) {
+			continue
+		}
+
+		p.MatchedRules = append(p.MatchedRules, r.name)
+		p.RoutePattern = r.rawPattern
+		if r.sample != nil {
+			p.SampleRate = *r.sample
+		}
+		for _, f := range r.restrict {
+			switch f {
+			case config.FieldRequestBody:
+				p.CaptureRequestBody = false
+			case config.FieldResponseBody:
+				p.CaptureResponseBody = false
+			case config.FieldHeaders:
+				p.CaptureHeaders = false
+			}
+		}
+		if len(r.redactHdrs) > 0 {
+			if p.RedactHeaders == nil {
+				p.RedactHeaders = make(map[string]struct{})
+			}
+			for _, h := range r.redactHdrs {
+				p.RedactHeaders[h] = struct{}{}
+			}
+		}
+		p.RedactJSONPaths = append(p.RedactJSONPaths, r.redactPaths...)
+		if len(r.labels) > 0 {
+			if p.Labels == nil {
+				p.Labels = make(map[string]LabelSource)
+			}
+			for k, v := range r.labels {
+				p.Labels[k] = v
+			}
+		}
+		if len(r.meters) > 0 {
+			if p.Meters == nil {
+				p.Meters = make(map[string][][]string)
+			}
+			for name, path := range r.meters {
+				p.Meters[name] = append(p.Meters[name], path)
+			}
+		}
+	}
+	return p
+}
+
+// LabelKeys returns the sorted union of custom label names across all rules.
+// Prometheus requires a fixed label schema per metric, so the collector is
+// built once from this set; requests missing a label export "".
+func (e *Engine) LabelKeys() []string {
+	set := map[string]struct{}{}
+	for i := range e.rules {
+		for k := range e.rules[i].labels {
+			set[k] = struct{}{}
+		}
+	}
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+var (
+	uuidRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	hexRe  = regexp.MustCompile(`^[0-9a-fA-F]{16,}$`)
+	numRe  = regexp.MustCompile(`^\d+$`)
+)
+
+// NormalizeRoute collapses identifier-looking path segments (numbers, UUIDs,
+// long hex tokens) into ":id" so unmatched routes still produce bounded
+// metric cardinality: /api/v1/users/42 -> /api/v1/users/:id.
+func NormalizeRoute(urlPath string) string {
+	segs := splitPath(urlPath)
+	for i, s := range segs {
+		if numRe.MatchString(s) || uuidRe.MatchString(s) || hexRe.MatchString(s) {
+			segs[i] = ":id"
+		}
+	}
+	return "/" + strings.Join(segs, "/")
+}
+
+// splitPath normalizes "/api/v1/x/" into ["api", "v1", "x"].
+func splitPath(s string) []string {
+	s = strings.Trim(s, "/")
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, "/")
+}
+
+// matchSegments implements segment-wise globbing: "*" matches exactly one
+// segment (shell patterns also work within a segment), while "**" matches
+// zero or more segments.
+func matchSegments(pattern, segs []string) bool {
+	if len(pattern) == 0 {
+		return len(segs) == 0
+	}
+	if pattern[0] == "**" {
+		if len(pattern) == 1 {
+			return true
+		}
+		for i := 0; i <= len(segs); i++ {
+			if matchSegments(pattern[1:], segs[i:]) {
+				return true
+			}
+		}
+		return false
+	}
+	if len(segs) == 0 {
+		return false
+	}
+	ok, err := path.Match(pattern[0], segs[0])
+	if err != nil || !ok {
+		return false
+	}
+	return matchSegments(pattern[1:], segs[1:])
+}

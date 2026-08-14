@@ -1,0 +1,12 @@
+bin/
+*.db
+*.db-shm
+*.db-wal
+node_modules/
+__pycache__/
+*.pyc
+dist/
+.next/
+ui/out/
+ui/next-env.d.ts
+*.tsbuildinfo
