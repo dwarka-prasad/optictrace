@@ -8,18 +8,38 @@ One `optic.yaml` controls what your API traffic reveals: which routes are monito
 which payloads are captured, what gets redacted, and which request attributes become
 Prometheus dimensions.
 
-[Quickstart](#quickstart) · [How it works](#how-it-works) · [`optic.yaml` reference](#opticyaml-reference) ·
-[Dashboard](#developer-dashboard) · [SDKs](#framework-sdks) · [Deploy](#deployment) · [Contributing](CONTRIBUTING.md)
+[![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Status](https://img.shields.io/badge/status-v0.4.0--dev-orange)](#roadmap)
 
 </div>
 
 ---
 
+## Contents
+
+- [Why OpticTrace?](#why-optictrace)
+- [How it works](#how-it-works) — [request flow](#request-flow-two-lanes-one-tee-point) · [architecture](#architecture-components-and-who-talks-to-whom)
+- [Quickstart](#quickstart)
+- [`optic.yaml` reference](#opticyaml-reference)
+- [What's supported today](#whats-supported-today)
+- [Surfaces](#surfaces) — [CLI](#cli) · [control-plane API](#control-plane-api-9095) · [metrics](#metrics-exposed)
+- [Traffic-powered tooling](#traffic-powered-tooling)
+- [Export plugins](#export-plugins)
+- [Framework SDKs](#framework-sdks)
+- [Developer dashboard](#developer-dashboard)
+- [Deployment](#deployment)
+- [Verified behavior](#verified-behavior)
+- [Roadmap](#roadmap) — what to build next, and why
+- [Contributing](#contributing)
+
+---
+
 ## Why OpticTrace?
 
-API observability usually means choosing between two bad options: log everything
-(and leak credit cards into your log pipeline) or log nothing useful. OpticTrace
-makes the trade-off **declarative and reviewable**:
+API observability usually forces a bad trade: log everything (and leak credit cards into
+your log pipeline) or log nothing useful. OpticTrace makes the trade-off **declarative and
+reviewable**:
 
 ```yaml
 rules:
@@ -33,39 +53,147 @@ rules:
 ```
 
 - 🔍 **Capture-by-default, restrict-by-rule** — everything is observable unless a rule says otherwise, and the rules live in your repo where they get code-reviewed.
-- 🛡️ **Traffic is never mutated** — governance applies to what gets *recorded*, clients and upstreams always see original bytes.
-- 📊 **Prometheus-native** — request counts, error rates, P50/P95/P99 latency histograms per route, plus your own label dimensions extracted from headers or query params.
-- 🖥️ **Built-in developer dashboard** — live charts, a searchable request inspector (redactions visible), and a config linter, served by the same single binary.
+- 🛡️ **Traffic is never mutated** — governance applies to what gets *recorded*; clients and upstreams always see original bytes.
+- 📊 **Prometheus-native** — request counts, error rates, P50/P95/P99 per route, plus your own label dimensions extracted from headers or query params.
+- 🖥️ **Built-in developer dashboard** — live charts, a searchable request inspector, a config linter, served by the same single binary.
 - ⚡ **Built for the hot path** — rules compile once at startup; restricted routes skip capture entirely; body capture is size-bounded; storage is async and drops rather than blocks.
 
-And because OpticTrace owns your real traffic history, it can do things static tools can't:
+And because OpticTrace owns your real traffic history, it does things static tools can't:
 
-- 🧬 **Traffic → OpenAPI → SDK** — `optictrace spec` infers a spec from what clients *actually* send (stale-docs killer); `optictrace sdk` emits a typed TypeScript client from it.
-- 🚨 **Breaking-change linter** — `optictrace check -spec proposed.yaml` answers *"is any live client actually using the field I'm about to remove?"* with usage counts and last-seen times. CI-native (exit 1 on breaking).
-- 🎭 **Stateful mock server** — `optictrace mock -spec openapi.yaml` spins up a mock where `POST /cart` then `GET /cart` really returns the added item; optional AI-generated responses via Claude.
-- 💰 **FinOps metering** — extract usage figures (e.g. LLM token counts) from responses per rule, attribute cost per tenant, export billing CSVs.
+- 🧬 **Traffic → OpenAPI → SDK** — `optictrace spec` infers a spec from what clients *actually* send; `optictrace sdk` emits a typed TypeScript client.
+- 🚨 **Breaking-change linter** — `optictrace check` answers *"is any live client actually using the field I'm about to remove?"* with usage counts and last-seen times. Exits non-zero in CI.
+- 🎭 **Stateful mock server** — `optictrace mock` gives you a mock where `POST /cart` then `GET /cart` really returns the added item; optional AI-generated responses via Claude.
+- 💰 **FinOps metering** — extract usage figures (e.g. LLM token counts) from responses, attribute cost per tenant, export billing CSVs.
+
+---
 
 ## How it works
 
-```
-                        ┌────────────────────────────────────────────┐
-             :8080      │  OpticTrace agent                          │
-  client ─────────────▶ │  1. evaluate optic.yaml rules (per req)    │ ──▶ upstream
-                        │  2. tee bounded copies of traffic          │ ◀── response
-  client ◀───────────── │  3. restrict / redact captured telemetry   │
-                        │  4. fan out: console · Prometheus · SQLite │
-                        └───────────────┬────────────────────────────┘
-                                :9095   │ admin listener (firewall separately)
-                 ┌──────────────┬───────┴──────┬─────────────────┐
-                 ▼              ▼              ▼                 ▼
-             /metrics      dashboard      /api/logs        /api/ingest
-            (Prometheus)   (Next.js)     (inspector)     (framework SDKs)
+### The idea
+
+Everything is captured by default; rules **subtract** from that baseline. The governing
+invariant makes this safe to adopt:
+
+> **Live traffic is never modified.** Restriction and redaction apply only to the telemetry
+> OpticTrace *records*. A rule that masks `$.credit_card.number` does not strip the card
+> number from the payment request — the payment still works. It strips it from what gets
+> logged, stored, and exported.
+
+### Request flow: two lanes, one tee point
+
+A request travels one path while its telemetry travels another. The traffic lane is a plain
+reverse proxy. The telemetry lane branches off a **bounded copy** and is where all
+governance happens.
+
+```mermaid
+flowchart LR
+    C(["Client"])
+    P["OpticTrace :8080"]
+    U(["Your service"])
+
+    subgraph tel ["TELEMETRY LANE - governed before anything is written"]
+        direction LR
+        G["1 - Evaluate<br/>match rules, merge policy"]
+        A["2 - Attach<br/>buffers, or skip entirely"]
+        O["3 - Observe<br/>status, latency, bytes"]
+        V["4 - Govern<br/>restrict, redact, meter"]
+        F["5 - Fan out<br/>one canonical record"]
+        G --> A --> O --> V --> F
+    end
+
+    S1["Console<br/>structured JSON"]
+    S2["Prometheus<br/>metrics endpoint"]
+    S3["SQLite<br/>async, drops before blocking"]
+    S4["Exporters<br/>file, webhook, plugin"]
+
+    C -->|"request"| P
+    P -->|"forwarded verbatim"| U
+    U -.->|"response"| P
+    P -.->|"returned byte-for-byte"| C
+    P ==>|"bounded copy"| G
+    F --> S1
+    F --> S2
+    F --> S3
+    F --> S4
+
+    style P fill:#0a6b89,stroke:#0a6b89,color:#ffffff
+    style tel fill:#f6ebd6,stroke:#8e5c0d,color:#8e5c0d
 ```
 
-Two deployment modes share one code path:
+| Stage | What happens | Why it matters |
+|---|---|---|
+| **1 · Evaluate** | Method + path matched against compiled rules; every match merges into one policy | Rules compile once at startup — the hot path is a linear scan of cheap comparisons |
+| **2 · Attach** | Capture buffers wired up — or skipped entirely | The policy resolves *before* capture attaches, so a restricted route allocates **no buffers at all** |
+| **3 · Observe** | Upstream runs; status, latency and byte counts recorded | Metadata is always recorded, even when payload capture is fully restricted |
+| **4 · Govern** | Restricted fields dropped, redacted fields masked, labels and meters extracted | Nothing downstream ever sees raw sensitive data |
+| **5 · Fan out** | One canonical record handed to every sink | Console, Prometheus, store and exporters all receive the *same governed record* |
+
+**Why a bounded copy:** capture is capped at `capture_limit_bytes` (64 KB default) and
+flagged as truncated on overflow. A 2 GB upload streams through to the upstream at full
+speed while telemetry stays small — the tap never becomes a bottleneck.
+
+### Architecture: components, and who talks to whom
+
+Traffic and control plane listen on **separate ports** by design, so the dashboard and
+metrics can be firewalled independently of the API being proxied.
+
+```mermaid
+flowchart TB
+    subgraph ing ["INGRESS"]
+        direction LR
+        I1["Sidecar :8080"]
+        I2["Go middleware<br/>embedded in your app"]
+        I3["SDK ingest<br/>Express, FastAPI, Gin"]
+    end
+
+    subgraph core ["CORE"]
+        direction LR
+        E["Rule engine<br/>compiled globs, hot-swappable"]
+        X["Interceptor<br/>tees, applies policy, builds record"]
+    end
+
+    subgraph sink ["SINKS"]
+        direction LR
+        M["Collector<br/>private Prometheus registry"]
+        W["Async writer<br/>bounded queue to SQLite"]
+        D["Dispatcher<br/>per-exporter queues"]
+        L["Logger<br/>slog JSON"]
+    end
+
+    subgraph ctrl ["CONTROL PLANE :9095"]
+        direction LR
+        API["Admin API<br/>logs, stats, usage, reload"]
+        MET["Metrics endpoint"]
+        UI["Dashboard<br/>Next.js static export"]
+    end
+
+    subgraph tools ["OFFLINE TOOLS - read the captured history"]
+        direction LR
+        T1["spec<br/>to OpenAPI"]
+        T2["check<br/>spec vs. usage"]
+        T3["sdk<br/>to TypeScript"]
+        T4["mock<br/>to stateful server"]
+    end
+
+    ing --> core
+    core --> sink
+    M --> ctrl
+    W --> ctrl
+    D --> ctrl
+    W -.-> tools
+
+    style core fill:#0a6b89,stroke:#0a6b89,color:#ffffff
+```
+
+Everything above ships in a **single binary** — the dashboard is compiled in as static files.
+The offline tools are commands you run against captured history, not long-running services.
+
+**Two deployment modes share one code path:**
 
 - **Sidecar / gateway** — `optictrace run` reverse-proxies to your service.
-- **Embedded** — native middleware inside your app: [Go](#go--nethttp--gin), [Express](#nodejs--express), [FastAPI](#python--fastapi). SDKs apply governance **in-process** (sensitive data never leaves your app raw) and ship governed records to the agent.
+- **Embedded** — native middleware inside your app ([Go](#go--net-http--gin), [Express](#nodejs--express), [FastAPI](#python--fastapi)). SDKs apply governance **in-process**, so sensitive data never leaves your app raw, then ship governed records to the agent.
+
+---
 
 ## Quickstart
 
@@ -93,32 +221,53 @@ go build -o bin/ ./cmd/...
 
 Send traffic through `service.listen`, then open `http://localhost:9095`.
 
+---
+
 ## `optic.yaml` reference
 
+Parsing is **strict**: unknown keys are rejected rather than silently ignored, so a typo
+like `restirct:` fails at load instead of quietly disabling your governance.
+
 ```yaml
+# ── identity ──────────────────────────────────────────────
 version: 1
 
 service:
   name: payments-api
-  listen: ":8080"                    # sidecar listen address
-  upstream: "http://localhost:9000"  # where traffic is forwarded
+  listen: ":8080"                    # proxied traffic
+  upstream: "http://localhost:9000"
 
+# ── where telemetry goes ──────────────────────────────────
 telemetry:
-  admin_listen: ":9095"              # metrics + dashboard + APIs
+  admin_listen: ":9095"              # dashboard + /metrics + APIs
   console_log: true                  # structured JSON on stdout
   metrics:
     enabled: true
-    buckets: [0.005, 0.05, 0.5, 5]   # optional latency histogram bounds (s)
+    buckets: [0.005, 0.05, 0.5, 5]   # latency histogram bounds (seconds)
   store:
     driver: sqlite                   # sqlite | none
     dsn: optictrace.db
     queue_size: 4096                 # async queue; overflow drops, never blocks
     retention_max_rows: 100000       # oldest rows pruned
+  exporters:                         # fan out governed records
+    - { name: audit, type: file,    path: ./export/audit.jsonl }
+    - { name: siem,  type: webhook, url: "https://siem.internal/ingest",
+        headers: { Authorization: "Bearer ..." }, batch_size: 100, flush_interval: 5s }
+    - { name: mine,  type: command, command: ["python3", "my_exporter.py"] }
+  billing:                           # cost attribution (FinOps)
+    consumer_label: tenant
+    currency: USD
+    prices:
+      per_request: 0.0001
+      per_gb: 0.05
+      per_meter_unit: { tokens: 0.000002 }   # $2 per 1M tokens
 
+# ── the opt-out baseline ──────────────────────────────────
 defaults:
   capture: { request_body: true, response_body: true, headers: true }
   capture_limit_bytes: 65536         # per-body telemetry cap (traffic unaffected)
 
+# ── rules: evaluated top-to-bottom, actions merge ─────────
 rules:
   - name: no-capture-on-auth
     match:
@@ -139,27 +288,138 @@ rules:
       plan:   "query:plan"
     sample: 0.25                     # capture bodies for 25% of matches
                                      # (metrics & metadata stay complete)
+
+  - name: meter-ai-tokens
+    match: { path: "/api/v1/ai/**" }
+    restrict: [request_body, response_body]   # prompts stay private...
+    meter:
+      tokens: "$.usage.total_tokens"          # ...but tokens are still counted
 ```
 
-**Rule semantics:** rules evaluate top-to-bottom and *merge* — restrictions only
-ever narrow capture; redactions and labels accumulate; later rules win on
-conflicting scalars. Arrays traverse implicitly (`$.items.price` covers every
-element of `items`).
+**How rules merge.** Rules are *not* first-match-wins. Every matching rule contributes:
+restrictions only ever **narrow** capture, while redactions, labels and meters
+**accumulate**. Later rules win on conflicting scalars like `sample`. That lets a broad
+redaction rule and a narrow restriction rule compose instead of fighting.
 
-**Hot reload:** `kill -HUP <pid>` or `POST /api/reload` — the rule engine swaps
-atomically; in-flight requests finish under their old policy. An invalid config
-is rejected and the old rules stay live.
+**Arrays and depth.** JSON paths traverse arrays implicitly, so `$.items.price` covers every
+element of an `items` list. `$.**` descends to any depth — which matters when an upstream
+echoes a payload back inside a wrapper and would otherwise leak the field you just masked.
 
-## Prometheus metrics
+**Hot reload.** `kill -HUP <pid>` or `POST /api/reload` swaps the rule engine atomically;
+in-flight requests finish under their old policy. An invalid config is rejected and the old
+rules stay live.
+
+---
+
+## What's supported today
+
+✅ Shipped · 🟡 Partial or deliberate limit · ⬜ Not yet
+
+### Governance engine
+
+| Capability | Status | Notes |
+|---|:--:|---|
+| Path globbing | ✅ | `*` = one segment, `**` = zero or more; shell patterns inside a segment; optional method filters |
+| Restriction | ✅ | Disable `request_body`, `response_body` or `headers` capture per rule |
+| Redaction | ✅ | Mask headers by name and JSON fields by path, incl. wildcard and recursive descent |
+| Custom labels | ✅ | Extracted from headers or query params; become real Prometheus dimensions |
+| Body sampling | ✅ | Capture payloads for a fraction of matches; metrics and metadata stay complete |
+| Metering | ✅ | Pull numbers out of responses by JSON path — works even on fully restricted routes |
+| Hot reload | ✅ | `SIGHUP` or API; invalid configs rejected, old rules stay live |
+| Strict validation | ✅ | Unknown keys rejected at load; `optictrace validate` for CI |
+
+### Observability & storage
+
+| Capability | Status | Notes |
+|---|:--:|---|
+| Prometheus exporter | ✅ | Ten metric families on a **private registry**, so embedding never collides with an app's own |
+| Bounded cardinality | ✅ | `route` is always a rule glob or normalized pattern — `/users/42` → `/users/:id` |
+| SQLite payload store | ✅ | Pure-Go driver (no CGO), WAL mode, async writer that drops under backpressure, retention pruning |
+| Custom-label cardinality | 🟡 | Label *values* come from arbitrary headers and are **not** capped — see [roadmap](#tier-1--closes-a-real-risk) |
+| ClickHouse / Postgres | ⬜ | `LogStore` is driver-agnostic, but only `sqlite` and `none` are implemented |
+| OpenTelemetry export | ⬜ | Prometheus scrape is the supported path today |
+
+### Export plugins
+
+| Capability | Status | Notes |
+|---|:--:|---|
+| `file` | ✅ | Appends JSON Lines, rotates at a size threshold |
+| `webhook` | ✅ | POSTs batched JSON arrays with custom headers; one retry, then the batch counts as failed |
+| `command` — **custom plugin hook** | ✅ | Spawns any executable, streams one JSON record per line to stdin; stderr folded into the agent log; crashed plugins restart with backoff |
+| Delivery guarantee | 🟡 | **At-most-once, deliberately.** Each exporter has its own bounded queue and worker, so a dead plugin drops only its own records and never stalls the request path |
+
+### Traffic-powered tooling
+
+| Capability | Status | Notes |
+|---|:--:|---|
+| Infer OpenAPI from traffic | ✅ | `required` = present in *every* request; `integer`+`float` widen to `number`; ID segments collapse to path templates; redacted fields still contribute name and type |
+| Breaking-change linter | ✅ | Reports usage counts and last-seen times; exits non-zero on breaking findings |
+| TypeScript SDK generation | ✅ | Dependency-free typed fetch client; passes `tsc --strict` |
+| Python / Go SDK generation | ⬜ | Schema traversal is generator-agnostic; only the TypeScript emitter exists |
+| Stateful mock server | ✅ | Real CRUD state on collection/item routes; schema-conforming data elsewhere with field-name heuristics |
+| AI-generated mock responses | 🟡 | Implemented behind `-ai` + `ANTHROPIC_API_KEY` with deterministic fallback, but **not yet exercised against the live API** |
+| Query-parameter capture | ⬜ | Query strings aren't captured, so inferred specs cover path params and bodies only |
+
+### Integration & deployment
+
+| Capability | Status | Notes |
+|---|:--:|---|
+| Sidecar + embedded modes | ✅ | Reverse proxy and Go `http.Handler` middleware sharing one interception path |
+| Express / FastAPI / Gin SDKs | ✅ | Express and FastAPI carry semantically identical engine ports, so redaction happens in-process |
+| Docker / Compose / Helm | ✅ | Multi-stage non-root image; Compose stack with Prometheus; chart with probes, optional PVC and ServiceMonitor |
+| Admin-port authentication | 🟡 | **None** — trusted-network-by-deployment, which is why it binds a separate port. Don't expose `:9095` publicly |
+| gRPC / GraphQL / WebSockets | ⬜ | JSON over HTTP is the supported surface; hijacked connections pass through uninspected |
+
+---
+
+## Surfaces
+
+### CLI
+
+| Command | Does |
+|---|---|
+| `optictrace run` | Start proxy + control plane |
+| `optictrace validate` | Lint `optic.yaml` (CI-friendly) |
+| `optictrace spec` | Infer OpenAPI from captured traffic |
+| `optictrace check` | Spec vs. live usage; exit 1 on breaking findings |
+| `optictrace sdk` | Generate a typed TypeScript client |
+| `optictrace mock` | Serve a stateful mock from a spec |
+| `optictrace version` | Print the build version |
+
+### Control-plane API `:9095`
+
+| Endpoint | Returns |
+|---|---|
+| `GET /metrics` | Prometheus exposition |
+| `GET /healthz` | Liveness + uptime |
+| `GET /api/logs` | Filtered captured exchanges |
+| `GET /api/logs/{id}` | One exchange in full |
+| `GET /api/stats` | Aggregates, time series, percentiles |
+| `GET /api/routes` | Per-route latency breakdown |
+| `GET /api/rules/stats` | Rules joined with live match counts |
+| `GET /api/usage` | Per-consumer usage and cost (`&format=csv`) |
+| `GET /api/spec` | OpenAPI inferred from traffic |
+| `GET /api/export` | CSV or JSONL download of captured records |
+| `GET /api/config` | Current config + validity |
+| `POST /api/config/validate` | Lint a candidate config |
+| `POST /api/reload` | Re-read config, hot-swap engine |
+| `POST /api/ingest` | Accept governed records from SDKs |
+| `GET /api/system` | Agent health, store size, exporter stats |
+
+### Metrics exposed
 
 | Metric | Type | Labels |
 |---|---|---|
-| `optictrace_requests_total` | counter | `method route status status_class` + your labels |
-| `optictrace_request_duration_seconds` | histogram | `method route` + your labels |
-| `optictrace_request_size_bytes` / `_response_size_bytes` | histogram | `method route` |
-| `optictrace_inflight_requests` | gauge | |
-| `optictrace_store_dropped_total` | counter | backpressure drops |
-| `optictrace_sdk_ingested_total` | counter | records from SDKs |
+| `optictrace_requests_total` | counter | `method route status status_class` + yours |
+| `optictrace_request_duration_seconds` | histogram | `method route` + yours |
+| `optictrace_request_size_bytes` | histogram | `method route` |
+| `optictrace_response_size_bytes` | histogram | `method route` |
+| `optictrace_inflight_requests` | gauge | — |
+| `optictrace_store_dropped_total` | counter | — |
+| `optictrace_sdk_ingested_total` | counter | — |
+| `optictrace_exported_total` | counter | `exporter` |
+| `optictrace_export_failed_total` | counter | `exporter` |
+| `optictrace_export_dropped_total` | counter | `exporter` |
 
 P99 per route:
 
@@ -168,23 +428,7 @@ histogram_quantile(0.99,
   sum by (le, route) (rate(optictrace_request_duration_seconds_bucket[5m])))
 ```
 
-The `route` label is always the matched rule's glob or a normalized pattern
-(`/users/42` → `/users/:id`) — cardinality stays bounded by design.
-
-## Developer dashboard
-
-`ui/` is a Next.js (App Router) + Tailwind + Recharts app, statically exported
-and served by the agent itself — no separate frontend deployment.
-
-- **Overview** — live request volume, error rate, and latency charts; top routes with per-route P95.
-- **Routes** — every route with sortable P50/P95/P99, error rates, and traffic volume.
-- **Inspector** — search and filter captured exchanges; redacted fields are highlighted, restricted routes show a governance notice; **Export** downloads the current filter set as CSV or JSONL.
-- **Usage** — per-consumer requests, data, compute, custom meters (e.g. tokens), and estimated cost with billing CSV export.
-- **Governance** — each rule's actions (restrict/redact/labels/sample/meter) with live match counts, and what share of traffic is governed.
-- **Config** — view `optic.yaml`, lint edits live against the running agent, trigger hot reload.
-- **System** — agent health, store size, and per-exporter delivery/failure/drop counters.
-
-Develop it with `cd ui && npm run dev` (talks to the agent on `:9095` via CORS).
+---
 
 ## Traffic-powered tooling
 
@@ -206,9 +450,8 @@ optictrace check -spec proposed.yaml -window 24h
 optictrace sdk -lang typescript -out client.ts
 ```
 
-Also available over HTTP: `GET /api/spec?window=24h` on the admin port.
-Redaction never hides *structure* — masked fields still contribute their name
-and type to inference, so governance and documentation don't fight.
+Redaction never hides *structure* — masked fields still contribute their name and type to
+inference, so governance and documentation don't fight.
 
 ### Stateful mock server
 
@@ -216,69 +459,29 @@ and type to inference, so governance and documentation don't fight.
 optictrace mock -spec openapi.yaml -listen :7070
 ```
 
-Collection/item routes (`/cart` + `/cart/{id}`) get real CRUD state: what you
-POST is what later GETs return, PATCH merges, DELETE 404s afterwards. Other
-operations return schema-conforming data with realistic values (emails look
-like emails, prices like prices). Add `-ai` with `ANTHROPIC_API_KEY` set and
-non-CRUD responses are generated by Claude with full request context — any
-failure falls back to the deterministic generator, so the mock never needs
-the network.
+Collection/item routes (`/cart` + `/cart/{id}`) get real CRUD state: what you POST is what
+later GETs return, PATCH merges, DELETE 404s afterwards. Other operations return
+schema-conforming data with realistic values (emails look like emails, prices like prices).
+Add `-ai` with `ANTHROPIC_API_KEY` set and non-CRUD responses are generated by Claude with
+full request context — any failure falls back to the deterministic generator, so the mock
+never needs the network.
 
 ### Usage & cost attribution (FinOps)
 
-```yaml
-rules:
-  - name: meter-ai-tokens
-    match: { path: "/api/v1/ai/**" }
-    restrict: [request_body, response_body]  # prompts stay private...
-    meter:
-      tokens: "$.usage.total_tokens"         # ...but tokens are still counted
-    labels:
-      tenant: "header:X-Tenant-ID"
+`GET /api/usage` and the **Usage** dashboard page show per-tenant requests, data, compute
+time, metered units and estimated cost; `&format=csv` produces a billing export. Metering is
+independent of capture: a fully restricted route still meters, reading the payload for the
+number without ever storing it.
 
-telemetry:
-  billing:
-    consumer_label: tenant
-    currency: USD
-    prices:
-      per_request: 0.0001
-      per_gb: 0.05
-      per_meter_unit: { tokens: 0.000002 }   # $2 per 1M tokens
-```
-
-`GET /api/usage` (and the **Usage** dashboard page) then shows per-tenant
-requests, data, compute time, metered units, and estimated cost —
-`&format=csv` produces a billing export. Metering is independent of capture:
-a fully restricted route still meters, reading the payload for the number
-without ever storing it.
+---
 
 ## Export plugins
 
-Every governed record — post-restriction, post-redaction, so no export path
-can ever see raw sensitive data — also fans out to the output plugins declared
-in `optic.yaml`:
+Every governed record — post-restriction, post-redaction, so no export path can ever see raw
+sensitive data — also fans out to the output plugins declared in `optic.yaml`.
 
-```yaml
-telemetry:
-  exporters:
-    - name: audit-log            # append JSONL, size-rotated
-      type: file
-      path: ./export/audit.jsonl
-
-    - name: siem                 # POST JSON batches to any HTTP endpoint
-      type: webhook
-      url: https://siem.internal/ingest
-      headers: { Authorization: "Bearer ..." }
-      batch_size: 100
-      flush_interval: 5s
-
-    - name: my-plugin            # CUSTOM PLUGIN: any executable, any language
-      type: command
-      command: ["python3", "examples/exporters/csv_exporter.py", "traffic.csv"]
-```
-
-A **command plugin** receives one JSON record per stdin line — that's the
-whole contract. Ship to Kafka, S3, BigQuery, a SIEM, anywhere:
+A **command plugin** receives one JSON record per stdin line. That's the whole contract —
+ship to Kafka, S3, BigQuery, a SIEM, anywhere:
 
 ```python
 #!/usr/bin/env python3
@@ -288,17 +491,14 @@ for line in sys.stdin:
     ship_somewhere(record)
 ```
 
-Exporters are isolated: each gets its own bounded queue and worker, delivery
-is batched and at-most-once, and a slow or crashed plugin drops only its own
-records (visible in `optictrace_export_*` metrics and the System page) — the
-request path is never affected. One-off exports are also available as
-downloads: `GET /api/export?format=csv|jsonl` with the same filters as
-`/api/logs`, or the Export button in the Inspector.
+See [`examples/exporters/`](examples/exporters/) for a working CSV plugin.
+
+---
 
 ## Framework SDKs
 
-SDKs evaluate the same `optic.yaml` in-process and POST governed records to the
-agent's `/api/ingest` — one dashboard and one metrics endpoint across your stack.
+SDKs evaluate the same `optic.yaml` in-process and POST governed records to the agent's
+`/api/ingest` — one dashboard and one metrics endpoint across your whole stack.
 
 ### Node.js / Express
 
@@ -320,17 +520,140 @@ app.add_middleware(OpticTraceMiddleware,
 ```go
 agent, _ := optictrace.New("optic.yaml")
 defer agent.Close()
-agent.ServeAdmin("ui/out")                    // metrics + dashboard on :9095
+agent.ServeAdmin("ui/out")                            // metrics + dashboard on :9095
 
 http.ListenAndServe(":8080", agent.Middleware(mux))   // net/http
 r.Use(optictracegin.Middleware(agent))                // Gin
 ```
 
+---
+
+## Developer dashboard
+
+`ui/` is a Next.js (App Router) + Tailwind + Recharts app, statically exported and served by
+the agent itself — no separate frontend deployment.
+
+| Page | Shows |
+|---|---|
+| **Overview** | Live request volume, error rate, latency charts; top routes with per-route P95 |
+| **Routes** | Every route with sortable P50/P95/P99, error rates, traffic volume |
+| **Inspector** | Searchable/filterable exchanges; redacted fields highlighted; CSV/JSONL export |
+| **Usage** | Per-consumer requests, data, compute, meters and estimated cost |
+| **Governance** | Each rule's actions (restrict/redact/labels/sample/meter) with live match counts |
+| **Config** | View `optic.yaml`, lint edits live against the running agent, trigger hot reload |
+| **System** | Agent health, store size, per-exporter delivery/failure/drop counters |
+
+Develop it with `cd ui && npm run dev` (talks to the agent on `:9095` via CORS).
+
+---
+
 ## Deployment
 
-- **Docker** — multi-stage [`Dockerfile`](Dockerfile) (UI build → pure-Go build → ~30 MB Alpine image, non-root).
+- **Docker** — multi-stage [`Dockerfile`](Dockerfile) (UI build → pure-Go build → non-root Alpine image).
 - **Compose** — [`docker-compose.yml`](docker-compose.yml) runs OpticTrace + demo upstream + Prometheus.
 - **Helm** — [`deploy/helm/optictrace`](deploy/helm/optictrace) with ConfigMap-managed `optic.yaml`, health probes, optional PVC and ServiceMonitor.
+
+---
+
+## Verified behavior
+
+These aren't design intentions — each was observed end to end with real traffic through the
+proxy, not asserted from the code:
+
+- **Redaction holds under echo.** A payment request carrying a card number came back echoed inside a wrapper by the upstream; both the request and the nested response copy stored `[REDACTED]`, while the client received the real number.
+- **Restriction is total.** A login request's password and the response token appear nowhere in logs, store, or exports — only method, path, status and latency were recorded.
+- **Metering survives restriction.** An AI route with both bodies restricted still recorded `tokens: 63` attributed to a tenant, with the completion text absent everywhere.
+- **Labels reach Prometheus.** Series carried `tenant="acme"` and `region="ap-south-1"` as real dimensions, with routes normalized to `/api/v1/users/:id`.
+- **The linter catches real breakage.** A proposed spec dropping a field was rejected with *"clients send request field `credit_card` (28 times, last 22m ago)"* and a non-zero exit.
+- **Plugins receive governed data only.** A Python CSV plugin and a file exporter both ran live; neither output contained a card number or a restricted payload.
+- **A clean clone works.** Cloned fresh from GitHub: builds, six test packages pass, CLI runs.
+
+---
+
+## Roadmap
+
+Ordered by value, not by ease. Each item states the problem it solves — if the rationale
+doesn't hold for your use case, the item shouldn't be built.
+
+### Tier 1 — closes a real risk
+
+**1. Leak detector (`optictrace scan`)**
+Today OpticTrace masks only what you *name*. The failure mode that actually bites is the
+field you **forgot**. A scanner over stored records that flags values matching
+high-confidence sensitive patterns — Luhn-valid card numbers, JWTs, private-key headers,
+cloud access keys — turns governance from "a deny-list you maintain" into "a deny-list plus
+a safety net", and can gate CI against a staging capture. For a *governance* tool this is
+the single highest-value addition.
+
+**2. Label cardinality guard**
+Custom label values come from arbitrary request headers. `X-Tenant-ID` is bounded in theory;
+one buggy or hostile client makes it unbounded, and unbounded label values are how you take
+down a Prometheus. Route cardinality is already bounded — labels are the remaining hole. Cap
+distinct values per label, bucket overflow into `__over_limit__`, and expose a metric when
+the cap engages.
+
+**3. Tail-based sampling**
+`sample: 0.25` is uniform random, which discards exactly the requests you most want to keep.
+Sample by outcome instead: retain 100% of 5xx and anything above a latency threshold, sample
+the boring 200s. Small change, large improvement in the value of what's stored.
+
+**4. `optictrace test` — rule unit tests**
+Governance rules are security-critical but currently verifiable only by eyeball or by
+pushing real traffic. A fixture file of requests with expected policy outcomes, runnable in
+CI, would make rules safe to refactor:
+
+```yaml
+# optic.test.yaml (proposed)
+- request: { method: POST, path: /api/v1/payments/charge, body: {credit_card: {number: "4111..."}} }
+  expect:
+    matched_rules: [redact-payment-secrets]
+    stored_body: '{"credit_card":{"number":"[REDACTED]"}}'
+    captures_headers: false
+```
+
+### Tier 2 — completeness
+
+**5. Query-string capture** — unblocks full spec inference and lets `query:` labels be verified against real traffic.
+**6. Time-based retention + per-consumer purge** — today retention is row-count only; erasure requests need "delete everything for tenant X before date Y".
+**7. Admin-port authentication + TLS** — bearer token or mTLS, so the control plane can survive being reachable.
+**8. Published benchmarks** — the README claims low overhead and nothing proves it. `go test -bench` with documented p50/p99 added latency and allocations per request would back the claim before launch.
+**9. Python + Go SDK generators** — the schema traversal is already generator-agnostic; this is mostly templates.
+
+### Tier 3 — scale and ecosystem
+
+**10. ClickHouse / Postgres `LogStore` drivers** — SQLite plus 100k-row retention is a single-node story; high-traffic deployments need a real column store. The interface already exists.
+**11. OTLP export** — emit traces and metrics to an OpenTelemetry collector so OpticTrace fits existing pipelines instead of replacing them.
+**12. Multi-service fleet view** — today one agent is one service; the dashboard should aggregate across services when many SDKs report in.
+**13. Traffic replay** — replay governed captures against a staging service; combined with the mock server this closes a strong dev loop.
+**14. Shipped Grafana dashboard + alert rules** — a `grafana/dashboard.json` and Prometheus alerting rules in-repo, so `docker compose up` gives working alerts, not just raw metrics.
+**15. Release engineering** — goreleaser, signed multi-arch binaries, a Homebrew tap. `go install` works today; `brew install optictrace` is what gets adoption.
+**16. AI-assisted rule suggestions** — use the inferred spec to propose redaction rules for field names that look sensitive, so new endpoints arrive with governance suggested rather than forgotten.
+
+### Known gaps
+
+Documented so nobody discovers them the hard way:
+
+- Query strings are not captured, so they're absent from inferred specs and from stored records.
+- Rule match counts use a `LIKE` scan over stored JSON — fine at the default 100k-row retention, worth an indexed join table beyond that.
+- The AI mock path is implemented but has never run against the live Anthropic API.
+- Hijacked connections (WebSockets) pass through uninspected by nature.
+- The control plane has no authentication.
+
+---
+
+## Contributing
+
+Bug reports, rule-engine edge cases, and new SDK targets are all welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md). Ground rules worth repeating:
+
+1. **Governance invariants are non-negotiable.** Proxied traffic is never mutated; telemetry never blocks a request. Any PR that could leak a restricted or redacted value needs a test proving it doesn't.
+2. **The rule engine is portable.** `internal/engine` (Go), `sdks/express/engine.js` and `sdks/fastapi/.../engine.py` must stay semantically identical.
+
+```bash
+go build ./... && go test ./...        # Go agent
+cd ui && npm install && npm run dev    # dashboard
+./scripts/demo.sh                      # full local stack
+```
 
 ## Project layout
 
@@ -350,12 +673,6 @@ sdks/               express · fastapi · gin
 deploy/             compose bits + Helm chart
 examples/           exporter plugin examples
 ```
-
-## Contributing
-
-Bug reports, rule-engine edge cases, and new SDK targets are all welcome —
-see [CONTRIBUTING.md](CONTRIBUTING.md). Good first issues are labeled
-[`good-first-issue`](https://github.com/dwarka-prasad/optictrace/labels/good-first-issue).
 
 ## License
 
