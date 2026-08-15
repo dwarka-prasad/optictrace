@@ -7,6 +7,7 @@
 //
 //	file     append JSONL to disk, size-based rotation
 //	webhook  POST JSON batches to an HTTP endpoint
+//	otlp     emit OpenTelemetry spans to a collector (OTLP/HTTP + JSON)
 //	command  THE CUSTOM PLUGIN HOOK — spawn any executable and stream one
 //	         JSON record per line to its stdin; write plugins in any
 //	         language to ship data to Kafka, S3, a SIEM, anywhere.
@@ -74,7 +75,7 @@ type Dispatcher struct {
 }
 
 // New builds exporters from config and starts their workers.
-func New(cfgs []config.ExporterCfg, logger *slog.Logger, m Metrics) (*Dispatcher, error) {
+func New(cfgs []config.ExporterCfg, logger *slog.Logger, m Metrics, serviceName string) (*Dispatcher, error) {
 	d := &Dispatcher{logger: logger, metrics: m}
 	for i := range cfgs {
 		c := &cfgs[i]
@@ -87,6 +88,8 @@ func New(cfgs []config.ExporterCfg, logger *slog.Logger, m Metrics) (*Dispatcher
 			exp = newWebhookExporter(c)
 		case "command":
 			exp = newCommandExporter(c, logger)
+		case "otlp":
+			exp = newOTLPExporter(c, serviceName)
 		default:
 			err = fmt.Errorf("unknown exporter type %q", c.Type) // unreachable post-validation
 		}

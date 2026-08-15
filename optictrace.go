@@ -69,8 +69,14 @@ func New(configPath string, opts ...AgentOption) (*Agent, error) {
 		a.collector = metrics.New(cfg.Service.Name, cfg.Telemetry.Metrics.Buckets,
 			eng.LabelKeys(), cfg.Telemetry.Metrics.LabelValueCap())
 	}
-	if cfg.Telemetry.Store.Driver == "sqlite" {
-		sqlStore, err := store.NewSQLite(cfg.Telemetry.Store.DSN)
+	if cfg.Telemetry.Store.Driver != "none" {
+		var sqlStore store.LogStore
+		var err error
+		if cfg.Telemetry.Store.Driver == "postgres" {
+			sqlStore, err = store.NewPostgres(cfg.Telemetry.Store.DSN)
+		} else {
+			sqlStore, err = store.NewSQLite(cfg.Telemetry.Store.DSN)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -90,7 +96,7 @@ func New(configPath string, opts ...AgentOption) (*Agent, error) {
 		if a.collector != nil {
 			expMetrics = a.collector
 		}
-		a.dispatcher, err = export.New(cfg.Telemetry.Exporters, a.logger, expMetrics)
+		a.dispatcher, err = export.New(cfg.Telemetry.Exporters, a.logger, expMetrics, cfg.Service.Name)
 		if err != nil {
 			return nil, err
 		}

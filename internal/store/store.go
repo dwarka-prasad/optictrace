@@ -115,6 +115,21 @@ type Usage struct {
 	Meters     map[string]float64 `json:"meters,omitempty"`
 }
 
+// ServiceStat summarizes one service in a multi-service deployment. One
+// agent proxies one service, but many SDKs can report into a single agent,
+// so the store may hold several.
+type ServiceStat struct {
+	Service    string    `json:"service"`
+	Requests   int64     `json:"requests"`
+	Errors     int64     `json:"errors"`
+	ErrorRate  float64   `json:"error_rate"`
+	AvgLatency float64   `json:"avg_latency_ms"`
+	P95Latency float64   `json:"p95_latency_ms"`
+	Routes     int64     `json:"routes"`
+	Sources    string    `json:"sources"` // e.g. "proxy, express"
+	LastSeen   time.Time `json:"last_seen"`
+}
+
 // LogStore is the persistence contract. Implementations must be safe for
 // concurrent use. Save is called from the async writer, never from the
 // request hot path.
@@ -133,6 +148,8 @@ type LogStore interface {
 	// Recent returns up to limit full records since a time (newest first) —
 	// the input for spec inference and spec-vs-traffic checks.
 	Recent(ctx context.Context, since time.Time, limit int) ([]Record, error)
+	// ServiceStats aggregates per service — the fleet view.
+	ServiceStats(ctx context.Context, since time.Time) ([]ServiceStat, error)
 	// UsageByLabel aggregates traffic per consumer (a label value, e.g.
 	// tenant) since the given time — the FinOps view.
 	UsageByLabel(ctx context.Context, since time.Time, label string) ([]Usage, error)

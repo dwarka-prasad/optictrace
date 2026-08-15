@@ -1,0 +1,91 @@
+# OpticTrace alerting rules.
+#
+# These alert on the AGENT's own health as well as the traffic it observes.
+# A monitoring tool that silently stops recording is worse than one that was
+# never installed, so the self-health rules come first.
+groups:
+  - name: optictrace-self
+    interval: 30s
+    rules:
+      - alert: OpticTraceDown
+        expr: up{job="optictrace"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "OpticTrace agent is not scrapeable"
+          description: >-
+            Prometheus cannot reach {{ $labels.instance }}. API traffic may
+            still be flowing — the proxy and the metrics endpoint fail
+            independently — but you are now blind to it.
+
+      - alert: OpticTraceStoreDropping
+        # The store queue drops rather than blocking the request path. That is
+        # correct behaviour under load, but sustained drops mean lost history.
+        expr: rate(optictrace_store_dropped_total[5m]) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Telemetry records are being dropped ({{ $labels.service }})"
+          description: >-
+            The async store queue is full, so records are being discarded to
+            protect request latency. Raise telemetry.store.queue_size or check
+            whether the database is slow.
+
+      - alert: OpticTraceExportFailing
+        expr: rate(optictrace_export_failed_total[5m]) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Exporter {{ $labels.exporter }} is failing"
+          description: >-
+            Export delivery is at-most-once by design, so these records are
+            gone. Check the destination is reachable.
+
+      - alert: OpticTraceLabelCardinalityCapped
+        # The guard is working, but hitting it means a label is unbounded —
+        # usually a client sending a unique value per request.
+        expr: rate(optictrace_label_capped_total[15m]) > 0
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Label {{ $labels.label }} exceeded its cardinality cap"
+          description: >-
+            New values are collapsing into __over_limit__. Either the label
+            source is unbounded (check the header clients send) or the cap
+            needs raising.
+
+  - name: optictrace-traffic
+    interval: 30s
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum by (service, route) (rate(optictrace_requests_total{status_class="5xx"}[5m]))
+          /
+          sum by (service, route) (rate(optictrace_requests_total[5m]))
+          > 0.05
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.route }} is returning >5% 5xx"
+          description: "Error rate is {{ $value | humanizePercentage }} on {{ $labels.service }}."
+
+      - alert: LatencyP99Degraded
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, service, route) (rate(optictrace_request_duration_seconds_bucket[5m]))
+          ) > 1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.route }} P99 latency above 1s"
+          description: "P99 is {{ $value | humanizeDuration }} on {{ $labels.service }}."
+
+      - alert: TrafficStopped
+        # Catches an upstream that has gone quiet, which no error-rate alert
+        # will ever fire on.
+        expr: sum by (service) (rate(optictrace_requests_total[10m])) == 0
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "No traffic observed for {{ $labels.service }}"
+          description: "OpticTrace is up but has seen no requests for 15 minutes."

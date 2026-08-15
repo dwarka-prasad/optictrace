@@ -4,7 +4,8 @@
 #
 #   http://localhost:8080  -> proxied demo API
 #   http://localhost:9095  -> OpticTrace dashboard, /metrics, /api/*
-#   http://localhost:9090  -> Prometheus (pre-configured scrape)
+#   http://localhost:9090  -> Prometheus (pre-configured scrape + alert rules)
+#   http://localhost:3000  -> Grafana with the OpticTrace dashboard provisioned
 
 services:
   optictrace:
@@ -33,9 +34,27 @@ services:
       - "9090:9090"
     volumes:
       - ./deploy/compose/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prom-data:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: optictrace
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboard.json:/var/lib/grafana/dashboards/optictrace.json:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
     restart: unless-stopped
 
 volumes:
   optic-data:
   prom-data:
+  grafana-data:

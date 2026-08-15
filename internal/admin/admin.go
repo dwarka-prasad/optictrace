@@ -72,6 +72,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/spec", s.inferSpec)
 	mux.HandleFunc("GET /api/usage", s.usage)
 	mux.HandleFunc("GET /api/scan", s.scan)
+	mux.HandleFunc("GET /api/services", s.services)
 	mux.HandleFunc("GET /api/export", s.export)
 	mux.HandleFunc("GET /api/config", s.getConfig)
 	mux.HandleFunc("POST /api/config/validate", s.validateConfig)
@@ -388,6 +389,25 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"label": label, "currency": currency, "billing": billing != nil, "consumers": out,
 	})
+}
+
+// services is the fleet view: one agent proxies one service, but many SDKs
+// can report into the same agent, so the store may hold several.
+func (s *Server) services(w http.ResponseWriter, r *http.Request) {
+	if s.Reader == nil {
+		httpError(w, http.StatusNotImplemented, "payload store is disabled")
+		return
+	}
+	window := parseDurationDefault(r.URL.Query().Get("window"), time.Hour)
+	stats, err := s.Reader.ServiceStats(r.Context(), time.Now().Add(-window))
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if stats == nil {
+		stats = []store.ServiceStat{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"services": stats})
 }
 
 // scan looks for sensitive values that slipped past the rules — the field

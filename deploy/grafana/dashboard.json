@@ -1,0 +1,241 @@
+{
+  "title": "OpticTrace — API Traffic & Governance",
+  "uid": "optictrace-main",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "tags": ["optictrace", "api", "governance"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {}
+      },
+      {
+        "name": "service",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(optictrace_requests_total, service)",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true
+      },
+      {
+        "name": "route",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(optictrace_requests_total{service=~\"$service\"}, route)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Golden signals",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "title": "Request rate",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "decimals": 1, "color": { "mode": "fixed", "fixedColor": "blue" } }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(optictrace_requests_total{service=~\"$service\", route=~\"$route\"}[5m]))",
+          "legendFormat": "req/s"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Error rate (5xx)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.01 },
+              { "color": "red", "value": 0.05 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(optictrace_requests_total{service=~\"$service\", route=~\"$route\", status_class=\"5xx\"}[5m])) / clamp_min(sum(rate(optictrace_requests_total{service=~\"$service\", route=~\"$route\"}[5m])), 0.0001)",
+          "legendFormat": "error rate"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "P95 latency",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.5 },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(optictrace_request_duration_seconds_bucket{service=~\"$service\", route=~\"$route\"}[5m])))",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "In-flight",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        { "expr": "sum(optictrace_inflight_requests{service=~\"$service\"})", "legendFormat": "in-flight" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Request rate by status class",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "fillOpacity": 20, "stacking": { "mode": "normal" } }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "5xx" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] },
+          { "matcher": { "id": "byName", "options": "4xx" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }] },
+          { "matcher": { "id": "byName", "options": "2xx" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }] }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "sum by (status_class) (rate(optictrace_requests_total{service=~\"$service\", route=~\"$route\"}[5m]))",
+          "legendFormat": "{{status_class}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Latency percentiles",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 5 } } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(optictrace_request_duration_seconds_bucket{service=~\"$service\", route=~\"$route\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(optictrace_request_duration_seconds_bucket{service=~\"$service\", route=~\"$route\"}[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(optictrace_request_duration_seconds_bucket{service=~\"$service\", route=~\"$route\"}[5m])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Per route",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 }
+    },
+    {
+      "type": "table",
+      "title": "Routes by volume, error rate and P99",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 15 },
+      "transformations": [
+        { "id": "seriesToColumns", "options": { "byField": "route" } },
+        { "id": "organize", "options": { "renameByName": { "Value #A": "req/s", "Value #B": "error rate", "Value #C": "p99" } } }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "expr": "sum by (route) (rate(optictrace_requests_total{service=~\"$service\"}[5m]))"
+        },
+        {
+          "refId": "B",
+          "format": "table",
+          "instant": true,
+          "expr": "sum by (route) (rate(optictrace_requests_total{service=~\"$service\", status_class=\"5xx\"}[5m])) / clamp_min(sum by (route) (rate(optictrace_requests_total{service=~\"$service\"}[5m])), 0.0001)"
+        },
+        {
+          "refId": "C",
+          "format": "table",
+          "instant": true,
+          "expr": "histogram_quantile(0.99, sum by (le, route) (rate(optictrace_request_duration_seconds_bucket{service=~\"$service\"}[5m])))"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Agent health — a blind monitor is worse than none",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Dropped telemetry (store backpressure)",
+      "description": "The store drops rather than blocking the request path. Sustained drops mean lost history: raise queue_size or check the database.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 25 },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "red" } } },
+      "targets": [
+        { "expr": "rate(optictrace_store_dropped_total{service=~\"$service\"}[5m])", "legendFormat": "dropped/s" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Exporter delivery",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 25 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        { "expr": "rate(optictrace_exported_total{service=~\"$service\"}[5m])", "legendFormat": "{{exporter}} delivered" },
+        { "expr": "rate(optictrace_export_failed_total{service=~\"$service\"}[5m])", "legendFormat": "{{exporter}} failed" },
+        { "expr": "rate(optictrace_export_dropped_total{service=~\"$service\"}[5m])", "legendFormat": "{{exporter}} dropped" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Label cardinality",
+      "description": "Distinct values per custom label, and how often the guard collapsed a value into __over_limit__.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 25 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        { "expr": "optictrace_label_distinct_values{service=~\"$service\"}", "legendFormat": "{{label}} distinct" },
+        { "expr": "rate(optictrace_label_capped_total{service=~\"$service\"}[5m])", "legendFormat": "{{label}} capped/s" }
+      ]
+    }
+  ]
+}

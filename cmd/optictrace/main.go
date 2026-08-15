@@ -28,13 +28,15 @@ import (
 	"github.com/dwarka-prasad/optictrace/internal/metrics"
 	"github.com/dwarka-prasad/optictrace/internal/mock"
 	"github.com/dwarka-prasad/optictrace/internal/proxy"
+	"github.com/dwarka-prasad/optictrace/internal/replay"
 	"github.com/dwarka-prasad/optictrace/internal/ruletest"
 	"github.com/dwarka-prasad/optictrace/internal/scan"
 	"github.com/dwarka-prasad/optictrace/internal/spec"
 	"github.com/dwarka-prasad/optictrace/internal/store"
+	"github.com/dwarka-prasad/optictrace/internal/suggest"
 )
 
-var version = "0.6.0-dev" // overridden via -ldflags at release time
+var version = "0.7.0-dev" // overridden via -ldflags at release time
 
 func main() {
 	args := os.Args[1:]
@@ -58,6 +60,11 @@ func main() {
 	purgeValue := fs.String("value", "", "purge: consumer label value to erase")
 	olderThan := fs.Duration("older-than", 0, "purge: only delete records older than this (default: all)")
 	yes := fs.Bool("yes", false, "purge: skip the interactive confirmation (for automation)")
+	replayTarget := fs.String("target", "", "replay: base URL to replay captured traffic against")
+	rate := fs.Float64("rate", 0, "replay: requests per second (0 = as fast as possible)")
+	concurrency := fs.Int("concurrency", 4, "replay: parallel in-flight requests")
+	dryRun := fs.Bool("dry-run", false, "replay: report what would be sent without sending")
+	applyOut := fs.String("apply", "", "suggest: write proposed rules to this file instead of stdout")
 	_ = fs.Parse(args)
 
 	switch cmd {
@@ -79,11 +86,15 @@ func main() {
 		ruleTest(*configPath, *testsPath)
 	case "purge":
 		purge(*configPath, *purgeLabel, *purgeValue, *olderThan, *yes)
+	case "replay":
+		replayTraffic(*configPath, *window, *replayTarget, *rate, *concurrency, *dryRun)
+	case "suggest":
+		suggestRules(*configPath, *window, *applyOut)
 	case "version":
 		fmt.Println("optictrace", version)
 	default:
 		fmt.Fprintf(os.Stderr,
-			"unknown command %q\n  (run, validate, test, scan, purge, spec, check, sdk, mock, version)\n", cmd)
+			"unknown command %q\n  (run, validate, test, scan, suggest, purge, replay,\n   spec, check, sdk, mock, version)\n", cmd)
 		os.Exit(2)
 	}
 }
@@ -98,8 +109,8 @@ func purge(configPath, label, value string, olderThan time.Duration, assumeYes b
 		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
 		os.Exit(1)
 	}
-	if cfg.Telemetry.Store.Driver != "sqlite" {
-		fmt.Fprintln(os.Stderr, "✗ purge needs telemetry.store.driver: sqlite")
+	if cfg.Telemetry.Store.Driver == "none" {
+		fmt.Fprintln(os.Stderr, "✗ purge needs a payload store (sqlite or postgres)")
 		os.Exit(1)
 	}
 	if label == "" {
@@ -113,7 +124,7 @@ func purge(configPath, label, value string, olderThan time.Duration, assumeYes b
 		os.Exit(2)
 	}
 
-	st, err := store.NewSQLite(cfg.Telemetry.Store.DSN)
+	st, err := openStore(&cfg.Telemetry.Store)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "✗ open store: %v\n", err)
 		os.Exit(1)
@@ -156,6 +167,89 @@ func purge(configPath, label, value string, olderThan time.Duration, assumeYes b
 		os.Exit(1)
 	}
 	fmt.Printf("✓ purged %d record(s) for %s=%q\n", removed, label, value)
+}
+
+// replayTraffic re-issues captured traffic against a target. Governed records
+// cannot reproduce redacted or restricted payloads, so the summary reports
+// what was skipped rather than pretending to full fidelity.
+func replayTraffic(configPath string, window time.Duration, target string,
+	rate float64, concurrency int, dryRun bool) {
+
+	if target == "" {
+		fmt.Fprintln(os.Stderr, "✗ replay requires -target <base-url>")
+		os.Exit(2)
+	}
+	_, records := loadTraffic(configPath, window)
+	if len(records) == 0 {
+		fmt.Fprintln(os.Stderr, "✗ no traffic captured in this window — nothing to replay")
+		os.Exit(1)
+	}
+	sum, err := replay.Run(context.Background(), records, replay.Options{
+		Target: target, RatePerSec: rate, Concurrency: concurrency, DryRun: dryRun,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+		os.Exit(1)
+	}
+	verb := "replayed"
+	if dryRun {
+		verb = "would replay"
+	}
+	fmt.Printf("%s %d/%d record(s) against %s in %s\n",
+		verb, sum.Sent, sum.Total, target, sum.Elapsed.Round(time.Millisecond))
+	if sum.Skipped > 0 {
+		fmt.Printf("skipped %d:\n", sum.Skipped)
+		for reason, n := range sum.SkipReason {
+			fmt.Printf("  %d × %s\n", n, reason)
+		}
+	}
+	if !dryRun {
+		fmt.Printf("status match: %d · diverged: %d · failed: %d\n", sum.Matched, sum.Diverged, sum.Failed)
+		for _, d := range sum.Diffs {
+			if d.Err != nil {
+				fmt.Printf("  ✗ %s %s — %v\n", d.Method, d.Path, d.Err)
+			} else {
+				fmt.Printf("  ⚠ %s %s — was %d, now %d\n", d.Method, d.Path, d.OriginalCode, d.ReplayedCode)
+			}
+		}
+	}
+	if sum.Failed > 0 {
+		os.Exit(1)
+	}
+}
+
+// suggestRules proposes governance for fields whose NAMES look sensitive —
+// the complement to scan, which inspects values.
+func suggestRules(configPath string, window time.Duration, applyOut string) {
+	cfg, records := loadTraffic(configPath, window)
+	if len(records) == 0 {
+		fmt.Fprintln(os.Stderr, "✗ no traffic captured in this window — nothing to analyse")
+		os.Exit(1)
+	}
+	report := suggest.Records(records, engine.New(cfg))
+	actionable := report.Actionable()
+
+	if len(actionable) == 0 {
+		fmt.Printf("✓ analysed %d record(s) — every sensitive-looking field is already governed\n",
+			report.Scanned)
+		return
+	}
+	icons := map[string]string{suggest.High: "✗", suggest.Medium: "⚠", suggest.Low: "·"}
+	for _, s := range actionable {
+		fmt.Printf("%s [%s] %s %q on %s\n", icons[s.Confidence], s.Confidence, s.Kind, s.Field, s.Route)
+		fmt.Printf("    %s (seen %d×)\n", s.Why, s.Seen)
+	}
+	governed := len(report.Suggestions) - len(actionable)
+	fmt.Printf("\n%d suggestion(s); %d sensitive-looking field(s) already covered by your rules\n",
+		len(actionable), governed)
+
+	yaml := report.YAML()
+	if applyOut != "" {
+		writeOut(applyOut, []byte(yaml))
+		fmt.Fprintln(os.Stderr, "  review these rules before merging them into optic.yaml")
+		return
+	}
+	fmt.Printf("\n--- proposed optic.yaml rules ---\n%s", yaml)
 }
 
 // scanTraffic is the safety net: it looks for values that LOOK sensitive in
@@ -240,13 +334,13 @@ func loadTraffic(configPath string, window time.Duration) (*config.Config, []sto
 		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
 		os.Exit(1)
 	}
-	if cfg.Telemetry.Store.Driver != "sqlite" {
-		fmt.Fprintln(os.Stderr, "✗ this command needs telemetry.store.driver: sqlite (traffic history)")
+	if cfg.Telemetry.Store.Driver == "none" {
+		fmt.Fprintln(os.Stderr, "✗ this command needs a payload store (telemetry.store.driver: sqlite or postgres)")
 		os.Exit(1)
 	}
-	st, err := store.NewSQLite(cfg.Telemetry.Store.DSN)
+	st, err := openStore(&cfg.Telemetry.Store)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "✗ open store %s: %v\n", cfg.Telemetry.Store.DSN, err)
+		fmt.Fprintf(os.Stderr, "✗ open store: %v\n", err)
 		os.Exit(1)
 	}
 	defer st.Close()
@@ -385,6 +479,17 @@ func writeOut(path string, data []byte) {
 
 func isFlag(s string) bool { return len(s) > 0 && s[0] == '-' }
 
+// openStore resolves the configured driver. Both implementations satisfy the
+// same LogStore contract, enforced by the conformance suite in internal/store.
+func openStore(cfg *config.StoreCfg) (store.LogStore, error) {
+	switch cfg.Driver {
+	case "postgres":
+		return store.NewPostgres(cfg.DSN)
+	default:
+		return store.NewSQLite(cfg.DSN)
+	}
+}
+
 func validate(path string) {
 	cfg, err := config.Load(path)
 	if err != nil {
@@ -415,10 +520,10 @@ func run(configPath, uiDir string) {
 	// --- payload store ---------------------------------------------------
 	var reader store.LogStore
 	var writer *store.AsyncWriter
-	if cfg.Telemetry.Store.Driver == "sqlite" {
-		sqlStore, err := store.NewSQLite(cfg.Telemetry.Store.DSN)
+	if cfg.Telemetry.Store.Driver != "none" {
+		sqlStore, err := openStore(&cfg.Telemetry.Store)
 		if err != nil {
-			logger.Error("failed to open store", "dsn", cfg.Telemetry.Store.DSN, "error", err)
+			logger.Error("failed to open store", "driver", cfg.Telemetry.Store.Driver, "error", err)
 			os.Exit(1)
 		}
 		reader = sqlStore
@@ -429,6 +534,7 @@ func run(configPath, uiDir string) {
 		asyncOpts = append(asyncOpts, store.WithRetention(cfg.Telemetry.Store.RetentionMaxRows),
 			store.WithMaxAge(cfg.Telemetry.Store.MaxAge()))
 		writer = store.NewAsyncWriter(sqlStore, cfg.Telemetry.Store.QueueSize, logger, asyncOpts...)
+		logger.Info("payload store ready", "driver", cfg.Telemetry.Store.Driver)
 	}
 
 	// --- output exporters (custom plugins) --------------------------------
@@ -438,7 +544,7 @@ func run(configPath, uiDir string) {
 		if collector != nil {
 			expMetrics = collector
 		}
-		dispatcher, err = export.New(cfg.Telemetry.Exporters, logger, expMetrics)
+		dispatcher, err = export.New(cfg.Telemetry.Exporters, logger, expMetrics, cfg.Service.Name)
 		if err != nil {
 			logger.Error("failed to start exporters", "error", err)
 			os.Exit(1)

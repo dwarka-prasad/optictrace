@@ -116,7 +116,7 @@ type Prices struct {
 // export path can ever see raw sensitive data.
 type ExporterCfg struct {
 	Name string `yaml:"name"` // unique; becomes the Prometheus `exporter` label
-	Type string `yaml:"type"` // "file" | "webhook" | "command"
+	Type string `yaml:"type"` // "file" | "webhook" | "command" | "otlp"
 
 	// file: JSONL append target, rotated at MaxSizeMB (default 100).
 	Path      string `yaml:"path"`
@@ -157,7 +157,8 @@ type Metrics struct {
 
 // StoreCfg configures asynchronous payload persistence.
 type StoreCfg struct {
-	Driver string `yaml:"driver"` // "sqlite" (default) or "none"
+	// Driver is "sqlite" (default), "postgres" (multi-node), or "none".
+	Driver string `yaml:"driver"`
 	// DSN is the SQLite file path. Default "optictrace.db".
 	DSN string `yaml:"dsn"`
 	// QueueSize bounds the async write queue; writes are dropped (and
@@ -272,7 +273,7 @@ func applyTelemetryDefaults(t *Telemetry) {
 	if t.Store.Driver == "" {
 		t.Store.Driver = "sqlite"
 	}
-	if t.Store.DSN == "" {
+	if t.Store.DSN == "" && t.Store.Driver == "sqlite" {
 		t.Store.DSN = "optictrace.db"
 	}
 	if t.Store.QueueSize <= 0 {
@@ -319,8 +320,13 @@ func (c *Config) Validate() error {
 	}
 	switch c.Telemetry.Store.Driver {
 	case "sqlite", "none":
+	case "postgres":
+		if !strings.HasPrefix(c.Telemetry.Store.DSN, "postgres://") &&
+			!strings.HasPrefix(c.Telemetry.Store.DSN, "postgresql://") {
+			return fmt.Errorf("telemetry.store.dsn must be a postgres:// URL when driver is postgres")
+		}
 	default:
-		return fmt.Errorf("telemetry.store.driver %q is not supported (sqlite, none)", c.Telemetry.Store.Driver)
+		return fmt.Errorf("telemetry.store.driver %q is not supported (sqlite, postgres, none)", c.Telemetry.Store.Driver)
 	}
 	if a := c.Telemetry.Auth; a != nil {
 		if a.Token == "" && a.TokenEnv == "" {
@@ -385,17 +391,17 @@ func (e *ExporterCfg) validate() error {
 		if e.Path == "" {
 			return fmt.Errorf("type file requires path")
 		}
-	case "webhook":
+	case "webhook", "otlp":
 		u, err := url.Parse(e.URL)
 		if err != nil || u.Scheme == "" || u.Host == "" {
-			return fmt.Errorf("type webhook requires a valid absolute url, got %q", e.URL)
+			return fmt.Errorf("type %s requires a valid absolute url, got %q", e.Type, e.URL)
 		}
 	case "command":
 		if len(e.Command) == 0 {
 			return fmt.Errorf("type command requires command: [executable, args...]")
 		}
 	default:
-		return fmt.Errorf("unknown type %q (file, webhook, command)", e.Type)
+		return fmt.Errorf("unknown type %q (file, webhook, command, otlp)", e.Type)
 	}
 	if e.FlushInterval != "" {
 		if _, err := time.ParseDuration(e.FlushInterval); err != nil {

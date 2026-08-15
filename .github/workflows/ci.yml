@@ -8,6 +8,18 @@ on:
 jobs:
   go:
     runs-on: ubuntu-latest
+    services:
+      # The Postgres driver is only meaningfully tested against a real server;
+      # the conformance suite skips it when this DSN is absent.
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: optic
+          POSTGRES_DB: optictrace
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -17,7 +29,9 @@ jobs:
         run: |
           go vet ./...
           test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
-      - name: Test
+      - name: Test (both store drivers)
+        env:
+          OPTICTRACE_TEST_POSTGRES: postgres://postgres:optic@localhost:5432/optictrace?sslmode=disable
         run: go test -race ./...
       - name: Validate example config
         run: go run ./cmd/optictrace validate -config optic.yaml
@@ -55,6 +69,19 @@ jobs:
       - name: FastAPI SDK tests
         working-directory: sdks/fastapi
         run: pip install pyyaml && python test_middleware.py
+
+  assets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Prometheus alert rules
+        run: |
+          docker run --rm -v "$PWD/deploy/prometheus/alerts.yml:/a.yml:ro" \
+            --entrypoint promtool prom/prometheus:v2.53.0 check rules /a.yml
+      - name: Validate goreleaser config
+        run: docker run --rm -v "$PWD:/src" -w /src goreleaser/goreleaser:latest check
+      - name: Validate Grafana dashboard JSON
+        run: python3 -c "import json;json.load(open('deploy/grafana/dashboard.json'))"
 
   docker:
     runs-on: ubuntu-latest

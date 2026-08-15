@@ -1,0 +1,128 @@
+# goreleaser configuration — https://goreleaser.com
+#
+# `go install` works today; this exists because `brew install optictrace` is
+# what actually gets adoption. Builds are pure Go (CGO_ENABLED=0), which is
+# why cross-compiling to five platforms needs no toolchain gymnastics — the
+# SQLite driver is modernc's pure-Go port, chosen partly for this reason.
+version: 2
+
+project_name: optictrace
+
+before:
+  hooks:
+    - go mod tidy
+    # The dashboard is compiled into the release image, not the binary, so
+    # nothing to build here — the binary serves ui/out when present.
+
+builds:
+  - id: optictrace
+    main: ./cmd/optictrace
+    binary: optictrace
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+    mod_timestamp: "{{ .CommitTimestamp }}" # reproducible builds
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+      - optic.yaml
+      - optic.test.yaml
+
+checksum:
+  name_template: "checksums.txt"
+
+# Cosign keyless signing: provenance without a key to manage or leak.
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sig"
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-signature=${signature}"
+      - "--output-certificate=${certificate}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+    output: true
+
+sboms:
+  - artifacts: archive
+
+homebrew_casks:
+  - name: optictrace
+    repository:
+      owner: dwarka-prasad
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: "https://github.com/dwarka-prasad/optictrace"
+    description: "Declarative API telemetry & governance gateway"
+    license: "Apache-2.0"
+
+dockers_v2:
+  - id: optictrace
+    images:
+      - "ghcr.io/dwarka-prasad/optictrace"
+    tags:
+      - "{{ .Version }}"
+      - "latest"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    dockerfile: Dockerfile.release
+    labels:
+      org.opencontainers.image.source: "https://github.com/dwarka-prasad/optictrace"
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.licenses: "Apache-2.0"
+
+changelog:
+  sort: asc
+  use: github
+  groups:
+    - title: Features
+      regexp: '^feat'
+      order: 0
+    - title: Fixes
+      regexp: '^fix'
+      order: 1
+    - title: Documentation
+      regexp: '^docs'
+      order: 2
+    - title: Other
+      order: 99
+  filters:
+    exclude:
+      - "^test:"
+      - "^chore:"
+
+release:
+  github:
+    owner: dwarka-prasad
+    name: optictrace
+  footer: |
+    ---
+    **Verify a download**
+
+    ```bash
+    cosign verify-blob \
+      --certificate checksums.txt.pem \
+      --signature checksums.txt.sig \
+      --certificate-identity-regexp 'https://github.com/dwarka-prasad/optictrace' \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      checksums.txt
+    ```

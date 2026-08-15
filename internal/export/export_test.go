@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -154,6 +155,74 @@ func TestWebhookExporter(t *testing.T) {
 	}
 	if len(got) != 1 || len(got[0]) != 2 {
 		t.Fatalf("webhook did not receive the batch: %+v", got)
+	}
+}
+
+func TestOTLPExporterEmitsValidSpans(t *testing.T) {
+	var got map[string]any
+	var contentType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contentType = r.Header.Get("Content-Type")
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	e := newOTLPExporter(&config.ExporterCfg{Name: "otlp", Type: "otlp", URL: srv.URL}, "payments-api")
+	// The collector path is appended automatically.
+	if !strings.HasSuffix(e.endpoint, "/v1/traces") {
+		t.Errorf("endpoint should target the traces signal, got %q", e.endpoint)
+	}
+
+	rec := &store.Record{
+		Time: time.Now(), Method: "POST", Path: "/api/v1/payments/charge",
+		Route: "/api/v1/payments/**", Status: 500, DurationMS: 12.5,
+		Query:        "page=2&api_key=[REDACTED]",
+		Labels:       map[string]string{"tenant": "acme"},
+		Meters:       map[string]float64{"tokens": 128},
+		MatchedRules: []string{"redact-payments"},
+		RequestBody:  `{"secret":"must-not-be-exported"}`,
+		ResponseBody: `{"also":"must-not-be-exported"}`,
+	}
+	if err := e.Export(context.Background(), []*store.Record{rec}); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if contentType != "application/json" {
+		t.Errorf("content type = %q", contentType)
+	}
+
+	raw, _ := json.Marshal(got)
+	// Payload bodies must never reach a tracing backend: span attributes
+	// have different retention and access rules than the payload store.
+	if strings.Contains(string(raw), "must-not-be-exported") {
+		t.Error("OTLP export leaked a request/response body into span attributes")
+	}
+
+	rs := got["resourceSpans"].([]any)[0].(map[string]any)
+	spans := rs["scopeSpans"].([]any)[0].(map[string]any)["spans"].([]any)
+	if len(spans) != 1 {
+		t.Fatalf("want 1 span, got %d", len(spans))
+	}
+	span := spans[0].(map[string]any)
+	if span["name"] != "POST /api/v1/payments/**" {
+		t.Errorf("span name = %v", span["name"])
+	}
+	if id, _ := span["traceId"].(string); len(id) != 32 {
+		t.Errorf("traceId must be 16 bytes hex, got %q", id)
+	}
+	if id, _ := span["spanId"].(string); len(id) != 16 {
+		t.Errorf("spanId must be 8 bytes hex, got %q", id)
+	}
+	// 5xx must mark the span errored (STATUS_CODE_ERROR = 2).
+	if code := span["status"].(map[string]any)["code"]; code != float64(2) {
+		t.Errorf("5xx should set span status ERROR, got %v", code)
+	}
+	// Governed metadata should be present as attributes.
+	attrsJSON, _ := json.Marshal(span["attributes"])
+	for _, want := range []string{"optictrace.label.tenant", "acme", "optictrace.meter.tokens", "http.route", "url.query"} {
+		if !strings.Contains(string(attrsJSON), want) {
+			t.Errorf("span attributes missing %q", want)
+		}
 	}
 }
 

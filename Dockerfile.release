@@ -1,0 +1,20 @@
+# Release image. Unlike the top-level Dockerfile (which builds from source),
+# this one consumes the binary goreleaser has already cross-compiled, so the
+# release pipeline builds each platform exactly once.
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S optic && adduser -S optic -G optic \
+    && mkdir -p /data && chown optic:optic /data
+
+COPY optictrace /usr/local/bin/optictrace
+COPY optic.yaml /etc/optictrace/optic.yaml
+
+USER optic
+WORKDIR /data
+
+# 8080: proxied traffic · 9095: control plane (metrics, dashboard, APIs)
+EXPOSE 8080 9095
+
+ENTRYPOINT ["optictrace"]
+CMD ["run", "-config", "/etc/optictrace/optic.yaml"]

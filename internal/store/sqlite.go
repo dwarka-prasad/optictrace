@@ -387,6 +387,51 @@ func (s *SQLiteStore) UsageByLabel(ctx context.Context, since time.Time, label s
 	return out, nil
 }
 
+func (s *SQLiteStore) ServiceStats(ctx context.Context, since time.Time) ([]ServiceStat, error) {
+	sinceMs := since.UnixMilli()
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT COALESCE(NULLIF(service, ''), '(unnamed)') AS svc,
+		        COUNT(*), COALESCE(SUM(status >= 500), 0), COALESCE(AVG(duration_ms), 0),
+		        COUNT(DISTINCT route), GROUP_CONCAT(DISTINCT source), MAX(ts)
+		 FROM logs WHERE ts >= ? GROUP BY svc ORDER BY 2 DESC`, sinceMs)
+	if err != nil {
+		return nil, err
+	}
+	var out []ServiceStat
+	for rows.Next() {
+		var st ServiceStat
+		var lastMs int64
+		if err := rows.Scan(&st.Service, &st.Requests, &st.Errors, &st.AvgLatency,
+			&st.Routes, &st.Sources, &lastMs); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		st.LastSeen = time.UnixMilli(lastMs)
+		if st.Requests > 0 {
+			st.ErrorRate = float64(st.Errors) / float64(st.Requests)
+		}
+		out = append(out, st)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		st := &out[i]
+		offset := int64(0.95 * float64(st.Requests))
+		if offset >= st.Requests {
+			offset = st.Requests - 1
+		}
+		err := s.db.QueryRowContext(ctx,
+			`SELECT duration_ms FROM logs WHERE ts >= ? AND COALESCE(NULLIF(service, ''), '(unnamed)') = ?
+			 ORDER BY duration_ms LIMIT 1 OFFSET ?`, sinceMs, st.Service, offset).Scan(&st.P95Latency)
+		if err != nil && err != sql.ErrNoRows {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 func (s *SQLiteStore) Count(ctx context.Context) (int64, error) {
 	var n int64
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM logs`).Scan(&n)
