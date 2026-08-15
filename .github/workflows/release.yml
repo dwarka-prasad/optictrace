@@ -47,6 +47,23 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Optional: set this repo secret to publish the Homebrew formula.
-          # Without it, goreleaser skips the brew step rather than failing.
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN || secrets.GITHUB_TOKEN }}
+
+      # Images are built from the repo's own multi-stage Dockerfile rather
+      # than by goreleaser, so the published image includes the compiled
+      # dashboard and uses the exact build the `docker` CI job already
+      # exercises on every push.
+      - name: Publish multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: VERSION=${{ github.ref_name }}
+          tags: |
+            ghcr.io/dwarka-prasad/optictrace:${{ github.ref_name }}
+            ghcr.io/dwarka-prasad/optictrace:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/dwarka-prasad/optictrace
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.licenses=Apache-2.0

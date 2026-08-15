@@ -78,22 +78,6 @@ homebrew_casks:
     description: "Declarative API telemetry & governance gateway"
     license: "Apache-2.0"
 
-dockers_v2:
-  - id: optictrace
-    images:
-      - "ghcr.io/dwarka-prasad/optictrace"
-    tags:
-      - "{{ .Version }}"
-      - "latest"
-    platforms:
-      - linux/amd64
-      - linux/arm64
-    dockerfile: Dockerfile.release
-    labels:
-      org.opencontainers.image.source: "https://github.com/dwarka-prasad/optictrace"
-      org.opencontainers.image.version: "{{ .Version }}"
-      org.opencontainers.image.licenses: "Apache-2.0"
-
 changelog:
   sort: asc
   use: github
