@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dwarka-prasad/optictrace/internal/config"
 	"github.com/dwarka-prasad/optictrace/internal/engine"
@@ -216,6 +218,88 @@ rules:
 	}
 	if recs[0].ResponseBody != "" {
 		t.Errorf("restricted body must not be stored: %q", recs[0].ResponseBody)
+	}
+}
+
+// Tail-based sampling: uniform sampling is set so low that a random draw
+// essentially never keeps a body, yet errors and slow requests must still be
+// captured in full — that's the whole point of sampling by outcome.
+func TestTailSamplingRescuesErrorsAndSlowRequests(t *testing.T) {
+	yaml := `
+version: 1
+service: { name: tail }
+rules:
+  - name: sampled-with-tail
+    match: { path: "/api/**" }
+    sample: 0.0000001
+    keep_errors: true
+    keep_slower_than: 120ms
+`
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath := t.TempDir() + "/tail.db"
+	st, err := store.NewSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	w := store.NewAsyncWriter(st, 64, logger)
+	ic := NewInterceptor(cfg, engine.New(cfg), logger, WithStore(w))
+
+	app := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/boom":
+			rw.WriteHeader(http.StatusInternalServerError)
+			_, _ = rw.Write([]byte(`{"error":"kaboom-marker"}`))
+		case "/api/slow":
+			time.Sleep(160 * time.Millisecond)
+			_, _ = rw.Write([]byte(`{"ok":"slow-marker"}`))
+		default:
+			_, _ = rw.Write([]byte(`{"ok":"fast-marker"}`))
+		}
+	})
+	srv := httptest.NewServer(ic.Wrap(app))
+	t.Cleanup(srv.Close)
+
+	for _, p := range []string{"/api/boom", "/api/slow", "/api/fast", "/api/fast", "/api/fast"} {
+		resp, err := http.Get(srv.URL + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := store.NewSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recs, total, err := reopened.Query(context.Background(), store.Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Every request is recorded — sampling only ever governs BODIES.
+	if total != 5 {
+		t.Fatalf("all 5 exchanges should be recorded, got %d", total)
+	}
+	bodies := map[string]string{}
+	for _, r := range recs {
+		bodies[r.Path] = r.ResponseBody
+	}
+	if !strings.Contains(bodies["/api/boom"], "kaboom-marker") {
+		t.Errorf("keep_errors should have rescued the 500 body, got %q", bodies["/api/boom"])
+	}
+	if !strings.Contains(bodies["/api/slow"], "slow-marker") {
+		t.Errorf("keep_slower_than should have rescued the slow body, got %q", bodies["/api/slow"])
+	}
+	if strings.Contains(bodies["/api/fast"], "fast-marker") {
+		t.Errorf("fast 200s should have been sampled away, got %q", bodies["/api/fast"])
 	}
 }
 

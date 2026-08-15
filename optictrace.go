@@ -66,7 +66,8 @@ func New(configPath string, opts ...AgentOption) (*Agent, error) {
 	eng := engine.New(cfg)
 
 	if config.Bool(cfg.Telemetry.Metrics.Enabled) {
-		a.collector = metrics.New(cfg.Service.Name, cfg.Telemetry.Metrics.Buckets, eng.LabelKeys())
+		a.collector = metrics.New(cfg.Service.Name, cfg.Telemetry.Metrics.Buckets,
+			eng.LabelKeys(), cfg.Telemetry.Metrics.LabelValueCap())
 	}
 	if cfg.Telemetry.Store.Driver == "sqlite" {
 		sqlStore, err := store.NewSQLite(cfg.Telemetry.Store.DSN)

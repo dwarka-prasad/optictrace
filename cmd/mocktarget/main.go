@@ -27,6 +27,19 @@ func main() {
 		})
 	})
 
+	// A route deliberately NOT covered by the example optic.yaml rules —
+	// the "someone shipped an endpoint and forgot the governance" case that
+	// `optictrace scan` exists to catch.
+	mux.HandleFunc("POST /api/v1/orders", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var payload map[string]any
+		_ = json.Unmarshal(body, &payload)
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"order_id": "ord_9001",
+			"echo":     payload,
+		})
+	})
+
 	mux.HandleFunc("POST /api/v1/auth/login", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"token": "super-secret-session-token",

@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,11 +28,13 @@ import (
 	"github.com/dwarka-prasad/optictrace/internal/metrics"
 	"github.com/dwarka-prasad/optictrace/internal/mock"
 	"github.com/dwarka-prasad/optictrace/internal/proxy"
+	"github.com/dwarka-prasad/optictrace/internal/ruletest"
+	"github.com/dwarka-prasad/optictrace/internal/scan"
 	"github.com/dwarka-prasad/optictrace/internal/spec"
 	"github.com/dwarka-prasad/optictrace/internal/store"
 )
 
-var version = "0.4.0-dev" // overridden via -ldflags at release time
+var version = "0.5.0-dev" // overridden via -ldflags at release time
 
 func main() {
 	args := os.Args[1:]
@@ -49,6 +52,8 @@ func main() {
 	lang := fs.String("lang", "typescript", "SDK language (sdk)")
 	listen := fs.String("listen", ":7070", "mock server listen address (mock)")
 	ai := fs.Bool("ai", false, "mock: generate responses with Claude when ANTHROPIC_API_KEY is set")
+	testsPath := fs.String("tests", "optic.test.yaml", "rule test file (test)")
+	failOn := fs.String("fail-on", "high", "scan: minimum severity that exits non-zero (critical|high|medium|never)")
 	_ = fs.Parse(args)
 
 	switch cmd {
@@ -64,11 +69,91 @@ func main() {
 		sdkGenerate(*configPath, *specPath, *window, *lang, *outPath)
 	case "mock":
 		mockServe(*specPath, *listen, *ai)
+	case "scan":
+		scanTraffic(*configPath, *window, *failOn)
+	case "test":
+		ruleTest(*configPath, *testsPath)
 	case "version":
 		fmt.Println("optictrace", version)
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q (run, validate, spec, check, sdk, mock, version)\n", cmd)
+		fmt.Fprintf(os.Stderr,
+			"unknown command %q\n  (run, validate, test, scan, spec, check, sdk, mock, version)\n", cmd)
 		os.Exit(2)
+	}
+}
+
+// scanTraffic is the safety net: it looks for values that LOOK sensitive in
+// records that already passed governance — the field you forgot to declare.
+func scanTraffic(configPath string, window time.Duration, failOn string) {
+	_, records := loadTraffic(configPath, window)
+	if len(records) == 0 {
+		fmt.Fprintln(os.Stderr, "✗ no traffic captured in this window — nothing to scan")
+		os.Exit(1)
+	}
+	report := scan.Records(records, time.Now().Add(-window))
+	crit, high, med := report.Counts()
+
+	if len(report.Findings) == 0 {
+		fmt.Printf("✓ scanned %d record(s) over %s — no sensitive values found outside your rules\n",
+			report.Scanned, window)
+		return
+	}
+
+	icons := map[string]string{scan.SevCritical: "✗", scan.SevHigh: "⚠", scan.SevMedium: "·"}
+	for _, f := range report.Findings {
+		fmt.Printf("%s [%s] %s in %s %s → %s.%s\n",
+			icons[f.Severity], f.Severity, f.Kind, f.Method, f.Route, f.Location, f.Field)
+		fmt.Printf("    %s · seen %d× (last %s ago) · sample %s\n",
+			f.Why, f.Count, ago(f.LastAt), f.Sample)
+		fmt.Printf("    fix: %s\n\n", strings.ReplaceAll(f.Suggest, "\n", "\n         "))
+	}
+	fmt.Printf("scanned %d record(s): %d critical, %d high, %d medium\n",
+		report.Scanned, crit, high, med)
+
+	if failOn != "never" && report.HasAtLeast(failOn) {
+		fmt.Fprintf(os.Stderr, "\n✗ sensitive data found at or above severity %q\n", failOn)
+		os.Exit(1)
+	}
+}
+
+// ruleTest asserts optic.yaml behaves as intended, without a running server.
+func ruleTest(configPath, testsPath string) {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+		os.Exit(1)
+	}
+	cases, err := ruletest.Load(testsPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+		os.Exit(1)
+	}
+	res := ruletest.Run(engine.New(cfg), cases)
+
+	for _, f := range res.Failures {
+		fmt.Printf("✗ %s\n    %s\n      want: %s\n      got:  %s\n", f.Case, f.Assert, f.Want, f.Got)
+	}
+	if len(res.Failures) == 0 {
+		fmt.Printf("✓ %d/%d rule test(s) passed against %s\n", res.Passed, res.Total, configPath)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\n✗ %d/%d passed — %d assertion(s) failed\n",
+		res.Passed, res.Total, len(res.Failures))
+	os.Exit(1)
+}
+
+func ago(t time.Time) string {
+	if t.IsZero() {
+		return "unknown"
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	default:
+		return fmt.Sprintf("%.1fh", d.Hours())
 	}
 }
 
@@ -236,7 +321,8 @@ func run(configPath, uiDir string) {
 	// --- metrics -------------------------------------------------------
 	var collector *metrics.Collector
 	if config.Bool(cfg.Telemetry.Metrics.Enabled) {
-		collector = metrics.New(cfg.Service.Name, cfg.Telemetry.Metrics.Buckets, eng.LabelKeys())
+		collector = metrics.New(cfg.Service.Name, cfg.Telemetry.Metrics.Buckets,
+			eng.LabelKeys(), cfg.Telemetry.Metrics.LabelValueCap())
 	}
 
 	// --- payload store ---------------------------------------------------

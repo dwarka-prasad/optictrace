@@ -104,6 +104,14 @@ type Metrics struct {
 	// Buckets are latency histogram bounds in seconds. Defaults tuned for
 	// API traffic (1ms .. 10s).
 	Buckets []float64 `yaml:"buckets"`
+	// MaxLabelValues caps how many DISTINCT values each custom label may
+	// contribute to metrics. Label values come from arbitrary request
+	// headers, so one buggy or hostile client can otherwise blow up
+	// Prometheus cardinality. Beyond the cap, values collapse into
+	// "__over_limit__" and optictrace_label_capped_total increments.
+	// Route cardinality is already bounded by design; this closes the same
+	// hole for custom labels. Default 500; an explicit 0 disables the guard.
+	MaxLabelValues *int `yaml:"max_label_values"`
 }
 
 // StoreCfg configures asynchronous payload persistence.
@@ -152,6 +160,12 @@ type Rule struct {
 	// (0..1]. Metrics and metadata are always recorded in full — sampling
 	// only bounds payload volume on hot routes. Later rules override.
 	Sample *float64 `yaml:"sample"`
+	// KeepErrors and KeepSlowerThan are TAIL-BASED sampling: they rescue
+	// interesting requests that uniform `sample` would have thrown away.
+	// The decision is made after the response, so a route using either one
+	// buffers bodies for every request and discards them at the end.
+	KeepErrors     *bool  `yaml:"keep_errors"`      // always capture status >= 500
+	KeepSlowerThan string `yaml:"keep_slower_than"` // Go duration, e.g. "500ms"
 	// Meter extracts numeric usage figures from RESPONSE bodies by JSON
 	// path — e.g. tokens: "$.usage.total_tokens" for LLM APIs. Values are
 	// summed per consumer for usage/cost attribution. Metering is
@@ -224,6 +238,10 @@ func applyTelemetryDefaults(t *Telemetry) {
 		if t.Billing.Currency == "" {
 			t.Billing.Currency = "USD"
 		}
+	}
+	if t.Metrics.MaxLabelValues == nil {
+		def := 500
+		t.Metrics.MaxLabelValues = &def
 	}
 	if len(t.Metrics.Buckets) == 0 {
 		t.Metrics.Buckets = []float64{
@@ -371,7 +389,37 @@ func (r *Rule) validate() error {
 			return fmt.Errorf("meter.%s: %q must be a dotted path starting with '$.'", name, path)
 		}
 	}
+	if r.KeepSlowerThan != "" {
+		d, err := time.ParseDuration(r.KeepSlowerThan)
+		if err != nil {
+			return fmt.Errorf("keep_slower_than: %w", err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("keep_slower_than %q must be positive", r.KeepSlowerThan)
+		}
+	}
 	return nil
+}
+
+// SlowerThan returns the parsed tail-sampling latency threshold (0 = unset).
+// Validated at load time, so parse errors are impossible here.
+func (r *Rule) SlowerThan() time.Duration {
+	if r.KeepSlowerThan == "" {
+		return 0
+	}
+	d, _ := time.ParseDuration(r.KeepSlowerThan)
+	return d
+}
+
+// LabelValueCap resolves the cardinality guard (0 = disabled).
+func (m *Metrics) LabelValueCap() int {
+	if m.MaxLabelValues == nil {
+		return 500
+	}
+	if *m.MaxLabelValues < 0 {
+		return 0
+	}
+	return *m.MaxLabelValues
 }
 
 // Bool resolves an optional flag against the opt-out default (true).

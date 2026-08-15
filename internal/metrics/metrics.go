@@ -16,6 +16,7 @@ package metrics
 import (
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -34,10 +35,22 @@ type Observation struct {
 	Labels    map[string]string // values for the custom label schema
 }
 
+// OverLimit replaces a custom label's value once that label has already
+// contributed maxLabelValues distinct values. Every subsequent unseen value
+// collapses into this single series, so cardinality stops growing.
+const OverLimit = "__over_limit__"
+
 // Collector aggregates per-request metrics and serves them via Handler().
 type Collector struct {
 	registry  *prometheus.Registry
 	labelKeys []string
+
+	// Cardinality guard. Label values arrive from arbitrary request headers,
+	// so an unbounded value space is a real availability risk for the
+	// Prometheus scraping this. seen tracks distinct values per label key.
+	maxLabelValues int
+	cardMu         sync.Mutex
+	seen           map[string]map[string]struct{}
 
 	requests *prometheus.CounterVec
 	duration *prometheus.HistogramVec
@@ -50,11 +63,15 @@ type Collector struct {
 	exported     *prometheus.CounterVec
 	exportFailed *prometheus.CounterVec
 	exportDrops  *prometheus.CounterVec
+
+	labelCapped   *prometheus.CounterVec
+	labelDistinct *prometheus.GaugeVec
 }
 
 // New builds a Collector for one service. customKeys is the fixed set of
-// optic.yaml label names (from engine.LabelKeys()).
-func New(service string, buckets []float64, customKeys []string) *Collector {
+// optic.yaml label names (from engine.LabelKeys()); maxLabelValues caps the
+// distinct values each may contribute (0 disables the guard).
+func New(service string, buckets []float64, customKeys []string, maxLabelValues int) *Collector {
 	reg := prometheus.NewRegistry()
 	constLabels := prometheus.Labels{"service": service}
 
@@ -65,8 +82,10 @@ func New(service string, buckets []float64, customKeys []string) *Collector {
 	sizeBuckets := prometheus.ExponentialBuckets(64, 4, 10) // 64B .. ~16MB
 
 	c := &Collector{
-		registry:  reg,
-		labelKeys: customKeys,
+		registry:       reg,
+		labelKeys:      customKeys,
+		maxLabelValues: maxLabelValues,
+		seen:           make(map[string]map[string]struct{}, len(customKeys)),
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "optictrace_requests_total", Help: "Total HTTP requests observed.",
 			ConstLabels: constLabels,
@@ -107,11 +126,22 @@ func New(service string, buckets []float64, customKeys []string) *Collector {
 			Name: "optictrace_export_dropped_total", Help: "Records dropped because an exporter queue was full.",
 			ConstLabels: constLabels,
 		}, []string{"exporter"}),
+		labelCapped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "optictrace_label_capped_total",
+			Help:        "Observations whose custom label value was replaced by __over_limit__ because the cardinality cap was reached.",
+			ConstLabels: constLabels,
+		}, []string{"label"}),
+		labelDistinct: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name:        "optictrace_label_distinct_values",
+			Help:        "Distinct values observed per custom label, up to the cardinality cap.",
+			ConstLabels: constLabels,
+		}, []string{"label"}),
 	}
 	reg.MustRegister(
 		c.requests, c.duration, c.reqSize, c.respSize,
 		c.inflight, c.dropped, c.ingested,
 		c.exported, c.exportFailed, c.exportDrops,
+		c.labelCapped, c.labelDistinct,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
@@ -128,8 +158,9 @@ func (c *Collector) Observe(o Observation) {
 	durationVals := make([]string, 0, 2+len(c.labelKeys))
 	durationVals = append(durationVals, o.Method, o.Route)
 	for _, k := range c.labelKeys {
-		counterVals = append(counterVals, o.Labels[k])
-		durationVals = append(durationVals, o.Labels[k])
+		v := c.guard(k, o.Labels[k])
+		counterVals = append(counterVals, v)
+		durationVals = append(durationVals, v)
 	}
 
 	c.requests.WithLabelValues(counterVals...).Inc()
@@ -140,6 +171,35 @@ func (c *Collector) Observe(o Observation) {
 	if o.RespBytes > 0 {
 		c.respSize.WithLabelValues(o.Method, o.Route).Observe(float64(o.RespBytes))
 	}
+}
+
+// guard enforces the per-label cardinality cap, returning either the original
+// value or OverLimit. Empty values are always allowed through: they mean
+// "this request had no such header", which is one series, not unbounded.
+func (c *Collector) guard(key, value string) string {
+	if c.maxLabelValues <= 0 || value == "" {
+		return value
+	}
+	c.cardMu.Lock()
+	defer c.cardMu.Unlock()
+
+	vals := c.seen[key]
+	if vals == nil {
+		vals = make(map[string]struct{}, 8)
+		c.seen[key] = vals
+	}
+	if _, known := vals[value]; known {
+		return value
+	}
+	if len(vals) >= c.maxLabelValues {
+		// Cap reached: fold every new value into one bucket so the series
+		// count stops growing, and make that visible in metrics.
+		c.labelCapped.WithLabelValues(key).Inc()
+		return OverLimit
+	}
+	vals[value] = struct{}{}
+	c.labelDistinct.WithLabelValues(key).Set(float64(len(vals)))
+	return value
 }
 
 // InflightInc/Dec bracket a proxied request.

@@ -107,8 +107,12 @@ func (ic *Interceptor) Wrap(next http.Handler) http.Handler {
 		start := time.Now()
 		policy := ic.engine.Load().Evaluate(r.Method, r.URL.Path)
 
-		// Sampling gates body capture only — metrics/metadata stay complete.
-		sampled := policy.SampleRate >= 1.0 || rand.Float64() < policy.SampleRate
+		// Uniform sampling draw, made up front. Tail-based rules can rescue
+		// a request this draw discarded, but only once the outcome is known
+		// — so when they're configured we buffer regardless and decide in
+		// emit(). Metrics and metadata are never sampled.
+		drew := policy.SampleRate >= 1.0 || rand.Float64() < policy.SampleRate
+		buffer := drew || policy.TailSampled()
 
 		if ic.collector != nil {
 			ic.collector.InflightInc()
@@ -117,7 +121,7 @@ func (ic *Interceptor) Wrap(next http.Handler) http.Handler {
 
 		// --- Request-side capture (tee, never consume) -------------------
 		var reqBuf *limitedBuffer
-		if sampled && policy.CaptureRequestBody && r.Body != nil {
+		if buffer && policy.CaptureRequestBody && r.Body != nil {
 			reqBuf = &limitedBuffer{limit: policy.CaptureLimitBytes}
 			r.Body = &teeReadCloser{rc: r.Body, tee: reqBuf}
 		}
@@ -126,18 +130,21 @@ func (ic *Interceptor) Wrap(next http.Handler) http.Handler {
 		// Meters need response bytes even when body *storage* is restricted
 		// or sampled out — the buffer is then used for extraction only.
 		rw := &recordingWriter{ResponseWriter: w, status: http.StatusOK}
-		if (sampled && policy.CaptureResponseBody) || len(policy.Meters) > 0 {
+		if (buffer && policy.CaptureResponseBody) || len(policy.Meters) > 0 {
 			rw.buf = &limitedBuffer{limit: policy.CaptureLimitBytes}
 		}
 
 		next.ServeHTTP(rw, r)
 
-		ic.emit(r, rw, reqBuf, &policy, sampled, time.Since(start))
+		elapsed := time.Since(start)
+		keep := policy.KeepBody(drew, rw.status, elapsed)
+		ic.emit(r, rw, reqBuf, &policy, keep, elapsed)
 	})
 }
 
-// emit builds the canonical record and fans it out to the sinks.
-func (ic *Interceptor) emit(r *http.Request, rw *recordingWriter, reqBuf *limitedBuffer, p *engine.Policy, sampled bool, elapsed time.Duration) {
+// emit builds the canonical record and fans it out to the sinks. keep is the
+// final body-retention decision (uniform draw, possibly rescued by tail rules).
+func (ic *Interceptor) emit(r *http.Request, rw *recordingWriter, reqBuf *limitedBuffer, p *engine.Policy, keep bool, elapsed time.Duration) {
 	route := p.RoutePattern
 	if route == "" {
 		route = engine.NormalizeRoute(r.URL.Path)
@@ -162,14 +169,14 @@ func (ic *Interceptor) emit(r *http.Request, rw *recordingWriter, reqBuf *limite
 		rec.RequestHeaders = p.SanitizeHeaders(r.Header)
 		rec.ResponseHeaders = p.SanitizeHeaders(rw.Header())
 	}
-	if reqBuf != nil {
+	if keep && reqBuf != nil {
 		rec.RequestBody, rec.ReqTruncated = renderBody(reqBuf, r.Header.Get("Content-Type"), p)
 	}
 	if rw.buf != nil {
 		// Meters read the raw buffer; the body is only STORED when capture
-		// policy + sampling allow it.
+		// policy and the sampling decision both allow it.
 		rec.Meters = p.ExtractMeters(rw.buf.Bytes())
-		if sampled && p.CaptureResponseBody {
+		if keep && p.CaptureResponseBody {
 			rec.ResponseBody, rec.RespTruncated = renderBody(rw.buf, rw.Header().Get("Content-Type"), p)
 		}
 	}

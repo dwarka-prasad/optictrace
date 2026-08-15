@@ -1,0 +1,98 @@
+# =============================================================================
+# optic.test.yaml — assertions about optic.yaml, run by `optictrace test`
+# =============================================================================
+# Governance rules are security-critical, but without tests they're only
+# verifiable by eyeball or by pushing live traffic. These cases run against
+# the real rule engine with no server and no network, so CI can prove that a
+# refactor didn't quietly stop redacting something.
+#
+#   optictrace test -config optic.yaml -tests optic.test.yaml
+#
+# Every `expect` field is optional — assert only what the case is about.
+# =============================================================================
+
+- name: auth routes record metadata only
+  request:
+    method: POST
+    path: /api/v1/auth/login
+    headers: { Authorization: "Bearer real-token" }
+    body: { username: ada, password: hunter2 }
+    response: { token: session-token }
+  expect:
+    matched_rules: [no-capture-on-auth]
+    captures_request_body: false
+    captures_response_body: false
+    captures_headers: false
+    stored_request_body: ""
+    stored_response_body: ""
+    # The assertion that actually matters: nothing sensitive survives anywhere.
+    not_contains: ["hunter2", "session-token", "Bearer real-token"]
+
+- name: payment secrets are masked, ordinary fields are kept
+  request:
+    method: POST
+    path: /api/v1/payments/charge
+    headers:
+      Authorization: "Bearer sk_live_abc"
+      X-Tenant-ID: acme
+      X-Region: ap-south-1
+    body:
+      amount: 4200
+      credit_card: { number: "4111111111111111", cvv: "123" }
+      customer: { email: ada@example.com, name: Ada }
+  expect:
+    matched_rules: [redact-payment-secrets]
+    redacted_headers: [Authorization]
+    labels: { tenant: acme, region: ap-south-1 }
+    not_contains: ["4111111111111111", "123", "ada@example.com", "sk_live_abc"]
+
+- name: redaction follows a payload echoed back inside a wrapper
+  # Regression guard: an upstream that echoes the request must not leak it
+  # through the response. This is why the rules use `$.**` recursive descent.
+  request:
+    method: POST
+    path: /api/v1/payments/charge
+    response:
+      charge_id: ch_12345
+      echo:
+        credit_card: { number: "4111111111111111", cvv: "123" }
+        customer: { email: ada@example.com }
+  expect:
+    not_contains: ["4111111111111111", "ada@example.com"]
+
+- name: non-sensitive payment fields are still observable
+  request:
+    method: POST
+    path: /api/v1/payments/charge
+    body: { amount: 4200, currency: USD, credit_card: { number: "4111111111111111" } }
+  expect:
+    stored_request_body: '{"amount":4200,"credit_card":{"number":"[REDACTED]"},"currency":"USD"}'
+
+- name: ai route meters tokens without storing the prompt or completion
+  request:
+    method: POST
+    path: /api/v1/ai/complete
+    headers: { X-Tenant-ID: acme }
+    body: { prompt: "a private prompt" }
+    response:
+      completion: "a private completion"
+      usage: { total_tokens: 128 }
+  expect:
+    matched_rules: [meter-ai-tokens]
+    captures_request_body: false
+    captures_response_body: false
+    meters: { tokens: 128 }
+    labels: { tenant: acme }
+    not_contains: ["a private prompt", "a private completion"]
+
+- name: unmatched routes fall back to capturing everything
+  request:
+    method: GET
+    path: /api/v1/users/42
+    response: { id: "42", name: Ada Lovelace }
+  expect:
+    matched_rules: []
+    route: /api/v1/users/:id
+    captures_request_body: true
+    captures_response_body: true
+    captures_headers: true

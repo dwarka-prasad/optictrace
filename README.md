@@ -10,7 +10,7 @@ Prometheus dimensions.
 
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/status-v0.4.0--dev-orange)](#roadmap)
+[![Status](https://img.shields.io/badge/status-v0.5.0--dev-orange)](#roadmap)
 
 </div>
 
@@ -60,6 +60,8 @@ rules:
 
 And because OpticTrace owns your real traffic history, it does things static tools can't:
 
+- 🕵️ **Leak detector** — `optictrace scan` finds sensitive values your rules *didn't* cover. Redaction masks what you name; this catches the field you forgot, and prints the rule that would have stopped it.
+- 🧪 **Testable governance** — `optictrace test` asserts your rules behave as intended, with no server and no network, so CI proves a refactor didn't stop redacting.
 - 🧬 **Traffic → OpenAPI → SDK** — `optictrace spec` infers a spec from what clients *actually* send; `optictrace sdk` emits a typed TypeScript client.
 - 🚨 **Breaking-change linter** — `optictrace check` answers *"is any live client actually using the field I'm about to remove?"* with usage counts and last-seen times. Exits non-zero in CI.
 - 🎭 **Stateful mock server** — `optictrace mock` gives you a mock where `POST /cart` then `GET /cart` really returns the added item; optional AI-generated responses via Claude.
@@ -324,9 +326,12 @@ rules stay live.
 | Redaction | ✅ | Mask headers by name and JSON fields by path, incl. wildcard and recursive descent |
 | Custom labels | ✅ | Extracted from headers or query params; become real Prometheus dimensions |
 | Body sampling | ✅ | Capture payloads for a fraction of matches; metrics and metadata stay complete |
+| Tail-based sampling | ✅ | `keep_errors` and `keep_slower_than` rescue 5xx and slow requests that a uniform draw would have discarded |
 | Metering | ✅ | Pull numbers out of responses by JSON path — works even on fully restricted routes |
 | Hot reload | ✅ | `SIGHUP` or API; invalid configs rejected, old rules stay live |
 | Strict validation | ✅ | Unknown keys rejected at load; `optictrace validate` for CI |
+| Rule unit tests | ✅ | `optictrace test` asserts matched rules, capture flags, redacted output, labels, meters and leak absence |
+| Leak detection | ✅ | `optictrace scan` finds sensitive values outside your rules and suggests the fix; masked output only |
 
 ### Observability & storage
 
@@ -335,7 +340,7 @@ rules stay live.
 | Prometheus exporter | ✅ | Ten metric families on a **private registry**, so embedding never collides with an app's own |
 | Bounded cardinality | ✅ | `route` is always a rule glob or normalized pattern — `/users/42` → `/users/:id` |
 | SQLite payload store | ✅ | Pure-Go driver (no CGO), WAL mode, async writer that drops under backpressure, retention pruning |
-| Custom-label cardinality | 🟡 | Label *values* come from arbitrary headers and are **not** capped — see [roadmap](#tier-1--closes-a-real-risk) |
+| Label cardinality guard | ✅ | Caps distinct values per custom label (default 500); overflow collapses to `__over_limit__` and is counted |
 | ClickHouse / Postgres | ⬜ | `LogStore` is driver-agnostic, but only `sqlite` and `none` are implemented |
 | OpenTelemetry export | ⬜ | Prometheus scrape is the supported path today |
 
@@ -380,6 +385,8 @@ rules stay live.
 |---|---|
 | `optictrace run` | Start proxy + control plane |
 | `optictrace validate` | Lint `optic.yaml` (CI-friendly) |
+| `optictrace test` | Assert rules behave as intended; exit 1 on failure |
+| `optictrace scan` | Find sensitive values your rules missed; exit 1 on findings |
 | `optictrace spec` | Infer OpenAPI from captured traffic |
 | `optictrace check` | Spec vs. live usage; exit 1 on breaking findings |
 | `optictrace sdk` | Generate a typed TypeScript client |
@@ -398,6 +405,7 @@ rules stay live.
 | `GET /api/routes` | Per-route latency breakdown |
 | `GET /api/rules/stats` | Rules joined with live match counts |
 | `GET /api/usage` | Per-consumer usage and cost (`&format=csv`) |
+| `GET /api/scan` | Sensitive values found outside your rules (masked) |
 | `GET /api/spec` | OpenAPI inferred from traffic |
 | `GET /api/export` | CSV or JSONL download of captured records |
 | `GET /api/config` | Current config + validity |
@@ -420,6 +428,8 @@ rules stay live.
 | `optictrace_exported_total` | counter | `exporter` |
 | `optictrace_export_failed_total` | counter | `exporter` |
 | `optictrace_export_dropped_total` | counter | `exporter` |
+| `optictrace_label_capped_total` | counter | `label` |
+| `optictrace_label_distinct_values` | gauge | `label` |
 
 P99 per route:
 
@@ -433,6 +443,73 @@ histogram_quantile(0.99,
 ## Traffic-powered tooling
 
 All of these read the same governed traffic history in the payload store.
+
+### Catch what your rules missed
+
+Redaction only masks what you **name**. The failure that actually bites is the
+field nobody wrote a rule for — a new endpoint ships and secrets land in the
+store. `scan` inverts the model: it reads records that already passed
+governance and flags values that *look* sensitive anyway.
+
+```bash
+optictrace scan -window 24h
+```
+
+```
+✗ [critical] github-token in POST /api/v1/orders → request_body.$.debug_token
+    a GitHub personal access / app token · seen 4× (last 8s ago) · sample gh•••••••••••••89
+    fix: redact:
+           json_fields: ["$.debug_token"]
+
+⚠ [high] credit-card in POST /api/v1/orders → response_body.$.echo.payment.pan
+    a Luhn-valid card number — PCI-DSS scope · seen 4× (last 8s ago) · sample 55••••••••••59
+    fix: redact:
+           json_fields: ["$.echo.payment.pan"]
+
+scanned 8 record(s): 2 critical, 2 high, 3 medium
+```
+
+Detectors are structural — issuer prefixes, Luhn and mod-97 checksums, PEM
+framing — not "looks random", so order IDs and timestamps don't trip them.
+**Findings never print the value they found**: a scanner that echoes a
+credential has just leaked it again, into your CI logs. Every sample is
+masked, and the suggested rule is copy-pasteable into `optic.yaml`.
+
+Exits non-zero at or above `-fail-on` (default `high`), so it gates CI.
+Also available at `GET /api/scan`.
+
+### Test your governance rules
+
+Rules are security-critical but, without tests, verifiable only by eyeball or
+by pushing live traffic. `optictrace test` runs assertions against the real
+engine — no server, no network:
+
+```yaml
+# optic.test.yaml
+- name: auth routes record metadata only
+  request:
+    method: POST
+    path: /api/v1/auth/login
+    body: { username: ada, password: hunter2 }
+    response: { token: session-token }
+  expect:
+    matched_rules: [no-capture-on-auth]
+    captures_request_body: false
+    not_contains: ["hunter2", "session-token"]   # the assertion that matters
+
+- name: tail sampling rescues server errors
+  request: { method: POST, path: /api/v1/ai/complete, status: 500 }
+  expect: { keeps_body: true }
+```
+
+```bash
+optictrace test -config optic.yaml -tests optic.test.yaml
+# ✓ 6/6 rule test(s) passed against optic.yaml
+```
+
+Every `expect` field is optional, so a case asserts only what it's about and
+won't break on unrelated config changes. See [`optic.test.yaml`](optic.test.yaml)
+for the full shipped example.
 
 ### Infer a spec, lint a proposal, generate an SDK
 
@@ -575,41 +652,14 @@ proxy, not asserted from the code:
 Ordered by value, not by ease. Each item states the problem it solves — if the rationale
 doesn't hold for your use case, the item shouldn't be built.
 
-### Tier 1 — closes a real risk
+### Tier 1 — ✅ shipped in v0.5.0
 
-**1. Leak detector (`optictrace scan`)**
-Today OpticTrace masks only what you *name*. The failure mode that actually bites is the
-field you **forgot**. A scanner over stored records that flags values matching
-high-confidence sensitive patterns — Luhn-valid card numbers, JWTs, private-key headers,
-cloud access keys — turns governance from "a deny-list you maintain" into "a deny-list plus
-a safety net", and can gate CI against a staging capture. For a *governance* tool this is
-the single highest-value addition.
+These closed the sharpest risks in the design and are all live now:
 
-**2. Label cardinality guard**
-Custom label values come from arbitrary request headers. `X-Tenant-ID` is bounded in theory;
-one buggy or hostile client makes it unbounded, and unbounded label values are how you take
-down a Prometheus. Route cardinality is already bounded — labels are the remaining hole. Cap
-distinct values per label, bucket overflow into `__over_limit__`, and expose a metric when
-the cap engages.
-
-**3. Tail-based sampling**
-`sample: 0.25` is uniform random, which discards exactly the requests you most want to keep.
-Sample by outcome instead: retain 100% of 5xx and anything above a latency threshold, sample
-the boring 200s. Small change, large improvement in the value of what's stored.
-
-**4. `optictrace test` — rule unit tests**
-Governance rules are security-critical but currently verifiable only by eyeball or by
-pushing real traffic. A fixture file of requests with expected policy outcomes, runnable in
-CI, would make rules safe to refactor:
-
-```yaml
-# optic.test.yaml (proposed)
-- request: { method: POST, path: /api/v1/payments/charge, body: {credit_card: {number: "4111..."}} }
-  expect:
-    matched_rules: [redact-payment-secrets]
-    stored_body: '{"credit_card":{"number":"[REDACTED]"}}'
-    captures_headers: false
-```
+- **Leak detector** (`optictrace scan`) — governance is no longer only a deny-list you maintain; it has a safety net that catches the field you forgot and prints the rule that fixes it.
+- **Label cardinality guard** — custom label values come from arbitrary request headers, so one buggy client could previously have created unbounded series. Now capped, with overflow visible as a metric.
+- **Tail-based sampling** — uniform sampling discarded exactly the requests worth keeping. `keep_errors` and `keep_slower_than` rescue them after the outcome is known.
+- **Rule unit tests** (`optictrace test`) — governance rules are safe to refactor now that CI can prove they still redact.
 
 ### Tier 2 — completeness
 
@@ -658,13 +708,15 @@ cd ui && npm install && npm run dev    # dashboard
 ## Project layout
 
 ```
-cmd/optictrace/     agent binary (run · validate · spec · check · sdk · mock · version)
+cmd/optictrace/     agent binary (run · validate · test · scan · spec · check · sdk · mock · version)
 internal/config/    optic.yaml schema + strict validation
 internal/engine/    compiled rule engine: globs, policy merge, redaction, meters
 internal/proxy/     interception (reverse proxy + embeddable middleware)
 internal/metrics/   Prometheus collector with dynamic label schemas
 internal/store/     LogStore interface, SQLite driver, async writer, usage aggregation
 internal/export/    output plugins: file · webhook · command (custom executables)
+internal/scan/      leak detector: structural detectors, masked findings, fix suggestions
+internal/ruletest/  optic.test.yaml runner (pure engine, no server)
 internal/spec/      traffic→OpenAPI inference, spec-vs-traffic linter, TS SDK gen
 internal/mock/      stateful mock server (+ optional Claude-generated responses)
 internal/admin/     admin API + dashboard hosting

@@ -16,6 +16,12 @@ ui: ## Build the dashboard (static export served by the agent)
 validate: build ## Lint optic.yaml
 	./bin/optictrace validate -config optic.yaml
 
+rules: build ## Run governance rule assertions (optic.test.yaml)
+	./bin/optictrace test -config optic.yaml -tests optic.test.yaml
+
+scan: build ## Find sensitive values your rules missed (needs captured traffic)
+	./bin/optictrace scan -config optic.yaml -window 24h
+
 demo: build ## Run the local end-to-end demo
 	./scripts/demo.sh
 

@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/dwarka-prasad/optictrace/internal/config"
 )
@@ -60,6 +61,13 @@ type Policy struct {
 	// captured (1.0 = all). Metrics and metadata ignore sampling.
 	SampleRate float64
 
+	// KeepErrors and KeepSlowerThan are tail-based sampling: they rescue
+	// requests that the uniform SampleRate draw would have discarded.
+	// Because the outcome is only known after the response, a policy with
+	// either set buffers bodies for every request and decides at the end.
+	KeepErrors     bool
+	KeepSlowerThan time.Duration
+
 	// Meters maps meter names to pre-split response-body JSON paths whose
 	// numeric values are extracted for usage/cost attribution. Metering is
 	// independent of capture restriction and sampling.
@@ -71,10 +79,35 @@ func (p *Policy) CapturesAnything() bool {
 	return p.CaptureRequestBody || p.CaptureResponseBody || p.CaptureHeaders
 }
 
+// TailSampled reports whether tail-based rules are in play, meaning the
+// keep/discard decision must be deferred until the response is complete.
+func (p *Policy) TailSampled() bool {
+	return p.KeepErrors || p.KeepSlowerThan > 0
+}
+
+// KeepBody decides whether a request's captured bodies are retained.
+// drew is the uniform SampleRate draw made at request start; status and
+// elapsed are the outcome. Tail rules can only ever rescue a request that
+// the draw discarded — they never suppress one it kept.
+func (p *Policy) KeepBody(drew bool, status int, elapsed time.Duration) bool {
+	if drew {
+		return true
+	}
+	if p.KeepErrors && status >= 500 {
+		return true
+	}
+	if p.KeepSlowerThan > 0 && elapsed >= p.KeepSlowerThan {
+		return true
+	}
+	return false
+}
+
 type compiledRule struct {
 	name        string
 	rawPattern  string
 	sample      *float64
+	keepErrors  *bool
+	keepSlower  time.Duration
 	pathSegs    []string
 	methods     map[string]struct{} // nil = all methods
 	restrict    []config.CaptureField
@@ -98,6 +131,8 @@ func New(cfg *config.Config) *Engine {
 			name:       r.Name,
 			rawPattern: r.Match.Path,
 			sample:     r.Sample,
+			keepErrors: r.KeepErrors,
+			keepSlower: r.SlowerThan(),
 			pathSegs:   splitPath(r.Match.Path),
 			restrict:   r.Restrict,
 		}
@@ -162,6 +197,12 @@ func (e *Engine) Evaluate(method, urlPath string) Policy {
 		p.RoutePattern = r.rawPattern
 		if r.sample != nil {
 			p.SampleRate = *r.sample
+		}
+		if r.keepErrors != nil {
+			p.KeepErrors = *r.keepErrors
+		}
+		if r.keepSlower > 0 {
+			p.KeepSlowerThan = r.keepSlower
 		}
 		for _, f := range r.restrict {
 			switch f {

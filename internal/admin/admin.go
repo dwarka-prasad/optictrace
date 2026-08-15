@@ -29,6 +29,7 @@ import (
 	"github.com/dwarka-prasad/optictrace/internal/config"
 	"github.com/dwarka-prasad/optictrace/internal/export"
 	"github.com/dwarka-prasad/optictrace/internal/metrics"
+	"github.com/dwarka-prasad/optictrace/internal/scan"
 	"github.com/dwarka-prasad/optictrace/internal/spec"
 	"github.com/dwarka-prasad/optictrace/internal/store"
 )
@@ -65,6 +66,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/system", s.system)
 	mux.HandleFunc("GET /api/spec", s.inferSpec)
 	mux.HandleFunc("GET /api/usage", s.usage)
+	mux.HandleFunc("GET /api/scan", s.scan)
 	mux.HandleFunc("GET /api/export", s.export)
 	mux.HandleFunc("GET /api/config", s.getConfig)
 	mux.HandleFunc("POST /api/config/validate", s.validateConfig)
@@ -345,6 +347,37 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"label": label, "currency": currency, "billing": billing != nil, "consumers": out,
+	})
+}
+
+// scan looks for sensitive values that slipped past the rules — the field
+// nobody remembered to redact. Findings carry masked samples only.
+//
+//	GET /api/scan?window=24h
+func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
+	if s.Reader == nil {
+		httpError(w, http.StatusNotImplemented, "payload store is disabled")
+		return
+	}
+	window := parseDurationDefault(r.URL.Query().Get("window"), 24*time.Hour)
+	since := time.Now().Add(-window)
+	records, err := s.Reader.Recent(r.Context(), since, 0)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	report := scan.Records(records, since)
+	crit, high, med := report.Counts()
+	if report.Findings == nil {
+		report.Findings = []scan.Finding{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"records_scanned": report.Scanned,
+		"since":           report.Since,
+		"critical":        crit,
+		"high":            high,
+		"medium":          med,
+		"findings":        report.Findings,
 	})
 }
 

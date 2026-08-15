@@ -30,6 +30,10 @@ telemetry:
   metrics:
     enabled: true
     # buckets: [0.005, 0.05, 0.5, 5]   # override latency histogram bounds (seconds)
+    # Cardinality guard. Label values come from arbitrary request headers, so
+    # one buggy client can otherwise create unbounded Prometheus series.
+    # Beyond this many distinct values, a label collapses to __over_limit__.
+    max_label_values: 500              # 0 disables the guard
   store:
     driver: sqlite            # sqlite | none
     dsn: optictrace.db
@@ -107,7 +111,12 @@ rules:
     labels:
       tenant: "header:X-Tenant-ID"   # becomes a Prometheus dimension + log field
       region: "header:X-Region"
-    # sample: 0.25   # capture bodies for 25% of matched requests (metrics stay full)
+    # Sampling. `sample` is a uniform draw made up front; the keep_* rules are
+    # TAIL-BASED — they rescue the requests you actually want after the outcome
+    # is known, instead of letting a coin flip discard your errors.
+    # sample: 0.25              # capture bodies for 25% of matched requests
+    # keep_errors: true         # ...but always keep 5xx
+    # keep_slower_than: 500ms   # ...and anything this slow
 
   # ---------------------------------------------------------------------------
   # METERING: extract numeric usage from responses (here: LLM token counts)
