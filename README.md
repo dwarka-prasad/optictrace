@@ -12,6 +12,14 @@ Prometheus dimensions.
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-v0.8.0--dev-orange)](#roadmap)
 
+**[optictrace product page →](https://dwarka-prasad.github.io/optictrace/)**
+
+<br>
+
+<img src="docs/assets/demo.gif" alt="A payment request passes through OpticTrace: the client receives the real card number while the stored telemetry shows [REDACTED]" width="820">
+
+<sub>Real output from a running agent — the client gets the original bytes, the telemetry never sees the card.</sub>
+
 </div>
 
 ---
@@ -815,6 +823,10 @@ r.Use(optictracegin.Middleware(agent))                // Gin
 `ui/` is a Next.js (App Router) + Tailwind + Recharts app, statically exported and served by
 the agent itself — no separate frontend deployment.
 
+<img src="docs/assets/dashboard-inspector.png" alt="Request Inspector showing a captured payment with card number, CVV, email and Authorization header all masked, the matched rule named, and non-sensitive fields left intact" width="100%">
+
+<sub>The Inspector, mid-investigation: redacted values are highlighted, the rule responsible is named, and everything non-sensitive is still there to debug with.</sub>
+
 | Page | Shows |
 |---|---|
 | **Overview** | Live request volume, error rate, latency charts; top routes with per-route P95 |
@@ -825,6 +837,23 @@ the agent itself — no separate frontend deployment.
 | **Config** | View `optic.yaml`, lint edits live against the running agent, trigger hot reload |
 | **System** | Agent health, store size, per-exporter delivery/failure/drop counters |
 
+<details>
+<summary>More screenshots</summary>
+
+**Overview** — golden signals and top routes
+<img src="docs/assets/dashboard-overview.png" width="100%">
+
+**Routes** — every route with sortable P50/P95/P99
+<img src="docs/assets/dashboard-routes.png" width="100%">
+
+**Usage** — per-tenant consumption, meters and estimated cost
+<img src="docs/assets/dashboard-usage.png" width="100%">
+
+**Governance** — each rule's actions with live match counts
+<img src="docs/assets/dashboard-governance.png" width="100%">
+
+</details>
+
 Develop it with `cd ui && npm run dev` (talks to the agent on `:9095` via CORS).
 
 ---
@@ -832,7 +861,10 @@ Develop it with `cd ui && npm run dev` (talks to the agent on `:9095` via CORS).
 ## Deployment
 
 - **Docker** — multi-stage [`Dockerfile`](Dockerfile) (UI build → pure-Go build → non-root Alpine image).
-- **Compose** — [`docker-compose.yml`](docker-compose.yml) runs OpticTrace + demo upstream + Prometheus.
+- **Compose** — [`docker-compose.yml`](docker-compose.yml) runs OpticTrace + demo upstream + Prometheus + Grafana, with the dashboard and alert rules provisioned:
+
+<img src="docs/assets/grafana.png" alt="The provisioned Grafana dashboard showing request rate, error rate, latency percentiles and agent health" width="100%">
+
 - **Helm** — [`deploy/helm/optictrace`](deploy/helm/optictrace) with ConfigMap-managed `optic.yaml`, health probes, optional PVC and ServiceMonitor.
 
 ---
