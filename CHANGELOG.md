@@ -10,7 +10,13 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- `optictrace suggest` no longer reports ordinary parameters as payment-card data. `pan`, `cvv` and `cvc` were substring matches, so `expand`, `company` and `panel` were all flagged high-confidence; they are now matched exactly. Found by running the Compose stack end to end.
+
+### Changed
+
+- The Compose demo config now exercises every governance mechanism — metering with billing, query redaction, tail-based sampling, the cardinality guard and a file exporter — so `docker compose up` produces a dashboard with real data instead of an empty shell. `/api/v1/orders` is deliberately left ungoverned so `scan` and `suggest` have something to find.
 
 ## [0.7.0] — 2026-08-16
 

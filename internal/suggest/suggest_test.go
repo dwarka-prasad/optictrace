@@ -127,6 +127,36 @@ func TestYAMLOutputIsPasteable(t *testing.T) {
 	}
 }
 
+// Regression: "pan" used to be a substring match, so ordinary parameters
+// like `expand` were reported as high-confidence card data. A heuristic that
+// cries wolf gets muted, and a muted heuristic protects nothing.
+func TestNoSubstringFalsePositives(t *testing.T) {
+	recs := []store.Record{{
+		Time: time.Now(), Method: "GET", Path: "/users/1", Route: "/users/:id",
+		Query:        "expand=profile&company=acme&panel=main",
+		ResponseBody: `{"expand":"profile","japan_office":true,"company":"acme","plan":"pro"}`,
+	}}
+	rep := Records(recs, eng(t, governedCfg))
+	for _, s := range rep.Actionable() {
+		t.Errorf("false positive: %s %q flagged as %s", s.Kind, s.Field, s.Confidence)
+	}
+
+	// ...while a field genuinely named `pan` is still caught.
+	real := []store.Record{{
+		Time: time.Now(), Method: "POST", Path: "/orders", Route: "/orders",
+		RequestBody: `{"payment":{"pan":"4111111111111111","cvv":"123"}}`,
+	}}
+	got := map[string]bool{}
+	for _, s := range Records(real, eng(t, governedCfg)).Actionable() {
+		got[s.Field] = true
+	}
+	for _, want := range []string{"$.payment.pan", "$.payment.cvv"} {
+		if !got[want] {
+			t.Errorf("exact match should still catch %s", want)
+		}
+	}
+}
+
 func TestPathCoverageSemantics(t *testing.T) {
 	cases := []struct {
 		pattern []string

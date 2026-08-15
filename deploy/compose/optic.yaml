@@ -1,4 +1,8 @@
-# Compose-stack config: proxy the bundled demo upstream.
+# Compose-stack config: proxies the bundled demo upstream.
+#
+# This is the guided tour — it exercises every governance mechanism against
+# the demo API so `docker compose up` produces a dashboard with something
+# real on it, not an empty shell.
 version: 1
 
 service:
@@ -9,28 +13,52 @@ service:
 telemetry:
   admin_listen: ":9095"
   console_log: true
+  metrics:
+    enabled: true
+    max_label_values: 500      # cardinality guard on tenant/region
   store:
     driver: sqlite
     dsn: /data/optictrace.db
     retention_max_rows: 100000
+    retention_max_age: 720h    # 30 days
+  exporters:
+    # Governed records also land on disk as JSONL, so you can see exactly
+    # what a downstream consumer would receive.
+    - name: audit-log
+      type: file
+      path: /data/audit.jsonl
+      flush_interval: 2s
+  billing:
+    consumer_label: tenant
+    currency: USD
+    prices:
+      per_request: 0.0001
+      per_gb: 0.05
+      per_meter_unit:
+        tokens: 0.000002       # $2 per 1M tokens
 
 defaults:
   capture:
     request_body: true
     response_body: true
     headers: true
+    query: true
 
 rules:
+  # Credentials must never reach telemetry: capture nothing but metadata.
   - name: no-capture-on-auth
     match:
       path: "/api/v1/auth/**"
     restrict: [request_body, response_body, headers]
 
+  # Mask payment secrets. `$.**` follows the field even when the upstream
+  # echoes the payload back inside a wrapper.
   - name: redact-payment-secrets
     match:
       path: "/api/v1/payments/**"
     redact:
       headers: [Authorization, X-Api-Key, Cookie]
+      query_params: [api_key, session]
       json_fields:
         - "$.**.credit_card.number"
         - "$.**.credit_card.cvv"
@@ -38,3 +66,27 @@ rules:
     labels:
       tenant: "header:X-Tenant-ID"
       region: "header:X-Region"
+
+  # Prompts and completions stay private, but tokens are still counted and
+  # priced per tenant — metering is independent of capture.
+  - name: meter-ai-tokens
+    match:
+      path: "/api/v1/ai/**"
+    restrict: [request_body, response_body]
+    meter:
+      tokens: "$.usage.total_tokens"
+    labels:
+      tenant: "header:X-Tenant-ID"
+
+  # Hot routes: sample bodies, but never throw away an error or a slow one.
+  - name: sample-user-reads
+    match:
+      path: "/api/v1/users/**"
+    sample: 0.5
+    keep_errors: true
+    keep_slower_than: 250ms
+    labels:
+      tenant: "header:X-Tenant-ID"
+
+  # NOTE: /api/v1/orders is deliberately left ungoverned so that
+  # `optictrace scan` and `optictrace suggest` have something to find.

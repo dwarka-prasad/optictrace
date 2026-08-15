@@ -71,7 +71,13 @@ var fieldRules = []nameRule{
 		"credentials must never be stored in telemetry"},
 	{contains("api_key", "apikey", "access_token", "refresh_token", "auth_token", "bearer"), High,
 		"a token in telemetry is a replayable credential"},
-	{contains("card_number", "cardnumber", "cvv", "cvc", "pan", "card_no"), High,
+	{contains("card_number", "cardnumber", "card_no"), High,
+		"payment card data is PCI-DSS scope"},
+	// `pan`, `cvv` and `cvc` are matched EXACTLY, never as substrings:
+	// "pan" appears inside ordinary words like "expand", "company" and
+	// "panel", and a heuristic that flags those gets muted — at which point
+	// it protects nothing.
+	{exact("pan", "cvv", "cvc"), High,
 		"payment card data is PCI-DSS scope"},
 	{contains("ssn", "social_security", "national_id", "aadhaar", "tax_id"), High,
 		"national identifiers are regulated personal data"},
