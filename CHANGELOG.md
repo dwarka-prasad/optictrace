@@ -73,6 +73,10 @@ Measured with `make bench` (12th Gen Intel i5-1235U, Go 1.25):
 | Full capture + depth-recursive redaction | +5.4 µs |
 | Prometheus observation with a custom label | +0.13 µs |
 
+### Fixed
+
+- Data race in the `command` exporter: process liveness was determined by reading `cmd.ProcessState` while `cmd.Wait()` wrote it from the reaper goroutine. Liveness is now published through a channel closed on exit, and `Close` no longer holds the mutex while waiting for a drain. Caught by `go test -race`, which CI runs on every push.
+
 ### Known limitations
 
 - ClickHouse is not implemented; `sqlite`, `postgres` and `none` are the available store drivers.
