@@ -31,6 +31,7 @@ Prometheus dimensions.
 - [Deployment](#deployment)
 - [Measured overhead](#measured-overhead) · [verified behavior](#verified-behavior)
 - [Roadmap](#roadmap) — what to build next, and why
+- [Changelog](CHANGELOG.md)
 - [Contributing](#contributing)
 
 ---
@@ -842,6 +843,10 @@ sdks/               express · fastapi · gin
 deploy/             compose bits, Helm chart, Grafana dashboard, Prometheus alerts
 examples/           exporter plugin examples
 ```
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## License
 

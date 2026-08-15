@@ -66,6 +66,10 @@ sboms:
 
 homebrew_casks:
   - name: optictrace
+    # Disabled until a `dwarka-prasad/homebrew-tap` repository exists. The
+    # cask is still generated into dist/ each release, so flipping this to
+    # false once the tap is created is the only change needed to publish.
+    skip_upload: true
     repository:
       owner: dwarka-prasad
       name: homebrew-tap
