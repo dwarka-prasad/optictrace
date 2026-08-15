@@ -10,6 +10,13 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 ## [Unreleased]
 
+### Added
+
+- **`optictrace review` and a GitHub Action** — comments on every pull request with what the change does to API governance. Its core is a *policy diff*: the same captured traffic is evaluated under the base branch's rules and the PR's, so a change that stops redacting a field is reported with the number of real requests it affects. Also reports a coverage score, pre-existing leaks, and (with a spec) changes that break observed clients.
+- By default a PR fails only for regressions it introduced; pre-existing findings are context, not a blocker. `fail-on: critical|high` escalates once the backlog is clear.
+- Traffic can come from a running agent (`-from`, the CI case — records arrive already governed, so the job never handles raw payloads) or a JSONL export (`-from-file`).
+- Coverage excludes 404s: a path the upstream doesn't serve isn't part of the API surface, and counting scanner noise against the score would make it untrustworthy.
+
 ### Fixed
 
 - `optictrace suggest` no longer reports ordinary parameters as payment-card data. `pan`, `cvv` and `cvc` were substring matches, so `expand`, `company` and `panel` were all flagged high-confidence; they are now matched exactly. Found by running the Compose stack end to end.

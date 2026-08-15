@@ -29,6 +29,7 @@ import (
 	"github.com/dwarka-prasad/optictrace/internal/mock"
 	"github.com/dwarka-prasad/optictrace/internal/proxy"
 	"github.com/dwarka-prasad/optictrace/internal/replay"
+	"github.com/dwarka-prasad/optictrace/internal/review"
 	"github.com/dwarka-prasad/optictrace/internal/ruletest"
 	"github.com/dwarka-prasad/optictrace/internal/scan"
 	"github.com/dwarka-prasad/optictrace/internal/spec"
@@ -36,7 +37,7 @@ import (
 	"github.com/dwarka-prasad/optictrace/internal/suggest"
 )
 
-var version = "0.7.0-dev" // overridden via -ldflags at release time
+var version = "0.8.0-dev" // overridden via -ldflags at release time
 
 func main() {
 	args := os.Args[1:]
@@ -55,7 +56,8 @@ func main() {
 	listen := fs.String("listen", ":7070", "mock server listen address (mock)")
 	ai := fs.Bool("ai", false, "mock: generate responses with Claude when ANTHROPIC_API_KEY is set")
 	testsPath := fs.String("tests", "optic.test.yaml", "rule test file (test)")
-	failOn := fs.String("fail-on", "high", "scan: minimum severity that exits non-zero (critical|high|medium|never)")
+	failOn := fs.String("fail-on", "high", "scan: severity that exits non-zero (critical|high|medium|never);\n\treview: regression|critical|high|never (default regression via -review-fail-on)")
+	reviewFailOn := fs.String("review-fail-on", "regression", "review: what fails the check — regression (this PR only), critical, high, never")
 	purgeLabel := fs.String("label", "", "purge: consumer label name (default: telemetry.billing.consumer_label)")
 	purgeValue := fs.String("value", "", "purge: consumer label value to erase")
 	olderThan := fs.Duration("older-than", 0, "purge: only delete records older than this (default: all)")
@@ -65,6 +67,10 @@ func main() {
 	concurrency := fs.Int("concurrency", 4, "replay: parallel in-flight requests")
 	dryRun := fs.Bool("dry-run", false, "replay: report what would be sent without sending")
 	applyOut := fs.String("apply", "", "suggest: write proposed rules to this file instead of stdout")
+	baseConfig := fs.String("base-config", "", "review: optic.yaml from the base branch, to diff governance against")
+	fromAgent := fs.String("from", "", "review: pull traffic from a running agent's URL instead of a local store")
+	fromFile := fs.String("from-file", "", "review: read traffic from a JSONL export instead of a store")
+	token := fs.String("token", "", "review: bearer token for -from (or OPTICTRACE_TOKEN)")
 	_ = fs.Parse(args)
 
 	switch cmd {
@@ -90,11 +96,17 @@ func main() {
 		replayTraffic(*configPath, *window, *replayTarget, *rate, *concurrency, *dryRun)
 	case "suggest":
 		suggestRules(*configPath, *window, *applyOut)
+	case "review":
+		reviewChanges(reviewArgs{
+			configPath: *configPath, baseConfig: *baseConfig, specPath: *specPath,
+			from: *fromAgent, fromFile: *fromFile, token: *token,
+			window: *window, out: *outPath, failOn: *reviewFailOn,
+		})
 	case "version":
 		fmt.Println("optictrace", version)
 	default:
 		fmt.Fprintf(os.Stderr,
-			"unknown command %q\n  (run, validate, test, scan, suggest, purge, replay,\n   spec, check, sdk, mock, version)\n", cmd)
+			"unknown command %q\n  (run, validate, test, scan, suggest, review, purge, replay,\n   spec, check, sdk, mock, version)\n", cmd)
 		os.Exit(2)
 	}
 }
@@ -250,6 +262,79 @@ func suggestRules(configPath string, window time.Duration, applyOut string) {
 		return
 	}
 	fmt.Printf("\n--- proposed optic.yaml rules ---\n%s", yaml)
+}
+
+type reviewArgs struct {
+	configPath, baseConfig, specPath string
+	from, fromFile, token            string
+	window                           time.Duration
+	out, failOn                      string
+}
+
+// reviewChanges produces the pull-request comment: coverage, what this change
+// does to governance versus the base branch, leaks, and breaking changes.
+func reviewChanges(a reviewArgs) {
+	headCfg, err := config.Load(a.configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+		os.Exit(1)
+	}
+
+	// Traffic can come from a running agent (the CI case), a JSONL export,
+	// or a local store.
+	var records []store.Record
+	switch {
+	case a.from != "":
+		tok := a.token
+		if tok == "" {
+			tok = os.Getenv("OPTICTRACE_TOKEN")
+		}
+		records, err = review.FetchRemote(a.from, tok, a.window.String(), 90*time.Second)
+	case a.fromFile != "":
+		records, err = review.LoadJSONL(a.fromFile)
+	default:
+		_, records = loadTraffic(a.configPath, a.window)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+		os.Exit(1)
+	}
+	if len(records) == 0 {
+		fmt.Fprintln(os.Stderr, "✗ no captured traffic to review — point -from at an agent watching staging, or pass -from-file")
+		os.Exit(1)
+	}
+
+	opts := review.Options{Records: records, Head: headCfg, Window: a.window.String()}
+	if a.baseConfig != "" {
+		// A missing base config is not fatal: on the first PR that adds
+		// optic.yaml there is nothing to diff against, and failing there
+		// would be hostile.
+		if baseCfg, err := config.Load(a.baseConfig); err != nil {
+			fmt.Fprintf(os.Stderr, "· no base policy to compare against (%v); reporting coverage only\n", err)
+		} else {
+			opts.Base = baseCfg
+		}
+	}
+	if a.specPath != "" {
+		if raw, err := os.ReadFile(a.specPath); err == nil {
+			if doc, err := spec.Parse(raw); err == nil {
+				opts.Spec = doc
+			}
+		}
+	}
+
+	rep := review.Run(opts)
+	md := rep.Markdown()
+	if a.out != "" {
+		writeOut(a.out, []byte(md))
+	} else {
+		fmt.Print(md)
+	}
+	fmt.Fprintln(os.Stderr, rep.Summary())
+
+	if rep.Blocking(a.failOn) {
+		os.Exit(1)
+	}
 }
 
 // scanTraffic is the safety net: it looks for values that LOOK sensitive in

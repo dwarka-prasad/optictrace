@@ -1,0 +1,168 @@
+name: "OpticTrace governance review"
+description: >-
+  Comment on pull requests with what the change does to API governance,
+  measured against real captured traffic rather than guesses.
+author: "OpticTrace"
+branding:
+  icon: eye
+  color: blue
+
+inputs:
+  config:
+    description: "Path to optic.yaml in this branch."
+    required: false
+    default: "optic.yaml"
+  agent-url:
+    description: >-
+      Base URL of an OpticTrace agent watching a staging environment, e.g.
+      https://optictrace.staging.internal:9095. Records arrive already
+      governed, so this job never handles raw payloads.
+    required: false
+  token:
+    description: "Bearer token for the agent's control plane (telemetry.auth)."
+    required: false
+  traffic-file:
+    description: >-
+      Alternative to agent-url: a JSONL export of captured traffic, e.g. one
+      downloaded as a CI artifact. Useful when CI cannot reach staging.
+    required: false
+  window:
+    description: "How much traffic history to analyse."
+    required: false
+    default: "24h"
+  spec:
+    description: >-
+      Optional OpenAPI file. When set, the review also reports changes that
+      would break clients observed in the traffic.
+    required: false
+  fail-on:
+    description: >-
+      What turns the check red: `regression` (default — only what this PR
+      changed), `critical`, `high`, or `never`.
+    required: false
+    default: "regression"
+  comment:
+    description: "Post/update a pull-request comment."
+    required: false
+    default: "true"
+  version:
+    description: "OpticTrace release to use, or `latest`."
+    required: false
+    default: "latest"
+  github-token:
+    description: "Token used to post the comment."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  summary:
+    description: "One-line verdict."
+    value: ${{ steps.review.outputs.summary }}
+  blocking:
+    description: "`true` when the review failed."
+    value: ${{ steps.review.outputs.blocking }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install optictrace
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        if [ "$VERSION" = "latest" ]; then
+          VERSION=$(curl -fsSL https://api.github.com/repos/dwarka-prasad/optictrace/releases/latest \
+            | grep -m1 '"tag_name"' | cut -d'"' -f4)
+        fi
+        echo "Using optictrace $VERSION"
+        curl -fsSL -o /tmp/optictrace.tar.gz \
+          "https://github.com/dwarka-prasad/optictrace/releases/download/${VERSION}/optictrace_${VERSION#v}_linux_amd64.tar.gz"
+        # Verify against the release checksums before running the binary.
+        curl -fsSL -o /tmp/checksums.txt \
+          "https://github.com/dwarka-prasad/optictrace/releases/download/${VERSION}/checksums.txt"
+        (cd /tmp && grep "optictrace_${VERSION#v}_linux_amd64.tar.gz" checksums.txt | sha256sum -c -)
+        tar xzf /tmp/optictrace.tar.gz -C /tmp optictrace
+        sudo mv /tmp/optictrace /usr/local/bin/optictrace
+
+    - name: Fetch the base branch's policy
+      shell: bash
+      env:
+        CONFIG: ${{ inputs.config }}
+        BASE_REF: ${{ github.event.pull_request.base.sha }}
+      run: |
+        set -uo pipefail
+        # The policy diff needs the config as it exists on the target branch.
+        # If this PR introduces optic.yaml, there is nothing to compare and
+        # the review falls back to reporting coverage only.
+        if [ -n "${BASE_REF:-}" ] && git cat-file -e "$BASE_REF:$CONFIG" 2>/dev/null; then
+          git show "$BASE_REF:$CONFIG" > /tmp/optic-base.yaml
+          echo "OPTIC_BASE=/tmp/optic-base.yaml" >> "$GITHUB_ENV"
+        else
+          echo "No optic.yaml on the base branch — reporting coverage only."
+        fi
+
+    - name: Review
+      id: review
+      shell: bash
+      env:
+        CONFIG: ${{ inputs.config }}
+        AGENT_URL: ${{ inputs.agent-url }}
+        TRAFFIC_FILE: ${{ inputs.traffic-file }}
+        OPTICTRACE_TOKEN: ${{ inputs.token }}
+        WINDOW: ${{ inputs.window }}
+        SPEC: ${{ inputs.spec }}
+        FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        set -uo pipefail
+        args=(review -config "$CONFIG" -window "$WINDOW" -review-fail-on "$FAIL_ON" -out /tmp/review.md)
+        [ -n "${OPTIC_BASE:-}" ]     && args+=(-base-config "$OPTIC_BASE")
+        [ -n "${AGENT_URL:-}" ]      && args+=(-from "$AGENT_URL")
+        [ -n "${TRAFFIC_FILE:-}" ]   && args+=(-from-file "$TRAFFIC_FILE")
+        [ -n "${SPEC:-}" ]           && args+=(-spec "$SPEC")
+
+        optictrace "${args[@]}" 2>/tmp/summary.txt
+        code=$?
+        summary=$(tail -1 /tmp/summary.txt)
+        echo "summary=$summary" >> "$GITHUB_OUTPUT"
+        echo "blocking=$([ $code -ne 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+        {
+          echo "## OpticTrace governance review"
+          echo "$summary"
+          echo
+          cat /tmp/review.md
+        } >> "$GITHUB_STEP_SUMMARY"
+        exit $code
+
+    - name: Post or update the pull-request comment
+      # Runs even when the review failed — the comment IS the failure report,
+      # so suppressing it exactly when something is wrong would be perverse.
+      if: always() && inputs.comment == 'true' && github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs');
+          if (!fs.existsSync('/tmp/review.md')) return;
+          const body = fs.readFileSync('/tmp/review.md', 'utf8');
+          const marker = '<!-- optictrace-governance-review -->';
+
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            per_page: 100,
+          });
+          // One comment that stays current, rather than a new one per push.
+          const existing = comments.find(c => c.body && c.body.includes(marker));
+          if (existing) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              comment_id: existing.id, body,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number, body,
+            });
+          }

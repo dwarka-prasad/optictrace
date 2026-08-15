@@ -1,0 +1,46 @@
+# Copy this into .github/workflows/ in the repository that owns your API.
+#
+# It comments on every pull request with what the change does to API
+# governance — measured against traffic an OpticTrace agent actually observed
+# in staging, not against assumptions.
+name: API governance review
+
+on:
+  pull_request:
+    # Narrow this if you only care about changes that could affect the API.
+    # Leaving it broad is also reasonable: coverage drifts when routes are
+    # added, not only when optic.yaml changes.
+    paths:
+      - "optic.yaml"
+      - "src/**"
+      - "api/**"
+
+permissions:
+  contents: read
+  pull-requests: write # to post the review comment
+
+jobs:
+  governance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The policy diff needs the base branch's optic.yaml, so fetch
+          # enough history for `git show <base-sha>:optic.yaml` to resolve.
+          fetch-depth: 0
+
+      - uses: dwarka-prasad/optictrace@v0
+        with:
+          config: optic.yaml
+          # An agent watching staging. Records arrive already governed, so
+          # this job never handles raw payloads.
+          agent-url: ${{ vars.OPTICTRACE_AGENT_URL }}
+          token: ${{ secrets.OPTICTRACE_TOKEN }}
+          window: 24h
+          # Optional: also flag changes that break clients seen in traffic.
+          # spec: openapi.yaml
+          #
+          # `regression` fails the check only for what THIS pull request
+          # changed. Switch to `critical` once your backlog of pre-existing
+          # findings is clear, so new ones can't creep in.
+          fail-on: regression

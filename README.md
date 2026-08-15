@@ -10,7 +10,7 @@ Prometheus dimensions.
 
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/status-v0.7.0--dev-orange)](#roadmap)
+[![Status](https://img.shields.io/badge/status-v0.8.0--dev-orange)](#roadmap)
 
 </div>
 
@@ -24,6 +24,7 @@ Prometheus dimensions.
 - [`optic.yaml` reference](#opticyaml-reference)
 - [What's supported today](#whats-supported-today)
 - [Surfaces](#surfaces) — [CLI](#cli) · [control-plane API](#control-plane-api-9095) · [metrics](#metrics-exposed)
+- [Pull-request reviews](#pull-request-reviews)
 - [Traffic-powered tooling](#traffic-powered-tooling)
 - [Export plugins](#export-plugins)
 - [Framework SDKs](#framework-sdks)
@@ -61,6 +62,7 @@ rules:
 
 And because OpticTrace owns your real traffic history, it does things static tools can't:
 
+- 🤖 **Reviews your pull requests** — a GitHub Action that comments on every PR with what the change does to governance, measured by replaying real traffic under both the old and new rules. It catches the change that *looks* harmless in a diff but stops redacting a card number.
 - 🕵️ **Leak detector** — `optictrace scan` finds sensitive values your rules *didn't* cover. Redaction masks what you name; this catches the field you forgot, and prints the rule that would have stopped it.
 - 🧪 **Testable governance** — `optictrace test` asserts your rules behave as intended, with no server and no network, so CI proves a refactor didn't stop redacting.
 - 🧬 **Traffic → OpenAPI → SDK** — `optictrace spec` infers a spec from what clients *actually* send; `optictrace sdk` emits typed TypeScript, Python or Go clients.
@@ -391,7 +393,62 @@ OPTICTRACE_TEST_POSTGRES='postgres://postgres:optic@localhost:5432/optictrace?ss
 | `command` — **custom plugin hook** | ✅ | Spawns any executable, streams one JSON record per line to stdin; stderr folded into the agent log; crashed plugins restart with backoff |
 | Delivery guarantee | 🟡 | **At-most-once, deliberately.** Each exporter has its own bounded queue and worker, so a dead plugin drops only its own records and never stalls the request path |
 
-### Traffic-powered tooling
+### Pull-request reviews
+
+Every other command is one you have to remember to run. This one runs itself,
+on every pull request, and answers the question a reviewer actually has:
+**does this change make governance weaker?**
+
+```yaml
+# .github/workflows/governance-review.yml
+- uses: dwarka-prasad/optictrace@v0
+  with:
+    agent-url: ${{ vars.OPTICTRACE_AGENT_URL }}   # an agent watching staging
+    token: ${{ secrets.OPTICTRACE_TOKEN }}
+    window: 24h
+```
+
+It posts one comment that updates in place:
+
+> ### ✗ This change weakens governance on 4 point(s)
+>
+> | | Route | Change | Requests affected |
+> |---|---|---|--:|
+> | ✗ | `POST /api/v1/payments/**` | stops redacting `$.**.credit_card.cvv` | 34 |
+> | ✗ | `POST /api/v1/payments/**` | stops redacting query param `api_key` | 34 |
+> | ⚠ | `POST /api/v1/auth/**` | now captures request bodies (was restricted) | 34 |
+> | ⚠ | `POST /api/v1/payments/**` | drops label `region` (breaks its Prometheus dimension) | 34 |
+
+**How it knows.** It evaluates the *same captured traffic* under the base
+branch's `optic.yaml` and the PR's, then reports where the two disagree. A
+rule reordering that silently stops masking a field is invisible in a text
+diff and obvious here — and every row carries the number of real requests it
+affects, so the finding is arguable rather than theoretical.
+
+**Why it won't get muted.** By default a PR fails only for what *it* changed.
+Pre-existing leaks are reported for context but don't block, because failing
+every pull request for a problem someone else introduced is how a bot gets
+ignored — and an ignored bot protects nothing. Once your backlog is clear,
+`fail-on: critical` stops new ones creeping in.
+
+The comment also carries a coverage score (share of traffic governed by a
+rule, routes with rules, sensitive-looking fields handled), any leaks found,
+and — with `spec:` set — changes that would break clients seen in traffic.
+404s are excluded from coverage, since you can't write a rule for a route
+that doesn't exist.
+
+No staging environment? Point it at a JSONL export instead:
+
+```bash
+optictrace review -config optic.yaml -base-config /tmp/base.yaml \
+  -from-file examples/traffic-sample.jsonl
+```
+
+See [`examples/workflows/governance-review.yml`](examples/workflows/governance-review.yml)
+for a complete workflow. This repo dogfoods it in
+[`.github/workflows/governance.yml`](.github/workflows/governance.yml).
+
+## Traffic-powered tooling
 
 | Capability | Status | Notes |
 |---|:--:|---|
@@ -425,6 +482,7 @@ OPTICTRACE_TEST_POSTGRES='postgres://postgres:optic@localhost:5432/optictrace?ss
 | `optictrace validate` | Lint `optic.yaml` (CI-friendly) |
 | `optictrace test` | Assert rules behave as intended; exit 1 on failure |
 | `optictrace scan` | Find sensitive values your rules missed; exit 1 on findings |
+| `optictrace review` | PR report: policy diff, coverage, leaks, breaking changes |
 | `optictrace purge` | Erase all stored records for one consumer (erasure requests) |
 | `optictrace suggest` | Propose rules for sensitive-looking field *names* |
 | `optictrace replay` | Re-issue captured traffic against a target and diff statuses |
@@ -481,6 +539,61 @@ histogram_quantile(0.99,
 ```
 
 ---
+
+## Pull-request reviews
+
+Every other command is one you have to remember to run. This one runs itself,
+on every pull request, and answers the question a reviewer actually has:
+**does this change make governance weaker?**
+
+```yaml
+# .github/workflows/governance-review.yml
+- uses: dwarka-prasad/optictrace@v0
+  with:
+    agent-url: ${{ vars.OPTICTRACE_AGENT_URL }}   # an agent watching staging
+    token: ${{ secrets.OPTICTRACE_TOKEN }}
+    window: 24h
+```
+
+It posts one comment that updates in place:
+
+> ### ✗ This change weakens governance on 4 point(s)
+>
+> | | Route | Change | Requests affected |
+> |---|---|---|--:|
+> | ✗ | `POST /api/v1/payments/**` | stops redacting `$.**.credit_card.cvv` | 34 |
+> | ✗ | `POST /api/v1/payments/**` | stops redacting query param `api_key` | 34 |
+> | ⚠ | `POST /api/v1/auth/**` | now captures request bodies (was restricted) | 34 |
+> | ⚠ | `POST /api/v1/payments/**` | drops label `region` (breaks its Prometheus dimension) | 34 |
+
+**How it knows.** It evaluates the *same captured traffic* under the base
+branch's `optic.yaml` and the PR's, then reports where the two disagree. A
+rule reordering that silently stops masking a field is invisible in a text
+diff and obvious here — and every row carries the number of real requests it
+affects, so the finding is arguable rather than theoretical.
+
+**Why it won't get muted.** By default a PR fails only for what *it* changed.
+Pre-existing leaks are reported for context but don't block, because failing
+every pull request for a problem someone else introduced is how a bot gets
+ignored — and an ignored bot protects nothing. Once your backlog is clear,
+`fail-on: critical` stops new ones creeping in.
+
+The comment also carries a coverage score (share of traffic governed by a
+rule, routes with rules, sensitive-looking fields handled), any leaks found,
+and — with `spec:` set — changes that would break clients seen in traffic.
+404s are excluded from coverage, since you can't write a rule for a route
+that doesn't exist.
+
+No staging environment? Point it at a JSONL export instead:
+
+```bash
+optictrace review -config optic.yaml -base-config /tmp/base.yaml \
+  -from-file examples/traffic-sample.jsonl
+```
+
+See [`examples/workflows/governance-review.yml`](examples/workflows/governance-review.yml)
+for a complete workflow. This repo dogfoods it in
+[`.github/workflows/governance.yml`](.github/workflows/governance.yml).
 
 ## Traffic-powered tooling
 
@@ -833,6 +946,7 @@ internal/store/     LogStore interface, SQLite driver, async writer, usage aggre
 internal/export/    output plugins: file · webhook · command (custom executables)
 internal/scan/      leak detector: structural detectors, masked findings, fix suggestions
 internal/suggest/   name-based rule proposals (complements scan's value checks)
+internal/review/    pull-request review: policy diff, coverage score, Markdown report
 internal/replay/    re-issue captured traffic against a target
 internal/ruletest/  optic.test.yaml runner (pure engine, no server)
 internal/spec/      traffic→OpenAPI inference, spec-vs-traffic linter, TS SDK gen
@@ -841,7 +955,7 @@ internal/admin/     admin API + dashboard hosting
 ui/                 Next.js dashboard (static export)
 sdks/               express · fastapi · gin
 deploy/             compose bits, Helm chart, Grafana dashboard, Prometheus alerts
-examples/           exporter plugin examples
+examples/           exporter plugins, CI workflows, a traffic fixture
 ```
 
 ## Changelog

@@ -1,0 +1,64 @@
+# OpticTrace reviewing its own pull requests.
+#
+# This repo has no staging environment to point at, so it reviews against a
+# committed traffic fixture. That is a weaker signal than real traffic, but it
+# does dogfood the action on every PR and catches the case that matters most:
+# a change to deploy/compose/optic.yaml that quietly weakens governance.
+name: Governance review
+
+on:
+  pull_request:
+    paths:
+      - "optic.yaml"
+      - "deploy/compose/optic.yaml"
+      - "internal/**"
+      - "examples/traffic-sample.jsonl"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the policy diff needs the base branch's config
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      # Build from source rather than using the released action, so a PR is
+      # reviewed by its own version of the reviewer.
+      - name: Review this PR's governance
+        run: |
+          set -uo pipefail
+          CONFIG=deploy/compose/optic.yaml
+          args=(-config "$CONFIG" -from-file examples/traffic-sample.jsonl -window 720h -out review.md)
+          if git cat-file -e "${{ github.event.pull_request.base.sha }}:$CONFIG" 2>/dev/null; then
+            git show "${{ github.event.pull_request.base.sha }}:$CONFIG" > /tmp/base.yaml
+            args+=(-base-config /tmp/base.yaml)
+          fi
+          go run ./cmd/optictrace review "${args[@]}"
+          code=$?
+          cat review.md >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+
+      - name: Comment
+        if: always() && hashFiles('review.md') != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('review.md', 'utf8');
+            const marker = '<!-- optictrace-governance-review -->';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number, per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            const args = { owner: context.repo.owner, repo: context.repo.repo, body };
+            if (existing) await github.rest.issues.updateComment({ ...args, comment_id: existing.id });
+            else await github.rest.issues.createComment({ ...args, issue_number: context.issue.number });
