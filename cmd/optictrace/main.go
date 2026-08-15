@@ -34,7 +34,7 @@ import (
 	"github.com/dwarka-prasad/optictrace/internal/store"
 )
 
-var version = "0.5.0-dev" // overridden via -ldflags at release time
+var version = "0.6.0-dev" // overridden via -ldflags at release time
 
 func main() {
 	args := os.Args[1:]
@@ -54,6 +54,10 @@ func main() {
 	ai := fs.Bool("ai", false, "mock: generate responses with Claude when ANTHROPIC_API_KEY is set")
 	testsPath := fs.String("tests", "optic.test.yaml", "rule test file (test)")
 	failOn := fs.String("fail-on", "high", "scan: minimum severity that exits non-zero (critical|high|medium|never)")
+	purgeLabel := fs.String("label", "", "purge: consumer label name (default: telemetry.billing.consumer_label)")
+	purgeValue := fs.String("value", "", "purge: consumer label value to erase")
+	olderThan := fs.Duration("older-than", 0, "purge: only delete records older than this (default: all)")
+	yes := fs.Bool("yes", false, "purge: skip the interactive confirmation (for automation)")
 	_ = fs.Parse(args)
 
 	switch cmd {
@@ -73,13 +77,85 @@ func main() {
 		scanTraffic(*configPath, *window, *failOn)
 	case "test":
 		ruleTest(*configPath, *testsPath)
+	case "purge":
+		purge(*configPath, *purgeLabel, *purgeValue, *olderThan, *yes)
 	case "version":
 		fmt.Println("optictrace", version)
 	default:
 		fmt.Fprintf(os.Stderr,
-			"unknown command %q\n  (run, validate, test, scan, spec, check, sdk, mock, version)\n", cmd)
+			"unknown command %q\n  (run, validate, test, scan, purge, spec, check, sdk, mock, version)\n", cmd)
 		os.Exit(2)
 	}
+}
+
+// purge deletes stored telemetry for one consumer — the erasure-request
+// primitive ("delete everything you hold for tenant X"). Deliberately a
+// separate command with a confirmation step rather than an API call: this is
+// irreversible, and a stray HTTP request should not be able to trigger it.
+func purge(configPath, label, value string, olderThan time.Duration, assumeYes bool) {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+		os.Exit(1)
+	}
+	if cfg.Telemetry.Store.Driver != "sqlite" {
+		fmt.Fprintln(os.Stderr, "✗ purge needs telemetry.store.driver: sqlite")
+		os.Exit(1)
+	}
+	if label == "" {
+		label = "tenant"
+		if cfg.Telemetry.Billing != nil {
+			label = cfg.Telemetry.Billing.ConsumerLabel
+		}
+	}
+	if value == "" {
+		fmt.Fprintln(os.Stderr, "✗ purge requires -value <consumer> (optionally -label <name>)")
+		os.Exit(2)
+	}
+
+	st, err := store.NewSQLite(cfg.Telemetry.Store.DSN)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ open store: %v\n", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+
+	var before time.Time
+	scope := "all records"
+	if olderThan > 0 {
+		before = time.Now().Add(-olderThan)
+		scope = fmt.Sprintf("records older than %s", olderThan)
+	}
+
+	// Count first so the operator sees the blast radius before confirming.
+	usage, err := st.UsageByLabel(context.Background(), time.Time{}, label)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+		os.Exit(1)
+	}
+	var held int64
+	for _, u := range usage {
+		if u.Consumer == value {
+			held = u.Requests
+		}
+	}
+	fmt.Printf("About to delete %s where %s=%q (store currently holds %d record(s) for it).\n",
+		scope, label, value, held)
+	if !assumeYes {
+		fmt.Print("This cannot be undone. Type the consumer name to confirm: ")
+		var typed string
+		_, _ = fmt.Scanln(&typed)
+		if typed != value {
+			fmt.Fprintln(os.Stderr, "✗ aborted — confirmation did not match")
+			os.Exit(1)
+		}
+	}
+	removed, err := st.Purge(context.Background(), label, value, before)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("✓ purged %d record(s) for %s=%q\n", removed, label, value)
 }
 
 // scanTraffic is the safety net: it looks for values that LOOK sensitive in
@@ -232,8 +308,10 @@ func specCheck(configPath, specPath string, window time.Duration) {
 }
 
 func sdkGenerate(configPath, specPath string, window time.Duration, lang, out string) {
-	if lang != "typescript" && lang != "ts" {
-		fmt.Fprintf(os.Stderr, "✗ unsupported -lang %q (available: typescript; python/go are on the roadmap)\n", lang)
+	switch lang {
+	case "typescript", "ts", "python", "py", "go":
+	default:
+		fmt.Fprintf(os.Stderr, "✗ unsupported -lang %q (available: typescript, python, go)\n", lang)
 		os.Exit(2)
 	}
 	var doc *spec.Spec
@@ -255,8 +333,17 @@ func sdkGenerate(configPath, specPath string, window time.Duration, lang, out st
 		}
 		doc = spec.Infer(cfg.Service.Name, records)
 	}
-	writeOut(out, []byte(spec.GenerateTypeScript(doc)))
-	fmt.Fprintf(os.Stderr, "✓ generated TypeScript client for %d path(s)\n", len(doc.Paths))
+	var code, label string
+	switch lang {
+	case "python", "py":
+		code, label = spec.GeneratePython(doc), "Python"
+	case "go":
+		code, label = spec.GenerateGo(doc, "apiclient"), "Go"
+	default:
+		code, label = spec.GenerateTypeScript(doc), "TypeScript"
+	}
+	writeOut(out, []byte(code))
+	fmt.Fprintf(os.Stderr, "✓ generated %s client for %d path(s)\n", label, len(doc.Paths))
 }
 
 func mockServe(specPath, listen string, ai bool) {
@@ -339,7 +426,8 @@ func run(configPath, uiDir string) {
 		if collector != nil {
 			asyncOpts = append(asyncOpts, store.WithDropCallback(collector.StoreDropped))
 		}
-		asyncOpts = append(asyncOpts, store.WithRetention(cfg.Telemetry.Store.RetentionMaxRows))
+		asyncOpts = append(asyncOpts, store.WithRetention(cfg.Telemetry.Store.RetentionMaxRows),
+			store.WithMaxAge(cfg.Telemetry.Store.MaxAge()))
 		writer = store.NewAsyncWriter(sqlStore, cfg.Telemetry.Store.QueueSize, logger, asyncOpts...)
 	}
 
@@ -399,12 +487,28 @@ func run(configPath, uiDir string) {
 			Reload:     reload,
 			UIDir:      uiDir,
 			Version:    version,
+			AuthToken:  cfg.Telemetry.Auth.Resolve(),
+			HealthOpen: cfg.Telemetry.Auth.HealthOpen(),
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
-		logger.Info("admin server listening", "listen", cfg.Telemetry.AdminListen)
-		if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		tlsCfg := cfg.Telemetry.TLS
+		logger.Info("admin server listening",
+			"listen", cfg.Telemetry.AdminListen,
+			"auth", cfg.Telemetry.Auth.Resolve() != "",
+			"tls", tlsCfg != nil)
+		if cfg.Telemetry.Auth.Resolve() == "" {
+			logger.Warn("admin server is unauthenticated — do not expose this port publicly",
+				"listen", cfg.Telemetry.AdminListen)
+		}
+		var err error
+		if tlsCfg != nil {
+			err = adminSrv.ListenAndServeTLS(tlsCfg.CertFile, tlsCfg.KeyFile)
+		} else {
+			err = adminSrv.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("admin server failed", "error", err)
 			os.Exit(1)
 		}

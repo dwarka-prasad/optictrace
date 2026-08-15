@@ -7,6 +7,9 @@ package engine
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
+	"sort"
+	"strings"
 )
 
 const RedactedPlaceholder = "[REDACTED]"
@@ -34,6 +37,45 @@ func (p *Policy) SanitizeHeaders(h http.Header) map[string]string {
 		}
 	}
 	return out
+}
+
+// SanitizeQuery re-encodes a raw query string with policy-listed parameter
+// values masked. Parameter names are matched case-insensitively. Values that
+// fail to parse are dropped rather than stored raw — an unparseable query is
+// exactly where a stray credential would hide.
+func (p *Policy) SanitizeQuery(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return "(unparseable query omitted)"
+	}
+	// Sort so the stored form is stable across requests — otherwise the same
+	// logical query produces different strings and defeats grouping.
+	keys := make([]string, 0, len(values))
+	for k := range values {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	for _, k := range keys {
+		_, mask := p.RedactQuery[strings.ToLower(k)]
+		for _, v := range values[k] {
+			if b.Len() > 0 {
+				b.WriteByte('&')
+			}
+			b.WriteString(url.QueryEscape(k))
+			b.WriteByte('=')
+			if mask {
+				b.WriteString(RedactedPlaceholder)
+			} else {
+				b.WriteString(url.QueryEscape(v))
+			}
+		}
+	}
+	return b.String()
 }
 
 // RedactJSONBody parses body as JSON, masks every field addressed by the

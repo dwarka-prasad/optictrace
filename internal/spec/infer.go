@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,6 +23,9 @@ func Infer(serviceName string, records []store.Record) *Spec {
 		count        int64
 		reqSchema    *Schema
 		respByStatus map[string]*Schema
+		// queryParams records which query keys were observed and how often,
+		// so a parameter present on every request can be marked required.
+		queryParams map[string]int64
 	}
 	ops := map[string]map[string]*opAgg{} // path -> METHOD -> agg
 
@@ -34,10 +38,18 @@ func Infer(serviceName string, records []store.Record) *Spec {
 		}
 		agg := ops[path][method]
 		if agg == nil {
-			agg = &opAgg{respByStatus: map[string]*Schema{}}
+			agg = &opAgg{respByStatus: map[string]*Schema{}, queryParams: map[string]int64{}}
 			ops[path][method] = agg
 		}
 		agg.count++
+
+		if rec.Query != "" {
+			if vals, err := url.ParseQuery(rec.Query); err == nil {
+				for k := range vals {
+					agg.queryParams[k]++
+				}
+			}
+		}
 
 		if sc := schemaOfJSON(rec.RequestBody); sc != nil {
 			agg.reqSchema = mergeSchemas(agg.reqSchema, sc)
@@ -78,6 +90,21 @@ func Infer(serviceName string, records []store.Record) *Spec {
 			for _, p := range pathParams(path) {
 				op.Parameters = append(op.Parameters, &Param{
 					Name: p, In: "path", Required: true, Schema: &Schema{Type: "string"},
+				})
+			}
+			// Query params: required only when present on every observation,
+			// matching how request-body fields are treated.
+			qnames := make([]string, 0, len(agg.queryParams))
+			for name := range agg.queryParams {
+				qnames = append(qnames, name)
+			}
+			sort.Strings(qnames)
+			for _, name := range qnames {
+				op.Parameters = append(op.Parameters, &Param{
+					Name:     name,
+					In:       "query",
+					Required: agg.queryParams[name] == agg.count,
+					Schema:   &Schema{Type: "string"},
 				})
 			}
 			if agg.reqSchema != nil {

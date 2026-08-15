@@ -22,6 +22,9 @@ rules: build ## Run governance rule assertions (optic.test.yaml)
 scan: build ## Find sensitive values your rules missed (needs captured traffic)
 	./bin/optictrace scan -config optic.yaml -window 24h
 
+bench: ## Measure interceptor overhead vs a bare handler
+	go test ./internal/proxy -bench=. -benchmem -run='^$$' -benchtime=2s
+
 demo: build ## Run the local end-to-end demo
 	./scripts/demo.sh
 

@@ -3,6 +3,7 @@ package scan
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -105,6 +106,15 @@ func Records(records []store.Record, since time.Time) *Report {
 		scanBody(rec.ResponseBody, func(field, val string) {
 			record(rec, "response_body", field, Find(val))
 		})
+		if rec.Query != "" {
+			if vals, err := url.ParseQuery(rec.Query); err == nil {
+				for name, list := range vals {
+					for _, v := range list {
+						record(rec, "query", name, Find(v))
+					}
+				}
+			}
+		}
 		for name, val := range rec.RequestHeaders {
 			record(rec, "request_headers", name, Find(val))
 		}
@@ -178,6 +188,8 @@ func formatNumber(f float64) string {
 // so a finding converts into a fix by copy-paste.
 func suggest(location, field string) string {
 	switch location {
+	case "query":
+		return fmt.Sprintf("redact:\n  query_params: [%s]", field)
 	case "request_headers", "response_headers":
 		return fmt.Sprintf("redact:\n  headers: [%s]", field)
 	default:

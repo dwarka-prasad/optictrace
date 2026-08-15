@@ -169,6 +169,9 @@ func (ic *Interceptor) emit(r *http.Request, rw *recordingWriter, reqBuf *limite
 		rec.RequestHeaders = p.SanitizeHeaders(r.Header)
 		rec.ResponseHeaders = p.SanitizeHeaders(rw.Header())
 	}
+	if p.CaptureQuery {
+		rec.Query = p.SanitizeQuery(r.URL.RawQuery)
+	}
 	if keep && reqBuf != nil {
 		rec.RequestBody, rec.ReqTruncated = renderBody(reqBuf, r.Header.Get("Content-Type"), p)
 	}
@@ -214,6 +217,9 @@ func (ic *Interceptor) logRecord(r *http.Request, rec *store.Record) {
 		slog.Int64("duration_ms", int64(rec.DurationMS)),
 		slog.Int64("response_bytes", rec.RespBytes),
 		slog.String("remote", rec.Remote),
+	}
+	if rec.Query != "" {
+		attrs = append(attrs, slog.String("query", rec.Query))
 	}
 	if len(rec.MatchedRules) > 0 {
 		attrs = append(attrs, slog.Any("matched_rules", rec.MatchedRules))

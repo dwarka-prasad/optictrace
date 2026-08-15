@@ -27,6 +27,7 @@ const (
 	FieldRequestBody  CaptureField = "request_body"
 	FieldResponseBody CaptureField = "response_body"
 	FieldHeaders      CaptureField = "headers"
+	FieldQuery        CaptureField = "query"
 )
 
 // Config is the root of an optic.yaml document.
@@ -50,6 +51,46 @@ type Telemetry struct {
 	Store       StoreCfg      `yaml:"store"`
 	Exporters   []ExporterCfg `yaml:"exporters"`
 	Billing     *Billing      `yaml:"billing"`
+	Auth        *AdminAuth    `yaml:"auth"`
+	TLS         *AdminTLS     `yaml:"tls"`
+}
+
+// AdminAuth protects the control plane. It is off by default because the
+// admin port is meant to be firewalled, but "meant to be" is not a control —
+// enable this whenever the port could be reachable.
+type AdminAuth struct {
+	// Token is a bearer token compared in constant time. Prefer TokenEnv:
+	// a secret in a config file is a secret in your git history.
+	Token string `yaml:"token"`
+	// TokenEnv names an environment variable holding the token. It wins
+	// over Token when both are set.
+	TokenEnv string `yaml:"token_env"`
+	// AllowHealth keeps /healthz unauthenticated so orchestrator probes
+	// keep working. Default true.
+	AllowHealth *bool `yaml:"allow_health"`
+}
+
+// AdminTLS serves the control plane over HTTPS.
+type AdminTLS struct {
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
+}
+
+// Resolve returns the effective bearer token, reading TokenEnv if set.
+// An empty result means authentication is disabled.
+func (a *AdminAuth) Resolve() string {
+	if a == nil {
+		return ""
+	}
+	if a.TokenEnv != "" {
+		return os.Getenv(a.TokenEnv)
+	}
+	return a.Token
+}
+
+// HealthOpen reports whether /healthz bypasses authentication.
+func (a *AdminAuth) HealthOpen() bool {
+	return a == nil || a.AllowHealth == nil || *a.AllowHealth
 }
 
 // Billing turns telemetry into cost attribution (FinOps): usage is grouped
@@ -125,6 +166,10 @@ type StoreCfg struct {
 	// RetentionMaxRows caps the log table; oldest rows are pruned.
 	// 0 disables pruning. Default 100000.
 	RetentionMaxRows int64 `yaml:"retention_max_rows"`
+	// RetentionMaxAge deletes records older than this regardless of row
+	// count — the control a data-retention policy is actually written in
+	// ("keep 30 days"). Go duration, e.g. "720h". Empty disables it.
+	RetentionMaxAge string `yaml:"retention_max_age"`
 }
 
 // Service describes the proxied service (standalone sidecar mode). When
@@ -147,6 +192,7 @@ type CaptureFlags struct {
 	RequestBody  *bool `yaml:"request_body"`
 	ResponseBody *bool `yaml:"response_body"`
 	Headers      *bool `yaml:"headers"`
+	Query        *bool `yaml:"query"`
 }
 
 // Rule couples a traffic matcher with governance actions.
@@ -184,6 +230,10 @@ type Match struct {
 type Redact struct {
 	Headers    []string `yaml:"headers"`
 	JSONFields []string `yaml:"json_fields"`
+	// QueryParams are masked in the captured query string. Credentials in
+	// query strings are common (?api_key=…), so capturing queries without
+	// a way to mask them would be a governance regression.
+	QueryParams []string `yaml:"query_params"`
 }
 
 const DefaultCaptureLimitBytes = 64 * 1024
@@ -271,6 +321,33 @@ func (c *Config) Validate() error {
 	case "sqlite", "none":
 	default:
 		return fmt.Errorf("telemetry.store.driver %q is not supported (sqlite, none)", c.Telemetry.Store.Driver)
+	}
+	if a := c.Telemetry.Auth; a != nil {
+		if a.Token == "" && a.TokenEnv == "" {
+			return fmt.Errorf("telemetry.auth: set either token or token_env (token_env is preferred)")
+		}
+		if a.TokenEnv != "" && os.Getenv(a.TokenEnv) == "" {
+			return fmt.Errorf("telemetry.auth.token_env: %s is not set in the environment", a.TokenEnv)
+		}
+	}
+	if t := c.Telemetry.TLS; t != nil {
+		if t.CertFile == "" || t.KeyFile == "" {
+			return fmt.Errorf("telemetry.tls: both cert_file and key_file are required")
+		}
+		for _, f := range []string{t.CertFile, t.KeyFile} {
+			if _, err := os.Stat(f); err != nil {
+				return fmt.Errorf("telemetry.tls: %v", err)
+			}
+		}
+	}
+	if s := c.Telemetry.Store.RetentionMaxAge; s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return fmt.Errorf("telemetry.store.retention_max_age: %w", err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("telemetry.store.retention_max_age %q must be positive", s)
+		}
 	}
 	seen := map[string]bool{}
 	for i := range c.Telemetry.Exporters {
@@ -363,9 +440,9 @@ func (r *Rule) validate() error {
 	}
 	for _, f := range r.Restrict {
 		switch f {
-		case FieldRequestBody, FieldResponseBody, FieldHeaders:
+		case FieldRequestBody, FieldResponseBody, FieldHeaders, FieldQuery:
 		default:
-			return fmt.Errorf("restrict: unknown field %q (valid: request_body, response_body, headers)", f)
+			return fmt.Errorf("restrict: unknown field %q (valid: request_body, response_body, headers, query)", f)
 		}
 	}
 	if r.Redact != nil {
@@ -408,6 +485,15 @@ func (r *Rule) SlowerThan() time.Duration {
 		return 0
 	}
 	d, _ := time.ParseDuration(r.KeepSlowerThan)
+	return d
+}
+
+// MaxAge returns the parsed age-based retention window (0 = disabled).
+func (s *StoreCfg) MaxAge() time.Duration {
+	if s.RetentionMaxAge == "" {
+		return 0
+	}
+	d, _ := time.ParseDuration(s.RetentionMaxAge)
 	return d
 }
 

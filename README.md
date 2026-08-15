@@ -10,7 +10,7 @@ Prometheus dimensions.
 
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/status-v0.5.0--dev-orange)](#roadmap)
+[![Status](https://img.shields.io/badge/status-v0.6.0--dev-orange)](#roadmap)
 
 </div>
 
@@ -29,7 +29,7 @@ Prometheus dimensions.
 - [Framework SDKs](#framework-sdks)
 - [Developer dashboard](#developer-dashboard)
 - [Deployment](#deployment)
-- [Verified behavior](#verified-behavior)
+- [Measured overhead](#measured-overhead) · [verified behavior](#verified-behavior)
 - [Roadmap](#roadmap) — what to build next, and why
 - [Contributing](#contributing)
 
@@ -62,7 +62,7 @@ And because OpticTrace owns your real traffic history, it does things static too
 
 - 🕵️ **Leak detector** — `optictrace scan` finds sensitive values your rules *didn't* cover. Redaction masks what you name; this catches the field you forgot, and prints the rule that would have stopped it.
 - 🧪 **Testable governance** — `optictrace test` asserts your rules behave as intended, with no server and no network, so CI proves a refactor didn't stop redacting.
-- 🧬 **Traffic → OpenAPI → SDK** — `optictrace spec` infers a spec from what clients *actually* send; `optictrace sdk` emits a typed TypeScript client.
+- 🧬 **Traffic → OpenAPI → SDK** — `optictrace spec` infers a spec from what clients *actually* send; `optictrace sdk` emits typed TypeScript, Python or Go clients.
 - 🚨 **Breaking-change linter** — `optictrace check` answers *"is any live client actually using the field I'm about to remove?"* with usage counts and last-seen times. Exits non-zero in CI.
 - 🎭 **Stateful mock server** — `optictrace mock` gives you a mock where `POST /cart` then `GET /cart` really returns the added item; optional AI-generated responses via Claude.
 - 💰 **FinOps metering** — extract usage figures (e.g. LLM token counts) from responses, attribute cost per tenant, export billing CSVs.
@@ -246,11 +246,19 @@ telemetry:
   metrics:
     enabled: true
     buckets: [0.005, 0.05, 0.5, 5]   # latency histogram bounds (seconds)
+  auth:                              # control-plane authentication (off by default)
+    token_env: OPTICTRACE_ADMIN_TOKEN  # preferred: keeps the secret out of git
+    # token: "literal-token"           # alternative, discouraged
+    allow_health: true                 # keep /healthz open for probes
+  tls:                               # optional HTTPS for the control plane
+    cert_file: /etc/optictrace/tls.crt
+    key_file:  /etc/optictrace/tls.key
   store:
     driver: sqlite                   # sqlite | none
     dsn: optictrace.db
     queue_size: 4096                 # async queue; overflow drops, never blocks
     retention_max_rows: 100000       # oldest rows pruned
+    retention_max_age: 720h          # ...and anything older than 30 days
   exporters:                         # fan out governed records
     - { name: audit, type: file,    path: ./export/audit.jsonl }
     - { name: siem,  type: webhook, url: "https://siem.internal/ingest",
@@ -275,12 +283,13 @@ rules:
     match:
       path: "/api/v1/auth/**"        # * = one segment, ** = zero or more
       methods: [POST]                # optional; omitted = all methods
-    restrict: [request_body, response_body, headers]
+    restrict: [request_body, response_body, headers, query]
 
   - name: redact-payment-secrets
     match: { path: "/api/v1/payments/**" }
     redact:
       headers: [Authorization, X-Api-Key]
+      query_params: [api_key, token] # ?api_key=… masked in captured queries
       json_fields:
         - "$.credit_card.number"     # exact dotted path
         - "$.*.ssn"                  # * = any single key
@@ -339,7 +348,8 @@ rules stay live.
 |---|:--:|---|
 | Prometheus exporter | ✅ | Ten metric families on a **private registry**, so embedding never collides with an app's own |
 | Bounded cardinality | ✅ | `route` is always a rule glob or normalized pattern — `/users/42` → `/users/:id` |
-| SQLite payload store | ✅ | Pure-Go driver (no CGO), WAL mode, async writer that drops under backpressure, retention pruning |
+| SQLite payload store | ✅ | Pure-Go driver (no CGO), WAL mode, async writer that drops under backpressure |
+| Retention & erasure | ✅ | Row-count *and* age-based pruning; `optictrace purge` deletes everything held for one consumer |
 | Label cardinality guard | ✅ | Caps distinct values per custom label (default 500); overflow collapses to `__over_limit__` and is counted |
 | ClickHouse / Postgres | ⬜ | `LogStore` is driver-agnostic, but only `sqlite` and `none` are implemented |
 | OpenTelemetry export | ⬜ | Prometheus scrape is the supported path today |
@@ -360,10 +370,10 @@ rules stay live.
 | Infer OpenAPI from traffic | ✅ | `required` = present in *every* request; `integer`+`float` widen to `number`; ID segments collapse to path templates; redacted fields still contribute name and type |
 | Breaking-change linter | ✅ | Reports usage counts and last-seen times; exits non-zero on breaking findings |
 | TypeScript SDK generation | ✅ | Dependency-free typed fetch client; passes `tsc --strict` |
-| Python / Go SDK generation | ⬜ | Schema traversal is generator-agnostic; only the TypeScript emitter exists |
+| Python / Go SDK generation | ✅ | `-lang python` emits TypedDict models + urllib client; `-lang go` emits structs + net/http client |
 | Stateful mock server | ✅ | Real CRUD state on collection/item routes; schema-conforming data elsewhere with field-name heuristics |
 | AI-generated mock responses | 🟡 | Implemented behind `-ai` + `ANTHROPIC_API_KEY` with deterministic fallback, but **not yet exercised against the live API** |
-| Query-parameter capture | ⬜ | Query strings aren't captured, so inferred specs cover path params and bodies only |
+| Query-parameter capture | ✅ | Captured and governed via `redact.query_params` / `restrict: [query]`; feeds spec inference and the leak scanner |
 
 ### Integration & deployment
 
@@ -372,7 +382,7 @@ rules stay live.
 | Sidecar + embedded modes | ✅ | Reverse proxy and Go `http.Handler` middleware sharing one interception path |
 | Express / FastAPI / Gin SDKs | ✅ | Express and FastAPI carry semantically identical engine ports, so redaction happens in-process |
 | Docker / Compose / Helm | ✅ | Multi-stage non-root image; Compose stack with Prometheus; chart with probes, optional PVC and ServiceMonitor |
-| Admin-port authentication | 🟡 | **None** — trusted-network-by-deployment, which is why it binds a separate port. Don't expose `:9095` publicly |
+| Admin-port authentication | ✅ | Optional bearer token (constant-time, `token_env`) + TLS. **Off by default** — enable it whenever the port could be reachable |
 | gRPC / GraphQL / WebSockets | ⬜ | JSON over HTTP is the supported surface; hijacked connections pass through uninspected |
 
 ---
@@ -387,9 +397,10 @@ rules stay live.
 | `optictrace validate` | Lint `optic.yaml` (CI-friendly) |
 | `optictrace test` | Assert rules behave as intended; exit 1 on failure |
 | `optictrace scan` | Find sensitive values your rules missed; exit 1 on findings |
+| `optictrace purge` | Erase all stored records for one consumer (erasure requests) |
 | `optictrace spec` | Infer OpenAPI from captured traffic |
 | `optictrace check` | Spec vs. live usage; exit 1 on breaking findings |
-| `optictrace sdk` | Generate a typed TypeScript client |
+| `optictrace sdk` | Generate a typed client (`-lang typescript\|python\|go`) |
 | `optictrace mock` | Serve a stateful mock from a spec |
 | `optictrace version` | Print the build version |
 
@@ -632,6 +643,30 @@ Develop it with `cd ui && npm run dev` (talks to the agent on `:9095` via CORS).
 
 ---
 
+## Measured overhead
+
+The claim "built for the hot path" deserves numbers rather than adjectives.
+`go test ./internal/proxy -bench=. -benchmem -run='^$'` compares a bare
+handler against the same handler wrapped by the interceptor:
+
+| Policy | ns/op | Added vs. baseline | allocs/op |
+|---|---:|---:|---:|
+| Baseline (no OpticTrace) | 2,050 | — | 25 |
+| Restricted route (capture off) | 2,267 | **+0.22 µs** | 29 |
+| Full capture + redaction | 7,434 | **+5.4 µs** | 211 |
+| …plus Prometheus with a custom label | 7,567 | +5.5 µs | 215 |
+| Rule evaluation alone (no HTTP) | 812 | — | 7 |
+
+<sub>12th Gen Intel i5-1235U, Go 1.25, `-benchtime=2s`, parallel. Reproduce with `make bench`.</sub>
+
+Read the **absolute** deltas, not the ratios: the baseline includes
+`httptest` request construction, which inflates it and flatters the
+percentages. What the numbers say:
+
+- **Restricting a route really is near-free** (+0.22 µs). The policy resolves before any buffer is attached, so a route you've told OpticTrace to leave alone costs almost nothing — this is the design claim, and it holds.
+- **Full capture with depth-recursive redaction costs about 5.4 µs per request.** Against a typical API call of 1–100 ms that's 0.005–0.5% of the request, but it is not free, and it's dominated by JSON parse + re-serialize. Use `sample` with `keep_errors` on very hot routes.
+- **Prometheus observation is noise** (+0.13 µs) even with a custom label dimension.
+
 ## Verified behavior
 
 These aren't design intentions — each was observed end to end with real traffic through the
@@ -661,13 +696,13 @@ These closed the sharpest risks in the design and are all live now:
 - **Tail-based sampling** — uniform sampling discarded exactly the requests worth keeping. `keep_errors` and `keep_slower_than` rescue them after the outcome is known.
 - **Rule unit tests** (`optictrace test`) — governance rules are safe to refactor now that CI can prove they still redact.
 
-### Tier 2 — completeness
+### Tier 2 — ✅ shipped in v0.6.0
 
-**5. Query-string capture** — unblocks full spec inference and lets `query:` labels be verified against real traffic.
-**6. Time-based retention + per-consumer purge** — today retention is row-count only; erasure requests need "delete everything for tenant X before date Y".
-**7. Admin-port authentication + TLS** — bearer token or mTLS, so the control plane can survive being reachable.
-**8. Published benchmarks** — the README claims low overhead and nothing proves it. `go test -bench` with documented p50/p99 added latency and allocations per request would back the claim before launch.
-**9. Python + Go SDK generators** — the schema traversal is already generator-agnostic; this is mostly templates.
+- **Query-string capture** — with `redact.query_params` shipped alongside it, because capturing `?api_key=…` without a way to mask it would have been a governance regression. Query params now appear in inferred specs and are scanned for leaks.
+- **Time-based retention + per-consumer purge** — `retention_max_age` expresses a policy the way policies are written ("keep 30 days"), and `optictrace purge -value acme` answers erasure requests.
+- **Admin authentication + TLS** — bearer token (constant-time compare, `token_env` so secrets stay out of git) and optional HTTPS. Health probes stay open so orchestrators keep working.
+- **Published benchmarks** — see [Measured overhead](#measured-overhead). The "restricted routes are near-free" claim is now a number: +0.22 µs.
+- **Python and Go SDK generators** — `optictrace sdk -lang python|go`, both dependency-free.
 
 ### Tier 3 — scale and ecosystem
 
@@ -683,11 +718,10 @@ These closed the sharpest risks in the design and are all live now:
 
 Documented so nobody discovers them the hard way:
 
-- Query strings are not captured, so they're absent from inferred specs and from stored records.
 - Rule match counts use a `LIKE` scan over stored JSON — fine at the default 100k-row retention, worth an indexed join table beyond that.
 - The AI mock path is implemented but has never run against the live Anthropic API.
 - Hijacked connections (WebSockets) pass through uninspected by nature.
-- The control plane has no authentication.
+- Admin authentication is available but **off by default**; enable `telemetry.auth` if the port is reachable.
 
 ---
 

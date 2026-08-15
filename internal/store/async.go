@@ -17,6 +17,7 @@ type AsyncWriter struct {
 	logger    *slog.Logger
 	onDrop    func()
 	maxRows   int64
+	maxAge    time.Duration
 	pruneTick time.Duration
 }
 
@@ -30,6 +31,12 @@ func WithDropCallback(fn func()) AsyncOption {
 // WithRetention prunes the store down to maxRows periodically.
 func WithRetention(maxRows int64) AsyncOption {
 	return func(w *AsyncWriter) { w.maxRows = maxRows }
+}
+
+// WithMaxAge deletes records older than d on the same schedule. Row-count and
+// age limits compose: whichever removes a record first wins.
+func WithMaxAge(d time.Duration) AsyncOption {
+	return func(w *AsyncWriter) { w.maxAge = d }
 }
 
 func NewAsyncWriter(s LogStore, queueSize int, logger *slog.Logger, opts ...AsyncOption) *AsyncWriter {
@@ -79,7 +86,17 @@ func (w *AsyncWriter) run() {
 				if n, err := w.store.Prune(ctx, w.maxRows); err != nil {
 					w.logger.Warn("store prune failed", "error", err)
 				} else if n > 0 {
-					w.logger.Info("pruned old telemetry", "rows", n)
+					w.logger.Info("pruned old telemetry", "rows", n, "reason", "max_rows")
+				}
+				cancel()
+			}
+			if w.maxAge > 0 {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				cutoff := time.Now().Add(-w.maxAge)
+				if n, err := w.store.PruneBefore(ctx, cutoff); err != nil {
+					w.logger.Warn("store age prune failed", "error", err)
+				} else if n > 0 {
+					w.logger.Info("pruned old telemetry", "rows", n, "reason", "max_age", "older_than", cutoff)
 				}
 				cancel()
 			}

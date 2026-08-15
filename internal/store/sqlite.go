@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS logs (
 	service       TEXT NOT NULL DEFAULT '',
 	method        TEXT NOT NULL DEFAULT '',
 	path          TEXT NOT NULL DEFAULT '',
+	query         TEXT NOT NULL DEFAULT '',
 	route         TEXT NOT NULL DEFAULT '',
 	status        INTEGER NOT NULL DEFAULT 0,
 	duration_ms   REAL NOT NULL DEFAULT 0,
@@ -60,21 +61,23 @@ func NewSQLite(dsn string) (*SQLiteStore, error) {
 	}
 	// Migration for databases created before the meters column existed;
 	// "duplicate column" from up-to-date schemas is expected and ignored.
-	if _, err := db.Exec(`ALTER TABLE logs ADD COLUMN meters TEXT NOT NULL DEFAULT ''`); err != nil &&
-		!strings.Contains(err.Error(), "duplicate column") {
-		db.Close()
-		return nil, fmt.Errorf("migrate schema: %w", err)
+	for _, col := range []string{"meters", "query"} {
+		_, err := db.Exec(`ALTER TABLE logs ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`)
+		if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("migrate schema (%s): %w", col, err)
+		}
 	}
 	return &SQLiteStore{db: db}, nil
 }
 
 func (s *SQLiteStore) Save(ctx context.Context, r *Record) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO logs (ts, service, method, path, route, status, duration_ms,
+		INSERT INTO logs (ts, service, method, path, query, route, status, duration_ms,
 			remote, source, req_headers, resp_headers, req_body, resp_body,
 			req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.Time.UnixMilli(), r.Service, r.Method, r.Path, r.Route, r.Status,
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.Time.UnixMilli(), r.Service, r.Method, r.Path, r.Query, r.Route, r.Status,
 		r.DurationMS,
 		r.Remote, r.Source,
 		mustJSON(r.RequestHeaders), mustJSON(r.ResponseHeaders),
@@ -98,7 +101,7 @@ func (s *SQLiteStore) Query(ctx context.Context, f Filter) ([]Record, int64, err
 	if limit <= 0 || limit > 500 {
 		limit = 50
 	}
-	q := "SELECT id, ts, service, method, path, route, status, duration_ms, remote, source, " +
+	q := "SELECT id, ts, service, method, path, query, route, status, duration_ms, remote, source, " +
 		"req_headers, resp_headers, req_body, resp_body, req_trunc, resp_trunc, " +
 		"req_bytes, resp_bytes, labels, matched_rules, meters FROM logs" + where +
 		" ORDER BY id DESC LIMIT ? OFFSET ?"
@@ -120,7 +123,7 @@ func (s *SQLiteStore) Query(ctx context.Context, f Filter) ([]Record, int64, err
 }
 
 func (s *SQLiteStore) Get(ctx context.Context, id int64) (*Record, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, ts, service, method, path, route,
+	row := s.db.QueryRowContext(ctx, `SELECT id, ts, service, method, path, query, route,
 		status, duration_ms, remote, source, req_headers, resp_headers, req_body,
 		resp_body, req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters
 		FROM logs WHERE id = ?`, id)
@@ -304,7 +307,7 @@ func (s *SQLiteStore) Recent(ctx context.Context, since time.Time, limit int) ([
 		limit = 20_000
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, ts, service, method, path, route, status, duration_ms, remote, source,
+		`SELECT id, ts, service, method, path, query, route, status, duration_ms, remote, source,
 		        req_headers, resp_headers, req_body, resp_body, req_trunc, resp_trunc,
 		        req_bytes, resp_bytes, labels, matched_rules, meters
 		 FROM logs WHERE ts >= ? ORDER BY id DESC LIMIT ?`, since.UnixMilli(), limit)
@@ -399,6 +402,42 @@ func (s *SQLiteStore) Prune(ctx context.Context, maxRows int64) (int64, error) {
 	return res.RowsAffected()
 }
 
+func (s *SQLiteStore) PruneBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM logs WHERE ts < ?`, cutoff.UnixMilli())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// Purge implements erasure requests. Labels are stored as a JSON object, so
+// the match is on the exact `"label":"value"` pair — substring matching on
+// the value alone would delete another tenant's data, which is the one
+// mistake an erasure tool must never make.
+func (s *SQLiteStore) Purge(ctx context.Context, label, value string, before time.Time) (int64, error) {
+	if label == "" || value == "" {
+		return 0, fmt.Errorf("purge requires both a label and a value")
+	}
+	pair, err := json.Marshal(map[string]string{label: value})
+	if err != nil {
+		return 0, err
+	}
+	// {"tenant":"acme"} -> "tenant":"acme"
+	needle := "%" + strings.TrimSuffix(strings.TrimPrefix(string(pair), "{"), "}") + "%"
+
+	query := `DELETE FROM logs WHERE labels LIKE ?`
+	args := []any{needle}
+	if !before.IsZero() {
+		query += ` AND ts < ?`
+		args = append(args, before.UnixMilli())
+	}
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func (s *SQLiteStore) Close() error { return s.db.Close() }
 
 // --- helpers ----------------------------------------------------------------
@@ -414,8 +453,8 @@ func buildWhere(f Filter) (string, []any) {
 	}
 	if f.Search != "" {
 		like := "%" + f.Search + "%"
-		conds = append(conds, "(path LIKE ? OR req_body LIKE ? OR resp_body LIKE ?)")
-		args = append(args, like, like, like)
+		conds = append(conds, "(path LIKE ? OR query LIKE ? OR req_body LIKE ? OR resp_body LIKE ?)")
+		args = append(args, like, like, like, like)
 	}
 	if f.StatusMin > 0 {
 		conds, args = append(conds, "status >= ?"), append(args, f.StatusMin)
@@ -442,7 +481,7 @@ func scanRecord(row scannable) (*Record, error) {
 	var ts int64
 	var reqH, respH, labels, rules, meters string
 	var reqT, respT int
-	err := row.Scan(&r.ID, &ts, &r.Service, &r.Method, &r.Path, &r.Route,
+	err := row.Scan(&r.ID, &ts, &r.Service, &r.Method, &r.Path, &r.Query, &r.Route,
 		&r.Status, &r.DurationMS, &r.Remote, &r.Source, &reqH, &respH,
 		&r.RequestBody, &r.ResponseBody, &reqT, &respT,
 		&r.ReqBytes, &r.RespBytes, &labels, &rules, &meters)

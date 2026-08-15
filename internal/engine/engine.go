@@ -40,11 +40,14 @@ type Policy struct {
 	CaptureRequestBody  bool
 	CaptureResponseBody bool
 	CaptureHeaders      bool
+	CaptureQuery        bool
 	CaptureLimitBytes   int64
 
 	// RedactHeaders holds canonical header names whose values are masked
 	// in captured telemetry.
 	RedactHeaders map[string]struct{}
+	// RedactQuery holds lower-cased query parameter names to mask.
+	RedactQuery map[string]struct{}
 	// RedactJSONPaths holds pre-split dotted paths ($.a.b -> ["a","b"]).
 	RedactJSONPaths [][]string
 	Labels          map[string]LabelSource
@@ -112,6 +115,7 @@ type compiledRule struct {
 	methods     map[string]struct{} // nil = all methods
 	restrict    []config.CaptureField
 	redactHdrs  []string
+	redactQuery []string
 	redactPaths [][]string
 	labels      map[string]LabelSource
 	meters      map[string][]string
@@ -146,6 +150,9 @@ func New(cfg *config.Config) *Engine {
 			for _, h := range r.Redact.Headers {
 				cr.redactHdrs = append(cr.redactHdrs, http.CanonicalHeaderKey(h))
 			}
+			for _, q := range r.Redact.QueryParams {
+				cr.redactQuery = append(cr.redactQuery, strings.ToLower(q))
+			}
 			for _, jp := range r.Redact.JSONFields {
 				// "$.credit_card.number" -> ["credit_card", "number"]
 				cr.redactPaths = append(cr.redactPaths, strings.Split(strings.TrimPrefix(jp, "$."), "."))
@@ -177,6 +184,7 @@ func (e *Engine) Evaluate(method, urlPath string) Policy {
 		CaptureRequestBody:  config.Bool(e.defaults.Capture.RequestBody),
 		CaptureResponseBody: config.Bool(e.defaults.Capture.ResponseBody),
 		CaptureHeaders:      config.Bool(e.defaults.Capture.Headers),
+		CaptureQuery:        config.Bool(e.defaults.Capture.Query),
 		CaptureLimitBytes:   e.defaults.CaptureLimitBytes,
 		SampleRate:          1.0,
 	}
@@ -212,6 +220,8 @@ func (e *Engine) Evaluate(method, urlPath string) Policy {
 				p.CaptureResponseBody = false
 			case config.FieldHeaders:
 				p.CaptureHeaders = false
+			case config.FieldQuery:
+				p.CaptureQuery = false
 			}
 		}
 		if len(r.redactHdrs) > 0 {
@@ -220,6 +230,14 @@ func (e *Engine) Evaluate(method, urlPath string) Policy {
 			}
 			for _, h := range r.redactHdrs {
 				p.RedactHeaders[h] = struct{}{}
+			}
+		}
+		if len(r.redactQuery) > 0 {
+			if p.RedactQuery == nil {
+				p.RedactQuery = make(map[string]struct{})
+			}
+			for _, q := range r.redactQuery {
+				p.RedactQuery[q] = struct{}{}
 			}
 		}
 		p.RedactJSONPaths = append(p.RedactJSONPaths, r.redactPaths...)

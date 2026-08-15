@@ -15,6 +15,7 @@
 package admin
 
 import (
+	"crypto/subtle"
 	"encoding/csv"
 	"encoding/json"
 	"io"
@@ -46,6 +47,10 @@ type Server struct {
 	Reload     func() error // hot-reload hook installed by main
 	UIDir      string       // static dashboard directory (optional)
 	Version    string
+	// AuthToken protects every endpoint when non-empty. HealthOpen keeps
+	// /healthz reachable for orchestrator probes.
+	AuthToken  string
+	HealthOpen bool
 
 	startedAt time.Time
 }
@@ -74,7 +79,42 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/ingest", s.ingest)
 	mux.HandleFunc("/", s.ui)
 
-	return withCORS(mux)
+	return withCORS(s.withAuth(mux))
+}
+
+// withAuth gates the control plane behind a bearer token. Comparison is
+// constant-time so a timing side channel can't be used to guess the token
+// byte by byte.
+func (s *Server) withAuth(next http.Handler) http.Handler {
+	if s.AuthToken == "" {
+		return next // disabled: the port is expected to be firewalled
+	}
+	want := []byte(s.AuthToken)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.HealthOpen && r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Preflight carries no credentials by design.
+		if r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		got := ""
+		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+			got = strings.TrimPrefix(h, "Bearer ")
+		} else if t := r.URL.Query().Get("token"); t != "" {
+			// Query fallback exists so a browser can load the dashboard;
+			// it is inherently weaker (proxies log URLs), hence documented.
+			got = t
+		}
+		if subtle.ConstantTimeCompare([]byte(got), want) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="optictrace"`)
+			httpError(w, http.StatusUnauthorized, "missing or invalid bearer token")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // withCORS allows the dashboard dev server (next dev on another port) to call

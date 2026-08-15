@@ -18,8 +18,10 @@ type Record struct {
 	Service string    `json:"service"`
 	Method  string    `json:"method"`
 	Path    string    `json:"path"`
-	Route   string    `json:"route"` // low-cardinality route pattern
-	Status  int       `json:"status"`
+	// Query is the sanitized query string (policy-masked, stable ordering).
+	Query  string `json:"query,omitempty"`
+	Route  string `json:"route"` // low-cardinality route pattern
+	Status int    `json:"status"`
 	// DurationMS is milliseconds (float) — the natural unit for SDKs in
 	// every language to produce and for the dashboard to consume.
 	DurationMS float64 `json:"duration_ms"`
@@ -135,5 +137,12 @@ type LogStore interface {
 	// tenant) since the given time — the FinOps view.
 	UsageByLabel(ctx context.Context, since time.Time, label string) ([]Usage, error)
 	Prune(ctx context.Context, maxRows int64) (removed int64, err error)
+	// PruneBefore deletes everything older than cutoff — age-based retention,
+	// which is how data-retention policies are actually written.
+	PruneBefore(ctx context.Context, cutoff time.Time) (removed int64, err error)
+	// Purge deletes records matching a consumer label (and optionally a time
+	// bound). This is the erasure-request primitive: "delete everything you
+	// hold for tenant X".
+	Purge(ctx context.Context, label, value string, before time.Time) (removed int64, err error)
 	Close() error
 }

@@ -75,7 +75,10 @@ func New(configPath string, opts ...AgentOption) (*Agent, error) {
 			return nil, err
 		}
 		a.reader = sqlStore
-		asyncOpts := []store.AsyncOption{store.WithRetention(cfg.Telemetry.Store.RetentionMaxRows)}
+		asyncOpts := []store.AsyncOption{
+			store.WithRetention(cfg.Telemetry.Store.RetentionMaxRows),
+			store.WithMaxAge(cfg.Telemetry.Store.MaxAge()),
+		}
 		if a.collector != nil {
 			asyncOpts = append(asyncOpts, store.WithDropCallback(a.collector.StoreDropped))
 		}
@@ -135,6 +138,8 @@ func (a *Agent) AdminHandler(uiDir string) http.Handler {
 		ConfigPath: a.configPath,
 		Reload:     a.Reload,
 		UIDir:      uiDir,
+		AuthToken:  a.cfg.Telemetry.Auth.Resolve(),
+		HealthOpen: a.cfg.Telemetry.Auth.HealthOpen(),
 	}).Handler()
 }
 
@@ -147,8 +152,16 @@ func (a *Agent) ServeAdmin(uiDir string) {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
-		a.logger.Info("admin server listening", "listen", a.cfg.Telemetry.AdminListen)
-		if err := a.adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		tlsCfg := a.cfg.Telemetry.TLS
+		a.logger.Info("admin server listening", "listen", a.cfg.Telemetry.AdminListen,
+			"auth", a.cfg.Telemetry.Auth.Resolve() != "", "tls", tlsCfg != nil)
+		var err error
+		if tlsCfg != nil {
+			err = a.adminSrv.ListenAndServeTLS(tlsCfg.CertFile, tlsCfg.KeyFile)
+		} else {
+			err = a.adminSrv.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			a.logger.Error("admin server failed", "error", err)
 		}
 	}()

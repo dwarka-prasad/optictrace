@@ -206,6 +206,51 @@ rules:
 	}
 }
 
+func TestQueryRedaction(t *testing.T) {
+	yaml := `
+version: 1
+rules:
+  - name: mask-query-creds
+    match: { path: "/v1/**" }
+    redact:
+      query_params: [api_key, TOKEN]
+  - name: no-query-on-admin
+    match: { path: "/admin/**" }
+    restrict: [query]
+`
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := New(cfg)
+
+	p := e.Evaluate("GET", "/v1/search")
+	got := p.SanitizeQuery("q=shoes&api_key=secret123&page=2&token=abc")
+	// Sorted for stability; listed params masked; case-insensitive match.
+	want := "api_key=" + RedactedPlaceholder + "&page=2&q=shoes&token=" + RedactedPlaceholder
+	if got != want {
+		t.Errorf("SanitizeQuery:\n got %q\nwant %q", got, want)
+	}
+	if strings.Contains(got, "secret123") || strings.Contains(got, "abc") {
+		t.Error("credential leaked through query sanitization")
+	}
+
+	// Restriction beats redaction: the query isn't captured at all.
+	admin := e.Evaluate("GET", "/admin/panel")
+	if admin.CaptureQuery {
+		t.Error("restrict: [query] should disable query capture")
+	}
+
+	// Unparseable queries are dropped rather than stored raw.
+	if out := p.SanitizeQuery("%zz"); !strings.Contains(out, "omitted") {
+		t.Errorf("unparseable query should be omitted, got %q", out)
+	}
+	// Default posture captures queries.
+	if !e.Evaluate("GET", "/other").CaptureQuery {
+		t.Error("query capture should be on by default")
+	}
+}
+
 func TestConfigValidationErrors(t *testing.T) {
 	bad := []string{
 		"version: 2", // unsupported version
