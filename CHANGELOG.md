@@ -10,30 +10,58 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-08-16
+
+Every issue on the tracker at the start of this cycle, plus the extension
+surface that lets OpticTrace be built on from outside.
+
+Two themes. **Closing the gap between what the docs claimed and what the code
+did** — WebSocket upgrades returned 502 rather than passing through, gRPC could
+not connect at all, a reload silently discarded most of the config, and `purge`
+could delete a neighbouring tenant's data. And **`ext/`**, a public, versioned
+extension surface: everything else lives under `internal/`, so until now there
+was nowhere for an out-of-tree store, exporter or authentication method to
+stand.
+
+> **Breaking:** the admin API now binds `127.0.0.1` by default instead of all
+> interfaces, and sends no CORS headers unless an origin is explicitly allowed.
+> If you reached the dashboard from another host, set
+> `admin_listen: "0.0.0.0:9095"` — and set `telemetry.auth` while you are there.
+> See *Security* below for why.
+
 ### Added
 
 - **`ext/` — a public extension surface.** Everything else lives under `internal/`, which other Go modules cannot import; `ext` is the deliberate exception, holding the record types and the `Store`/`Exporter` interfaces. Register a driver with `ext.RegisterStore` or `ext.RegisterExporter` and it becomes valid in `optic.yaml` purely by being linked in — the core needs no changes. Driver-specific keys live under a `settings:` map, since the decoder rejects unknown top-level keys on purpose. The record types are *aliased* from `internal/store`, not duplicated, so there is exactly one `Record` in the program.
+
 - **Admin extension hooks: authentication, authorization and audit.** `ext.RegisterAuthenticator` (with an optional `Challenger` for interactive login redirects), `ext.RegisterAuthorizer`, `ext.RegisterAuditor` and `ext.RegisterAdminRoutes`. Every admin route now declares a **capability** describing what it exposes, so policy is written against capabilities rather than URLs — an extension never tracks OpticTrace's routing, and a route cannot be added without classifying it. `read:payload` and `export` are deliberately separate. The chain fails closed (a panicking authenticator 401s, a panicking authorizer 403s), composes by intersection, and never returns a denial reason to the caller. Audit events carry what was reached — count, record ids, filter, tenant — not just the URL. With nothing registered and no token, behaviour is unchanged. [`examples/adminauth`](examples/adminauth) is a worked SSO+RBAC+audit implementation in its own module.
+
 - **`ext/exttest` — the conformance suite, exported.** The acceptance criteria the built-in drivers run are now public, so an out-of-tree store can be held to the identical contract. [`examples/memstore`](examples/memstore) is a worked reference: a complete driver in its own module, outside the `optictrace/` path prefix so it genuinely cannot reach `internal/`, passing the full suite using only `ext`. CI builds it, so a gap in the extension surface fails the build.
 
 - **Cleartext HTTP/2 (h2c)** behind `service.http2: true`. Off by default: it changes protocol negotiation for every client. This is what an HTTP/2 client needs to connect at all — it is *not* gRPC support, and the docs now say so plainly rather than describing gRPC as merely "not specifically supported". ([#11](https://github.com/dwarka-prasad/optictrace/issues/11))
+
 - **Streams are measured separately from requests.** `optictrace_stream_duration_seconds` (1s–4.5h buckets), `optictrace_streams_total` and `optictrace_streams_open` cover SSE, chunked responses and upgraded connections. Their durations no longer enter `optictrace_request_duration_seconds` or the dashboard's route percentiles, where a single 10-minute SSE connection used to define a route's p95 for the whole window. Records carry a `stream` flag; existing databases are migrated in place. ([#12](https://github.com/dwarka-prasad/optictrace/issues/12))
 
-### Added
-
 - **ClickHouse `LogStore` driver** (`telemetry.store.driver: clickhouse`). Every dashboard query is a time-bucketed aggregation over an append-only table, which is what a column store is for. It passes the shared conformance suite unmodified alongside SQLite and Postgres, so the three drivers cannot answer the same question differently. Two things genuinely differ and are handled explicitly rather than hidden: ClickHouse has no autoincrement, so IDs are generated client-side with a millisecond prefix to preserve newest-first ordering; and `DELETE` is an asynchronous mutation, so every delete path runs with `mutations_sync = 2` — an erasure request that returned before the data was gone would be worse than useless. The driver is pure Go, so `CGO_ENABLED=0` and the static release binaries are unaffected. ([#2](https://github.com/dwarka-prasad/optictrace/issues/2))
+
 - **GraphQL operations are first-class.** Set `service.graphql_paths`, and the operation name is extracted from the request body, appended to the route (`/graphql:CreatePayment`), and matchable with `match.graphql_operation`. Previously every operation collapsed into one `/graphql` route: latency percentiles averaged a 2ms `viewer` query with a 4s report, a rule could not redact a field on one mutation without applying to every query, and inferred specs produced a single endpoint whose schema was the union of everything. Operation names are client-supplied, so they are validated as plain identifiers and length-capped before becoming a label; batched requests report `batch` rather than being attributed to whichever operation came first. ([#10](https://github.com/dwarka-prasad/optictrace/issues/10))
+
 - **Org-specific `scan` detectors** via `scan.detectors` in `optic.yaml`, merged with the built-ins. Patterns compile at load time so a bad one fails `optictrace validate` rather than at scan time, patterns that match the empty string are rejected, and a `verify:` registry exposes the built-in checksums (`luhn`, `iban`, `us_ssn`, and a new `verhoeff` for Aadhaar and similar national IDs) so a custom detector can be as precise as a built-in. Findings still go through `Mask()`, so a custom detector cannot become the hole in that. ([#3](https://github.com/dwarka-prasad/optictrace/issues/3))
 
-### Testing
+- **Homebrew tap** — `brew install dwarka-prasad/tap/optictrace`, covering macOS and Linux on Intel and ARM. Published as a *formula* rather than a cask: casks are macOS-only, and a cask of an unsigned binary trips Gatekeeper quarantine. `scripts/update-tap.sh` regenerates it from each release's published `checksums.txt`, so the formula's hashes cannot drift from the artifacts users download.
 
-- **`internal/config`, `internal/admin` and `sdks/gin` had no tests at all.** They now cover the auth path (constant-time compare, query-token fallback, health bypass, preflight), the CORS allowlist, export pagination across multiple pages in both JSONL and CSV, the billing cost arithmetic component by component, every config validation rule, and the Gin adapter's `Flusher`/`Hijacker`/`Pusher` surface — the same class of wrapper bug as #5. Config coverage went 0% → 77%, admin 0% → 41%. CI now runs the SDK's tests rather than only building it. ([#13](https://github.com/dwarka-prasad/optictrace/issues/13))
+- A **product page** (`docs/`, served by GitHub Pages) and a demo GIF in the README, both built from real output and live screenshots of a running stack rather than mockups.
 
-### Performance
+- **`optictrace review` and a GitHub Action** — comments on every pull request with what the change does to API governance. Its core is a *policy diff*: the same captured traffic is evaluated under the base branch's rules and the PR's, so a change that stops redacting a field is reported with the number of real requests it affects. Also reports a coverage score, pre-existing leaks, and (with a spec) changes that break observed clients.
 
-- **Rule-match counts are one query instead of N.** `/api/rules/stats` ran one `matched_rules LIKE '%"name"%'` per rule — and a LIKE pattern with a leading wildcard can never use an index, so that was N full table scans per dashboard load. SQLite now expands the JSON array with `json_each` and groups in one indexed pass; measured 117ms → 52ms at 50k rows with 10 rules, and it now scales with rule count rather than multiplying by it. Postgres gained the GIN index on `matched_rules` that its containment query never had. ([#9](https://github.com/dwarka-prasad/optictrace/issues/9))
-- **Route percentiles no longer sort every matching row.** A new `(route, method, duration_ms)` index means the per-route `ORDER BY duration_ms LIMIT 1 OFFSET n` subqueries walk an ordered index; `EXPLAIN QUERY PLAN` confirms the temp B-tree for the sort is gone.
-- **Analysis passes stream instead of materialising.** `/api/scan` and `/api/spec` loaded up to 20,000 complete records — bodies included, so gigabytes at the default capture limit — before analysing any of them, on endpoints that were unauthenticated by default. Both analysers now fold record-by-record through a new `LogStore.RecentFunc`, holding one record at a time. The cap is configurable via `telemetry.store.analysis_max_rows`, and the CLI says so when it truncates rather than letting a partial analysis read as a complete one. ([#7](https://github.com/dwarka-prasad/optictrace/issues/7))
+- By default a PR fails only for regressions it introduced; pre-existing findings are context, not a blocker. `fail-on: critical|high` escalates once the backlog is clear.
+
+- Traffic can come from a running agent (`-from`, the CI case — records arrive already governed, so the job never handles raw payloads) or a JSONL export (`-from-file`).
+
+- Coverage excludes 404s: a path the upstream doesn't serve isn't part of the API surface, and counting scanner noise against the score would make it untrustworthy.
+
+### Changed
+
+- The Compose demo config now exercises every governance mechanism — metering with billing, query redaction, tail-based sampling, the cardinality guard and a file exporter — so `docker compose up` produces a dashboard with real data instead of an empty shell. `/api/v1/orders` is deliberately left ungoverned so `scan` and `suggest` have something to find.
 
 ### Security
 
@@ -55,22 +83,19 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 - **`purge` could delete another tenant's data** (SQLite). The label match used `LIKE` without an `ESCAPE` clause, so `%` and `_` in a value stayed live wildcards: purging `acme_1` also destroyed `acmeX1`, and `a%` destroyed every tenant beginning with `a` — while still reporting success. The Postgres driver compares exactly and was never affected, so the two drivers disagreed on the same input. Values are now matched literally, and `TestConformancePurgeIsLiteral` runs the case against **both** drivers so they cannot diverge again. ([#4](https://github.com/dwarka-prasad/optictrace/issues/4))
 
-### Added
-
-- **Homebrew tap** — `brew install dwarka-prasad/tap/optictrace`, covering macOS and Linux on Intel and ARM. Published as a *formula* rather than a cask: casks are macOS-only, and a cask of an unsigned binary trips Gatekeeper quarantine. `scripts/update-tap.sh` regenerates it from each release's published `checksums.txt`, so the formula's hashes cannot drift from the artifacts users download.
-- A **product page** (`docs/`, served by GitHub Pages) and a demo GIF in the README, both built from real output and live screenshots of a running stack rather than mockups.
-- **`optictrace review` and a GitHub Action** — comments on every pull request with what the change does to API governance. Its core is a *policy diff*: the same captured traffic is evaluated under the base branch's rules and the PR's, so a change that stops redacting a field is reported with the number of real requests it affects. Also reports a coverage score, pre-existing leaks, and (with a spec) changes that break observed clients.
-- By default a PR fails only for regressions it introduced; pre-existing findings are context, not a blocker. `fail-on: critical|high` escalates once the backlog is clear.
-- Traffic can come from a running agent (`-from`, the CI case — records arrive already governed, so the job never handles raw payloads) or a JSONL export (`-from-file`).
-- Coverage excludes 404s: a path the upstream doesn't serve isn't part of the API surface, and counting scanner noise against the score would make it untrustworthy.
-
-### Fixed
-
 - `optictrace suggest` no longer reports ordinary parameters as payment-card data. `pan`, `cvv` and `cvc` were substring matches, so `expand`, `company` and `panel` were all flagged high-confidence; they are now matched exactly. Found by running the Compose stack end to end.
 
-### Changed
+### Performance
 
-- The Compose demo config now exercises every governance mechanism — metering with billing, query redaction, tail-based sampling, the cardinality guard and a file exporter — so `docker compose up` produces a dashboard with real data instead of an empty shell. `/api/v1/orders` is deliberately left ungoverned so `scan` and `suggest` have something to find.
+- **Rule-match counts are one query instead of N.** `/api/rules/stats` ran one `matched_rules LIKE '%"name"%'` per rule — and a LIKE pattern with a leading wildcard can never use an index, so that was N full table scans per dashboard load. SQLite now expands the JSON array with `json_each` and groups in one indexed pass; measured 117ms → 52ms at 50k rows with 10 rules, and it now scales with rule count rather than multiplying by it. Postgres gained the GIN index on `matched_rules` that its containment query never had. ([#9](https://github.com/dwarka-prasad/optictrace/issues/9))
+
+- **Route percentiles no longer sort every matching row.** A new `(route, method, duration_ms)` index means the per-route `ORDER BY duration_ms LIMIT 1 OFFSET n` subqueries walk an ordered index; `EXPLAIN QUERY PLAN` confirms the temp B-tree for the sort is gone.
+
+- **Analysis passes stream instead of materialising.** `/api/scan` and `/api/spec` loaded up to 20,000 complete records — bodies included, so gigabytes at the default capture limit — before analysing any of them, on endpoints that were unauthenticated by default. Both analysers now fold record-by-record through a new `LogStore.RecentFunc`, holding one record at a time. The cap is configurable via `telemetry.store.analysis_max_rows`, and the CLI says so when it truncates rather than letting a partial analysis read as a complete one. ([#7](https://github.com/dwarka-prasad/optictrace/issues/7))
+
+### Testing
+
+- **`internal/config`, `internal/admin` and `sdks/gin` had no tests at all.** They now cover the auth path (constant-time compare, query-token fallback, health bypass, preflight), the CORS allowlist, export pagination across multiple pages in both JSONL and CSV, the billing cost arithmetic component by component, every config validation rule, and the Gin adapter's `Flusher`/`Hijacker`/`Pusher` surface — the same class of wrapper bug as #5. Config coverage went 0% → 77%, admin 0% → 41%. CI now runs the SDK's tests rather than only building it. ([#13](https://github.com/dwarka-prasad/optictrace/issues/13))
 
 ## [0.7.0] — 2026-08-16
 
@@ -145,5 +170,6 @@ Measured with `make bench` (12th Gen Intel i5-1235U, Go 1.25):
 - Control-plane authentication is available but **off by default**.
 - Homebrew publishing is configured but disabled until a `homebrew-tap` repository exists.
 
-[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/dwarka-prasad/optictrace/releases/tag/v0.7.0
