@@ -63,12 +63,10 @@ rules:
     match:
       path: "/api/v1/payments/**"
     redact:
-      headers: [Authorization, X-Api-Key, Cookie]
+      headers: [Authorization, X-Api-Key]
       query_params: [api_key, session]
       json_fields:
         - "$.**.credit_card.number"
-        - "$.**.credit_card.cvv"
-        - "$.**.customer.email"
     labels:
       tenant: "header:X-Tenant-ID"
       region: "header:X-Region"
