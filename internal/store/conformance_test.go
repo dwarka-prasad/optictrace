@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -291,6 +292,161 @@ func TestConformanceRowPrune(t *testing.T) {
 			}
 			if c, _ := s.Count(ctx); c != 20 {
 				t.Errorf("want 20 remaining, got %d", c)
+			}
+		})
+	}
+}
+
+// RecentFunc is the streaming form of Recent. Both must agree, and RecentFunc
+// must stop early when the callback asks it to — the whole point is that a
+// caller never has to hold the full window in memory.
+func TestConformanceRecentFunc(t *testing.T) {
+	for _, d := range drivers(t) {
+		t.Run(d.name, func(t *testing.T) {
+			ctx := context.Background()
+			s := d.open(t)
+			for i := 0; i < 25; i++ {
+				if err := s.Save(ctx, confRecord(200, float64(i), "/api/x", "acme")); err != nil {
+					t.Fatalf("save: %v", err)
+				}
+			}
+			since := time.Now().Add(-time.Hour)
+
+			var streamed []Record
+			if err := s.RecentFunc(ctx, since, 0, func(r *Record) error {
+				streamed = append(streamed, *r)
+				return nil
+			}); err != nil {
+				t.Fatalf("RecentFunc: %v", err)
+			}
+			materialised, err := s.Recent(ctx, since, 0)
+			if err != nil {
+				t.Fatalf("Recent: %v", err)
+			}
+			if len(streamed) != len(materialised) || len(streamed) != 25 {
+				t.Fatalf("streamed %d, materialised %d, want 25",
+					len(streamed), len(materialised))
+			}
+			for i := range streamed {
+				if streamed[i].ID != materialised[i].ID {
+					t.Fatalf("order diverges at %d: %d vs %d",
+						i, streamed[i].ID, materialised[i].ID)
+				}
+			}
+
+			t.Run("limit is honoured", func(t *testing.T) {
+				n := 0
+				if err := s.RecentFunc(ctx, since, 10, func(*Record) error { n++; return nil }); err != nil {
+					t.Fatal(err)
+				}
+				if n != 10 {
+					t.Errorf("read %d records with limit 10", n)
+				}
+			})
+
+			t.Run("callback error stops the walk", func(t *testing.T) {
+				stop := errors.New("enough")
+				n := 0
+				err := s.RecentFunc(ctx, since, 0, func(*Record) error {
+					n++
+					if n == 3 {
+						return stop
+					}
+					return nil
+				})
+				if !errors.Is(err, stop) {
+					t.Errorf("error = %v, want it to wrap the callback's", err)
+				}
+				if n != 3 {
+					t.Errorf("kept walking after the callback stopped: %d", n)
+				}
+			})
+		})
+	}
+}
+
+// RuleMatchCounts must report a zero for a rule that never fired — that is the
+// interesting answer for a rule you expected to be matching — and must count
+// each rule in a multi-rule record.
+func TestConformanceRuleMatchCounts(t *testing.T) {
+	for _, d := range drivers(t) {
+		t.Run(d.name, func(t *testing.T) {
+			ctx := context.Background()
+			s := d.open(t)
+			for _, rules := range [][]string{
+				{"redact-cards", "label-tenant"},
+				{"redact-cards"},
+				{"label-tenant"},
+				nil,
+			} {
+				r := confRecord(200, 1, "/api/x", "acme")
+				r.MatchedRules = rules
+				if err := s.Save(ctx, r); err != nil {
+					t.Fatalf("save: %v", err)
+				}
+			}
+			got, err := s.RuleMatchCounts(ctx, time.Now().Add(-time.Hour),
+				[]string{"redact-cards", "label-tenant", "never-fires"})
+			if err != nil {
+				t.Fatalf("RuleMatchCounts: %v", err)
+			}
+			counts := map[string]int64{}
+			for _, m := range got {
+				counts[m.Rule] = m.Count
+			}
+			for rule, want := range map[string]int64{
+				"redact-cards": 2, "label-tenant": 2, "never-fires": 0,
+			} {
+				if counts[rule] != want {
+					t.Errorf("%s = %d, want %d (all: %+v)", rule, counts[rule], want, counts)
+				}
+			}
+			if len(got) != 3 {
+				t.Errorf("every requested rule should be reported, got %d", len(got))
+			}
+		})
+	}
+}
+
+// Streams carry a connection lifetime in DurationMS, so they must not enter
+// latency percentiles — one long SSE connection would otherwise define a
+// route's p95 for the whole window.
+func TestConformanceStreamsExcludedFromPercentiles(t *testing.T) {
+	for _, d := range drivers(t) {
+		t.Run(d.name, func(t *testing.T) {
+			ctx := context.Background()
+			s := d.open(t)
+			for i := 0; i < 9; i++ {
+				if err := s.Save(ctx, confRecord(200, 10, "/api/x", "acme")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stream := confRecord(200, 600_000, "/api/x", "acme") // a 10-minute stream
+			stream.Stream = true
+			if err := s.Save(ctx, stream); err != nil {
+				t.Fatal(err)
+			}
+
+			st, err := s.Stats(ctx, time.Now().Add(-time.Hour), time.Minute)
+			if err != nil {
+				t.Fatalf("stats: %v", err)
+			}
+			if st.P95LatencyMS > 100 {
+				t.Errorf("p95 = %.0fms — the stream leaked into latency percentiles", st.P95LatencyMS)
+			}
+			// It should still be counted as traffic.
+			if st.Total != 10 {
+				t.Errorf("total = %d, want 10: streams are still requests", st.Total)
+			}
+
+			routes, err := s.RouteStats(ctx, time.Now().Add(-time.Hour))
+			if err != nil {
+				t.Fatalf("route stats: %v", err)
+			}
+			for _, r := range routes {
+				if r.P99Latency > 100 {
+					t.Errorf("route %s p99 = %.0fms — stream leaked in", r.Route, r.P99Latency)
+				}
 			}
 		})
 	}

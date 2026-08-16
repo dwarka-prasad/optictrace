@@ -200,6 +200,12 @@ type StoreCfg struct {
 	// count — the control a data-retention policy is actually written in
 	// ("keep 30 days"). Go duration, e.g. "720h". Empty disables it.
 	RetentionMaxAge string `yaml:"retention_max_age"`
+	// AnalysisMaxRows bounds how many records one analysis pass reads —
+	// `scan`, `spec`, `suggest`, `review`, `replay` and the /api/scan and
+	// /api/spec endpoints. These read FULL records including bodies, so at
+	// the default capture limit this is a memory ceiling rather than just a
+	// row count. Default 20000; hard ceiling 500000.
+	AnalysisMaxRows int `yaml:"analysis_max_rows"`
 }
 
 // Service describes the proxied service (standalone sidecar mode). When
@@ -277,6 +283,10 @@ type Redact struct {
 }
 
 const DefaultCaptureLimitBytes = 64 * 1024
+
+// MaxAnalysisRows mirrors store.MaxAnalysisMaxRows. Duplicated rather than
+// imported to keep config free of a dependency on store.
+const MaxAnalysisRows = 500_000
 
 // Load reads, parses, and validates an optic.yaml file.
 func Load(path string) (*Config, error) {
@@ -490,6 +500,13 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("telemetry.tls: %v", err)
 			}
 		}
+	}
+	if n := c.Telemetry.Store.AnalysisMaxRows; n < 0 {
+		return fmt.Errorf("telemetry.store.analysis_max_rows must not be negative")
+	} else if n > MaxAnalysisRows {
+		return fmt.Errorf("telemetry.store.analysis_max_rows %d exceeds the %d ceiling "+
+			"(these are full records with bodies — a larger window is a memory ceiling, not a row count)",
+			n, MaxAnalysisRows)
 	}
 	if s := c.Telemetry.Store.RetentionMaxAge; s != "" {
 		d, err := time.ParseDuration(s)

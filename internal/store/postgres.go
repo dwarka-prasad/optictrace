@@ -56,6 +56,11 @@ CREATE INDEX IF NOT EXISTS idx_logs_status  ON logs(status);
 CREATE INDEX IF NOT EXISTS idx_logs_route   ON logs(route, method);
 CREATE INDEX IF NOT EXISTS idx_logs_service ON logs(service);
 CREATE INDEX IF NOT EXISTS idx_logs_labels  ON logs USING gin(labels);
+-- RuleMatchCounts uses matched_rules @> '["name"]'. The labels GIN index does
+-- not cover this column, so the containment query had nothing to use.
+CREATE INDEX IF NOT EXISTS idx_logs_rules   ON logs USING gin(matched_rules);
+-- Same reasoning as SQLite: percentile_cont sorts within each route group.
+CREATE INDEX IF NOT EXISTS idx_logs_route_duration ON logs(route, method, duration_ms);
 `
 
 // NewPostgres opens (and migrates) a Postgres-backed store. dsn is a standard
@@ -307,26 +312,36 @@ func (s *PostgresStore) Count(ctx context.Context) (int64, error) {
 	return n, err
 }
 
-func (s *PostgresStore) Recent(ctx context.Context, since time.Time, limit int) ([]Record, error) {
-	if limit <= 0 || limit > 50_000 {
-		limit = 20_000
-	}
+// RecentFunc streams records one at a time so an analysis pass costs one
+// record of memory rather than the whole window. Recent() materialises the
+// same rows; prefer this wherever the caller only folds over them.
+func (s *PostgresStore) RecentFunc(ctx context.Context, since time.Time, limit int, fn func(*Record) error) error {
 	rows, err := s.db.QueryContext(ctx,
 		"SELECT "+pgColumns+" FROM logs WHERE ts >= $1 ORDER BY id DESC LIMIT $2",
-		since.UnixMilli(), limit)
+		since.UnixMilli(), AnalysisLimit(limit))
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer rows.Close()
-	var out []Record
 	for rows.Next() {
 		rec, err := pgScan(rows)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		out = append(out, *rec)
+		if err := fn(rec); err != nil {
+			return err
+		}
 	}
-	return out, rows.Err()
+	return rows.Err()
+}
+
+func (s *PostgresStore) Recent(ctx context.Context, since time.Time, limit int) ([]Record, error) {
+	var out []Record
+	err := s.RecentFunc(ctx, since, limit, func(r *Record) error {
+		out = append(out, *r)
+		return nil
+	})
+	return out, err
 }
 
 func (s *PostgresStore) UsageByLabel(ctx context.Context, since time.Time, label string) ([]Usage, error) {

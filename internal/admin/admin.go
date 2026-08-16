@@ -54,6 +54,9 @@ type Server struct {
 	// CORSOrigins lists browser origins allowed to call the API
 	// cross-origin. Empty means no CORS headers are sent at all.
 	CORSOrigins []string
+	// AnalysisMaxRows bounds how many records /api/scan and /api/spec read.
+	// 0 uses store.DefaultAnalysisMaxRows.
+	AnalysisMaxRows int
 
 	startedAt time.Time
 }
@@ -459,12 +462,17 @@ func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 	}
 	window := parseDurationDefault(r.URL.Query().Get("window"), 24*time.Hour)
 	since := time.Now().Add(-window)
-	records, err := s.Reader.Recent(r.Context(), since, 0)
-	if err != nil {
+	// Streamed, not materialised: these are full records including bodies,
+	// and this endpoint is reachable without a token in the default posture.
+	sc := scan.NewScanner(since)
+	if err := s.Reader.RecentFunc(r.Context(), since, s.AnalysisMaxRows, func(rec *store.Record) error {
+		sc.Add(rec)
+		return nil
+	}); err != nil {
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	report := scan.Records(records, since)
+	report := sc.Report()
 	crit, high, med := report.Counts()
 	if report.Findings == nil {
 		report.Findings = []scan.Finding{}
@@ -488,22 +496,29 @@ func (s *Server) inferSpec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	window := parseDurationDefault(r.URL.Query().Get("window"), 24*time.Hour)
-	records, err := s.Reader.Recent(r.Context(), time.Now().Add(-window), 0)
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if len(records) == 0 {
-		httpError(w, http.StatusNotFound, "no traffic captured in this window")
-		return
-	}
 	service := ""
 	if raw, err := os.ReadFile(s.ConfigPath); err == nil {
 		if cfg, err := config.Parse(raw); err == nil {
 			service = cfg.Service.Name
 		}
 	}
-	doc := spec.Infer(service, records)
+	// Streamed for the same reason as /api/scan.
+	inf := spec.NewInferrer(service)
+	seen := 0
+	if err := s.Reader.RecentFunc(r.Context(), time.Now().Add(-window), s.AnalysisMaxRows,
+		func(rec *store.Record) error {
+			seen++
+			inf.Add(rec)
+			return nil
+		}); err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if seen == 0 {
+		httpError(w, http.StatusNotFound, "no traffic captured in this window")
+		return
+	}
+	doc := inf.Spec()
 	if r.URL.Query().Get("format") == "json" {
 		writeJSON(w, http.StatusOK, doc)
 		return

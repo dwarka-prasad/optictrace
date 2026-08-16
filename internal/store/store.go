@@ -11,6 +11,26 @@ import (
 	"time"
 )
 
+// DefaultAnalysisMaxRows bounds how many records an analysis pass reads when
+// no explicit limit is given. These are FULL records including bodies, so at
+// the default 64 KiB capture limit this is a memory ceiling, not just a row
+// count. Override with telemetry.store.analysis_max_rows.
+const DefaultAnalysisMaxRows = 20_000
+
+// MaxAnalysisMaxRows is the hard ceiling on that knob.
+const MaxAnalysisMaxRows = 500_000
+
+// AnalysisLimit resolves a requested limit against the defaults.
+func AnalysisLimit(limit int) int {
+	if limit <= 0 {
+		return DefaultAnalysisMaxRows
+	}
+	if limit > MaxAnalysisMaxRows {
+		return MaxAnalysisMaxRows
+	}
+	return limit
+}
+
 // Record is one captured HTTP exchange, post-governance.
 type Record struct {
 	ID      int64     `json:"id"`
@@ -151,8 +171,17 @@ type LogStore interface {
 	// Count returns total stored records (for /api/system).
 	Count(ctx context.Context) (int64, error)
 	// Recent returns up to limit full records since a time (newest first) —
-	// the input for spec inference and spec-vs-traffic checks.
+	// the input for spec inference and spec-vs-traffic checks. limit <= 0
+	// means DefaultAnalysisMaxRows.
+	//
+	// Prefer RecentFunc for anything that folds over the result: these are
+	// FULL records, bodies included, so a large window can materialise
+	// gigabytes before the caller sees the first one.
 	Recent(ctx context.Context, since time.Time, limit int) ([]Record, error)
+	// RecentFunc streams the same records to fn one at a time, so memory
+	// stays at one record regardless of how many there are. Returning a
+	// non-nil error from fn stops the walk and is returned to the caller.
+	RecentFunc(ctx context.Context, since time.Time, limit int, fn func(*Record) error) error
 	// ServiceStats aggregates per service — the fleet view.
 	ServiceStats(ctx context.Context, since time.Time) ([]ServiceStat, error)
 	// UsageByLabel aggregates traffic per consumer (a label value, e.g.

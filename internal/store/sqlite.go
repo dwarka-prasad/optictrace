@@ -47,6 +47,11 @@ CREATE TABLE IF NOT EXISTS logs (
 CREATE INDEX IF NOT EXISTS idx_logs_ts     ON logs(ts);
 CREATE INDEX IF NOT EXISTS idx_logs_status ON logs(status);
 CREATE INDEX IF NOT EXISTS idx_logs_route  ON logs(route);
+-- Percentiles are computed with ORDER BY duration_ms LIMIT 1 OFFSET n, once
+-- per route per quantile. idx_logs_route alone satisfies the filter but still
+-- forces a sort of every matching row; carrying duration_ms in the index lets
+-- those subqueries walk it in order instead.
+CREATE INDEX IF NOT EXISTS idx_logs_route_duration ON logs(route, method, duration_ms);
 `
 
 func NewSQLite(dsn string) (*SQLiteStore, error) {
@@ -293,45 +298,81 @@ func (s *SQLiteStore) RouteStats(ctx context.Context, since time.Time) ([]RouteD
 	return out, nil
 }
 
+// RuleMatchCounts counts how often each named rule fired.
+//
+// This used to run one `matched_rules LIKE '%"name"%'` per rule — N full table
+// scans per dashboard load, since a LIKE pattern with a leading wildcard can
+// never use an index. It is now a single pass: json_each expands the JSON
+// array into rows, the ts index bounds the window, and GROUP BY does the
+// counting in SQLite instead of N round trips.
 func (s *SQLiteStore) RuleMatchCounts(ctx context.Context, since time.Time, ruleNames []string) ([]RuleMatch, error) {
-	sinceMs := since.UnixMilli()
-	out := make([]RuleMatch, 0, len(ruleNames))
-	for _, name := range ruleNames {
-		// matched_rules is a JSON array of strings; match the quoted name.
-		needle := `%"` + strings.ReplaceAll(name, `"`, ``) + `"%`
-		var n int64
-		if err := s.db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM logs WHERE ts >= ? AND matched_rules LIKE ?`,
-			sinceMs, needle).Scan(&n); err != nil {
-			return nil, err
-		}
-		out = append(out, RuleMatch{Rule: name, Count: n})
-	}
-	return out, nil
-}
-
-func (s *SQLiteStore) Recent(ctx context.Context, since time.Time, limit int) ([]Record, error) {
-	if limit <= 0 || limit > 50_000 {
-		limit = 20_000
-	}
+	counts := make(map[string]int64, len(ruleNames))
+	// matched_rules is '' for pre-migration rows and 'null' for a record that
+	// matched nothing. json_each errors on the first and yields a NULL-valued
+	// row for the second, so normalize to an empty array and drop NULLs.
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, ts, service, method, path, query, route, status, duration_ms, remote, source,
-		        req_headers, resp_headers, req_body, resp_body, req_trunc, resp_trunc,
-		        req_bytes, resp_bytes, labels, matched_rules, meters, stream
-		 FROM logs WHERE ts >= ? ORDER BY id DESC LIMIT ?`, since.UnixMilli(), limit)
+		`SELECT j.value, COUNT(*) FROM logs,
+		        json_each(CASE WHEN json_valid(logs.matched_rules)
+		                       THEN logs.matched_rules ELSE '[]' END) j
+		 WHERE logs.ts >= ? AND j.value IS NOT NULL
+		 GROUP BY j.value`, since.UnixMilli())
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Record
+	for rows.Next() {
+		var name string
+		var n int64
+		if err := rows.Scan(&name, &n); err != nil {
+			return nil, err
+		}
+		counts[name] = n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Report every requested rule, including those that never fired — a zero
+	// is the interesting answer for a rule that should be matching.
+	out := make([]RuleMatch, 0, len(ruleNames))
+	for _, name := range ruleNames {
+		out = append(out, RuleMatch{Rule: name, Count: counts[name]})
+	}
+	return out, nil
+}
+
+// RecentFunc streams records one at a time so an analysis pass costs one
+// record of memory rather than the whole window. Recent() materialises the
+// same rows; prefer this wherever the caller only folds over them.
+func (s *SQLiteStore) RecentFunc(ctx context.Context, since time.Time, limit int, fn func(*Record) error) error {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, ts, service, method, path, query, route, status, duration_ms, remote, source,
+		        req_headers, resp_headers, req_body, resp_body, req_trunc, resp_trunc,
+		        req_bytes, resp_bytes, labels, matched_rules, meters, stream
+		 FROM logs WHERE ts >= ? ORDER BY id DESC LIMIT ?`,
+		since.UnixMilli(), AnalysisLimit(limit))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
 	for rows.Next() {
 		rec, err := scanRecord(rows)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		out = append(out, *rec)
+		if err := fn(rec); err != nil {
+			return err
+		}
 	}
-	return out, rows.Err()
+	return rows.Err()
+}
+
+func (s *SQLiteStore) Recent(ctx context.Context, since time.Time, limit int) ([]Record, error) {
+	var out []Record
+	err := s.RecentFunc(ctx, since, limit, func(r *Record) error {
+		out = append(out, *r)
+		return nil
+	})
+	return out, err
 }
 
 // UsageByLabel aggregates in Go rather than SQL: labels/meters are stored

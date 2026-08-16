@@ -69,15 +69,30 @@ func (r *Report) HasAtLeast(sev string) bool {
 
 type key struct{ kind, method, route, location, field string }
 
-// Records scans stored telemetry for values that look sensitive despite
-// having passed governance.
-func Records(records []store.Record, since time.Time) *Report {
-	agg := map[key]*Finding{}
+// Scanner accumulates findings one record at a time.
+//
+// The streaming shape exists because the callers used to load every record in
+// the window — full bodies included — into a slice before scanning any of
+// them. At the default 64 KiB capture limit and a 20,000-row window that is
+// gigabytes resident before the first detector runs, on an endpoint that is
+// reachable without authentication. Folding incrementally costs one record.
+type Scanner struct {
+	agg     map[key]*Finding
+	scanned int
+	since   time.Time
+}
 
-	record := func(rec *store.Record, location, field string, matches []Match) {
+func NewScanner(since time.Time) *Scanner {
+	return &Scanner{agg: map[key]*Finding{}, since: since}
+}
+
+// Add folds one record into the report.
+func (s *Scanner) Add(rec *store.Record) {
+	s.scanned++
+	record := func(location, field string, matches []Match) {
 		for _, m := range matches {
 			k := key{m.Kind, rec.Method, rec.Route, location, field}
-			f := agg[k]
+			f := s.agg[k]
 			if f == nil {
 				f = &Finding{
 					Kind: m.Kind, Severity: m.Severity, Why: m.Why,
@@ -86,7 +101,7 @@ func Records(records []store.Record, since time.Time) *Report {
 					Sample: m.Masked, FirstAt: rec.Time,
 					Suggest: suggest(location, field),
 				}
-				agg[k] = f
+				s.agg[k] = f
 			}
 			f.Count++
 			if rec.Time.Before(f.FirstAt) {
@@ -98,33 +113,33 @@ func Records(records []store.Record, since time.Time) *Report {
 		}
 	}
 
-	for i := range records {
-		rec := &records[i]
-		scanBody(rec.RequestBody, func(field, val string) {
-			record(rec, "request_body", field, Find(val))
-		})
-		scanBody(rec.ResponseBody, func(field, val string) {
-			record(rec, "response_body", field, Find(val))
-		})
-		if rec.Query != "" {
-			if vals, err := url.ParseQuery(rec.Query); err == nil {
-				for name, list := range vals {
-					for _, v := range list {
-						record(rec, "query", name, Find(v))
-					}
+	scanBody(rec.RequestBody, func(field, val string) {
+		record("request_body", field, Find(val))
+	})
+	scanBody(rec.ResponseBody, func(field, val string) {
+		record("response_body", field, Find(val))
+	})
+	if rec.Query != "" {
+		if vals, err := url.ParseQuery(rec.Query); err == nil {
+			for name, list := range vals {
+				for _, v := range list {
+					record("query", name, Find(v))
 				}
 			}
 		}
-		for name, val := range rec.RequestHeaders {
-			record(rec, "request_headers", name, Find(val))
-		}
-		for name, val := range rec.ResponseHeaders {
-			record(rec, "response_headers", name, Find(val))
-		}
 	}
+	for name, val := range rec.RequestHeaders {
+		record("request_headers", name, Find(val))
+	}
+	for name, val := range rec.ResponseHeaders {
+		record("response_headers", name, Find(val))
+	}
+}
 
-	out := make([]Finding, 0, len(agg))
-	for _, f := range agg {
+// Report finalises the accumulated findings, most severe first.
+func (s *Scanner) Report() *Report {
+	out := make([]Finding, 0, len(s.agg))
+	for _, f := range s.agg {
 		out = append(out, *f)
 	}
 	rank := map[string]int{SevCritical: 0, SevHigh: 1, SevMedium: 2}
@@ -137,7 +152,17 @@ func Records(records []store.Record, since time.Time) *Report {
 		}
 		return out[i].Field < out[j].Field
 	})
-	return &Report{Scanned: len(records), Since: since, Findings: out}
+	return &Report{Scanned: s.scanned, Since: s.since, Findings: out}
+}
+
+// Records scans a slice of stored telemetry. Equivalent to feeding each record
+// to a Scanner; kept for callers that already hold the records.
+func Records(records []store.Record, since time.Time) *Report {
+	sc := NewScanner(since)
+	for i := range records {
+		sc.Add(&records[i])
+	}
+	return sc.Report()
 }
 
 // scanBody walks a stored JSON body, calling visit with each leaf's dotted

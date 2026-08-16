@@ -19,51 +19,77 @@ import (
 // arrive redacted ("[REDACTED]") still contribute their field name and a
 // string type, so governance never hides API *structure*, only data.
 func Infer(serviceName string, records []store.Record) *Spec {
-	type opAgg struct {
-		count        int64
-		reqSchema    *Schema
-		respByStatus map[string]*Schema
-		// queryParams records which query keys were observed and how often,
-		// so a parameter present on every request can be marked required.
-		queryParams map[string]int64
-	}
-	ops := map[string]map[string]*opAgg{} // path -> METHOD -> agg
-
+	inf := NewInferrer(serviceName)
 	for i := range records {
-		rec := &records[i]
-		path := openAPIPath(rec.Path)
-		method := strings.ToLower(rec.Method)
-		if ops[path] == nil {
-			ops[path] = map[string]*opAgg{}
-		}
-		agg := ops[path][method]
-		if agg == nil {
-			agg = &opAgg{respByStatus: map[string]*Schema{}, queryParams: map[string]int64{}}
-			ops[path][method] = agg
-		}
-		agg.count++
+		inf.Add(&records[i])
+	}
+	return inf.Spec()
+}
 
-		if rec.Query != "" {
-			if vals, err := url.ParseQuery(rec.Query); err == nil {
-				for k := range vals {
-					agg.queryParams[k]++
-				}
-			}
-		}
+type opAgg struct {
+	count        int64
+	reqSchema    *Schema
+	respByStatus map[string]*Schema
+	// queryParams records which query keys were observed and how often,
+	// so a parameter present on every request can be marked required.
+	queryParams map[string]int64
+}
 
-		if sc := schemaOfJSON(rec.RequestBody); sc != nil {
-			agg.reqSchema = mergeSchemas(agg.reqSchema, sc)
-		}
-		if sc := schemaOfJSON(rec.ResponseBody); sc != nil {
-			status := strconv.Itoa(rec.Status)
-			agg.respByStatus[status] = mergeSchemas(agg.respByStatus[status], sc)
-		} else if rec.Status != 0 {
-			status := strconv.Itoa(rec.Status)
-			if _, ok := agg.respByStatus[status]; !ok {
-				agg.respByStatus[status] = nil // status observed, body unknown/restricted
+// Inferrer accumulates an OpenAPI spec one record at a time.
+//
+// Streaming rather than slice-based because the callers used to materialise
+// every record in the window — full bodies included — before inferring
+// anything. Folding incrementally holds one record at a time instead.
+type Inferrer struct {
+	serviceName string
+	ops         map[string]map[string]*opAgg // path -> METHOD -> agg
+}
+
+func NewInferrer(serviceName string) *Inferrer {
+	return &Inferrer{serviceName: serviceName, ops: map[string]map[string]*opAgg{}}
+}
+
+// Add folds one record into the inferred spec.
+func (in *Inferrer) Add(rec *store.Record) {
+	ops := in.ops
+	path := openAPIPath(rec.Path)
+	method := strings.ToLower(rec.Method)
+	if ops[path] == nil {
+		ops[path] = map[string]*opAgg{}
+	}
+	agg := ops[path][method]
+	if agg == nil {
+		agg = &opAgg{respByStatus: map[string]*Schema{}, queryParams: map[string]int64{}}
+		ops[path][method] = agg
+	}
+	agg.count++
+
+	if rec.Query != "" {
+		if vals, err := url.ParseQuery(rec.Query); err == nil {
+			for k := range vals {
+				agg.queryParams[k]++
 			}
 		}
 	}
+
+	if sc := schemaOfJSON(rec.RequestBody); sc != nil {
+		agg.reqSchema = mergeSchemas(agg.reqSchema, sc)
+	}
+	if sc := schemaOfJSON(rec.ResponseBody); sc != nil {
+		status := strconv.Itoa(rec.Status)
+		agg.respByStatus[status] = mergeSchemas(agg.respByStatus[status], sc)
+	} else if rec.Status != 0 {
+		status := strconv.Itoa(rec.Status)
+		if _, ok := agg.respByStatus[status]; !ok {
+			agg.respByStatus[status] = nil // status observed, body unknown/restricted
+		}
+	}
+}
+
+// Spec finalises the accumulated observations into an OpenAPI document.
+func (in *Inferrer) Spec() *Spec {
+	ops := in.ops
+	serviceName := in.serviceName
 
 	title := serviceName
 	if title == "" {

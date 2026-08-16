@@ -285,7 +285,8 @@ telemetry:
     dsn: optictrace.db
     queue_size: 4096                 # async queue; overflow drops, never blocks
     retention_max_rows: 100000       # oldest rows pruned
-    retention_max_age: 720h          # ...and anything older than 30 days
+    retention_max_age: 720h
+    analysis_max_rows: 20000         # cap for scan/spec/suggest/review reads          # ...and anything older than 30 days
   exporters:                         # fan out governed records
     - { name: audit, type: file,    path: ./export/audit.jsonl }
     - { name: siem,  type: webhook, url: "https://siem.internal/ingest",

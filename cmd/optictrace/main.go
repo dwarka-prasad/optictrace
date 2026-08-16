@@ -433,10 +433,18 @@ func loadTraffic(configPath string, window time.Duration) (*config.Config, []sto
 		os.Exit(1)
 	}
 	defer st.Close()
-	records, err := st.Recent(context.Background(), time.Now().Add(-window), 0)
+	limit := cfg.Telemetry.Store.AnalysisMaxRows
+	records, err := st.Recent(context.Background(), time.Now().Add(-window), limit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "✗ query store: %v\n", err)
 		os.Exit(1)
+	}
+	// Silent truncation would read as "analysed everything" when it did not.
+	if len(records) == store.AnalysisLimit(limit) {
+		fmt.Fprintf(os.Stderr,
+			"! reached the %d-record analysis limit — older traffic in this window was not read.\n"+
+				"  Narrow -window, or raise telemetry.store.analysis_max_rows.\n",
+			len(records))
 	}
 	return cfg, records
 }
@@ -718,18 +726,19 @@ func run(configPath, uiDir string) {
 	adminSrv := &http.Server{
 		Addr: cfg.Telemetry.AdminListen,
 		Handler: (&admin.Server{
-			Logger:      logger,
-			Collector:   collector,
-			Reader:      reader,
-			Writer:      writer,
-			Dispatcher:  dispatcher,
-			ConfigPath:  configPath,
-			Reload:      reload,
-			UIDir:       uiDir,
-			Version:     version,
-			AuthToken:   cfg.Telemetry.Auth.Resolve(),
-			HealthOpen:  cfg.Telemetry.Auth.HealthOpen(),
-			CORSOrigins: cfg.Telemetry.CORSOrigins,
+			Logger:          logger,
+			Collector:       collector,
+			Reader:          reader,
+			Writer:          writer,
+			Dispatcher:      dispatcher,
+			ConfigPath:      configPath,
+			Reload:          reload,
+			UIDir:           uiDir,
+			Version:         version,
+			AuthToken:       cfg.Telemetry.Auth.Resolve(),
+			HealthOpen:      cfg.Telemetry.Auth.HealthOpen(),
+			CORSOrigins:     cfg.Telemetry.CORSOrigins,
+			AnalysisMaxRows: cfg.Telemetry.Store.AnalysisMaxRows,
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
