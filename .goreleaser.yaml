@@ -64,19 +64,11 @@ signs:
 sboms:
   - artifacts: archive
 
-homebrew_casks:
-  - name: optictrace
-    # Disabled until a `dwarka-prasad/homebrew-tap` repository exists. The
-    # cask is still generated into dist/ each release, so flipping this to
-    # false once the tap is created is the only change needed to publish.
-    skip_upload: true
-    repository:
-      owner: dwarka-prasad
-      name: homebrew-tap
-      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
-    homepage: "https://github.com/dwarka-prasad/optictrace"
-    description: "Declarative API telemetry & governance gateway"
-    license: "Apache-2.0"
+# Homebrew is published as a FORMULA, not a cask, by scripts/update-tap.sh:
+# casks are macOS-only, while OpticTrace also ships Linux binaries, and casks
+# of unsigned binaries trip macOS Gatekeeper quarantine. The script derives
+# its hashes from the release's own checksums.txt, so the formula can never
+# disagree with the artifacts users download.
 
 changelog:
   sort: asc

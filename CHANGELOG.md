@@ -12,6 +12,7 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 ### Added
 
+- **Homebrew tap** — `brew install dwarka-prasad/tap/optictrace`, covering macOS and Linux on Intel and ARM. Published as a *formula* rather than a cask: casks are macOS-only, and a cask of an unsigned binary trips Gatekeeper quarantine. `scripts/update-tap.sh` regenerates it from each release's published `checksums.txt`, so the formula's hashes cannot drift from the artifacts users download.
 - A **product page** (`docs/`, served by GitHub Pages) and a demo GIF in the README, both built from real output and live screenshots of a running stack rather than mockups.
 - **`optictrace review` and a GitHub Action** — comments on every pull request with what the change does to API governance. Its core is a *policy diff*: the same captured traffic is evaluated under the base branch's rules and the PR's, so a change that stops redacting a field is reported with the number of real requests it affects. Also reports a coverage score, pre-existing leaks, and (with a spec) changes that break observed clients.
 - By default a PR fails only for regressions it introduced; pre-existing findings are context, not a blocker. `fail-on: critical|high` escalates once the backlog is clear.

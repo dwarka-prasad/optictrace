@@ -49,6 +49,19 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN || secrets.GITHUB_TOKEN }}
 
+      - name: Update the Homebrew tap
+        # Runs after goreleaser so the release assets (and their checksums)
+        # already exist to hash. Needs a token that can push to the tap repo;
+        # without one the step is skipped rather than failing the release.
+        if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+          git config --global user.name "optictrace-release"
+          git config --global user.email "noreply@github.com"
+          ./scripts/update-tap.sh "${{ github.ref_name }}"
+
       # Images are built from the repo's own multi-stage Dockerfile rather
       # than by goreleaser, so the published image includes the compiled
       # dashboard and uses the exact build the `docker` CI job already

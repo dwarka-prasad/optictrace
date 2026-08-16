@@ -223,6 +223,21 @@ docker compose up --build
 | `http://localhost:9095` | dashboard · `/metrics` · query APIs |
 | `http://localhost:9090` | Prometheus, pre-configured to scrape OpticTrace |
 
+### Install
+
+```bash
+brew install dwarka-prasad/tap/optictrace     # macOS and Linux
+go install github.com/dwarka-prasad/optictrace/cmd/optictrace@latest
+```
+
+Or grab a signed binary from [releases](https://github.com/dwarka-prasad/optictrace/releases).
+The Homebrew formula ships an annotated `optic.yaml` and its rule tests, so
+`optictrace validate` works the moment it's installed.
+
+<sub>On Linux, Homebrew pulls in its own `glibc`/`gcc` for any formula — OpticTrace
+itself is a static, CGO-free binary and needs neither, so the tarball or
+`go install` is lighter if you'd rather skip that.</sub>
+
 ### From source
 
 ```bash
