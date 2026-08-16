@@ -106,8 +106,13 @@ func (p *Policy) KeepBody(drew bool, status int, elapsed time.Duration) bool {
 }
 
 type compiledRule struct {
-	name        string
-	rawPattern  string
+	name       string
+	rawPattern string
+	// gqlOp is the graphql_operation glob, empty when the rule does not
+	// constrain the operation. A rule that does can only be evaluated once
+	// the request body has been read, so Evaluate skips it and EvaluateOp
+	// applies it.
+	gqlOp       string
 	sample      *float64
 	keepErrors  *bool
 	keepSlower  time.Duration
@@ -130,6 +135,13 @@ type Engine struct {
 // New compiles a validated Config. Config must have passed Validate().
 func New(cfg *config.Config) *Engine {
 	e := &Engine{defaults: cfg.Defaults}
+	// Parse always fills this in, but the embedded API lets a caller build a
+	// Config by hand — and a zero limit means every capture buffer holds
+	// nothing, which looks like governance working rather than like a
+	// misconfiguration.
+	if e.defaults.CaptureLimitBytes <= 0 {
+		e.defaults.CaptureLimitBytes = config.DefaultCaptureLimitBytes
+	}
 	for _, r := range cfg.Rules {
 		cr := compiledRule{
 			name:       r.Name,
@@ -138,6 +150,7 @@ func New(cfg *config.Config) *Engine {
 			keepErrors: r.KeepErrors,
 			keepSlower: r.SlowerThan(),
 			pathSegs:   splitPath(r.Match.Path),
+			gqlOp:      r.Match.GraphQLOperation,
 			restrict:   r.Restrict,
 		}
 		if len(r.Match.Methods) > 0 {
@@ -179,7 +192,36 @@ func New(cfg *config.Config) *Engine {
 // Evaluate resolves the effective Policy for a method + URL path.
 // Rules merge in declaration order: restrictions only ever narrow capture,
 // redactions and labels accumulate.
+// Evaluate resolves policy from the request line alone — everything the
+// interceptor knows before the body is read. Rules constrained by
+// graphql_operation are skipped here and applied by EvaluateOp.
 func (e *Engine) Evaluate(method, urlPath string) Policy {
+	return e.evaluate(method, urlPath, "")
+}
+
+// EvaluateOp resolves policy including rules that target a GraphQL operation.
+// Called after the request body has been parsed.
+//
+// Late binding is sound because OpticTrace governs telemetry, never live
+// traffic: redaction, labels and the route pattern are all applied when the
+// record is built, so learning the operation mid-request is not too late for
+// any of them.
+func (e *Engine) EvaluateOp(method, urlPath, operation string) Policy {
+	return e.evaluate(method, urlPath, operation)
+}
+
+// HasGraphQLRules reports whether any rule constrains a GraphQL operation, so
+// the interceptor can skip the extra work entirely when none do.
+func (e *Engine) HasGraphQLRules() bool {
+	for i := range e.rules {
+		if e.rules[i].gqlOp != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Engine) evaluate(method, urlPath, operation string) Policy {
 	p := Policy{
 		CaptureRequestBody:  config.Bool(e.defaults.Capture.RequestBody),
 		CaptureResponseBody: config.Bool(e.defaults.Capture.ResponseBody),
@@ -199,6 +241,13 @@ func (e *Engine) Evaluate(method, urlPath string) Policy {
 		}
 		if !matchSegments(r.pathSegs, reqSegs) {
 			continue
+		}
+		if r.gqlOp != "" {
+			// Unknown operation: the rule cannot be decided yet, so it does
+			// not apply. Evaluate passes "" for exactly this case.
+			if operation == "" || !matchSegments(splitPath(r.gqlOp), splitPath(operation)) {
+				continue
+			}
 		}
 
 		p.MatchedRules = append(p.MatchedRules, r.name)
@@ -299,6 +348,14 @@ func NormalizeRoute(urlPath string) string {
 }
 
 // splitPath normalizes "/api/v1/x/" into ["api", "v1", "x"].
+// SplitPath and MatchSegments expose the glob matcher so other packages —
+// notably the interceptor's GraphQL path check — use the same semantics as
+// rule matching rather than a second, subtly different implementation.
+func SplitPath(s string) []string { return splitPath(s) }
+
+// MatchSegments reports whether a split glob matches split path segments.
+func MatchSegments(pattern, segs []string) bool { return matchSegments(pattern, segs) }
+
 func splitPath(s string) []string {
 	s = strings.Trim(s, "/")
 	if s == "" {

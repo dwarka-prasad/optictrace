@@ -25,6 +25,7 @@ import (
 	"github.com/dwarka-prasad/optictrace/internal/export"
 	"github.com/dwarka-prasad/optictrace/internal/metrics"
 	"github.com/dwarka-prasad/optictrace/internal/proxy"
+	"github.com/dwarka-prasad/optictrace/internal/scan"
 	"github.com/dwarka-prasad/optictrace/internal/store"
 )
 
@@ -152,6 +153,17 @@ func (a *Agent) Reload() error {
 	return nil
 }
 
+// scanDetectors compiles the org-specific scan detectors, falling back to the
+// built-ins if the config changed underneath us.
+func scanDetectors(cfg *config.Config, logger *slog.Logger) []scan.Detector {
+	dets, err := cfg.Detectors()
+	if err != nil {
+		logger.Error("ignoring scan.detectors", "error", err)
+		return nil
+	}
+	return dets
+}
+
 // AdminHandler exposes /metrics, the dashboard, and query APIs for mounting
 // on a listener you control.
 func (a *Agent) AdminHandler(uiDir string) http.Handler {
@@ -168,6 +180,7 @@ func (a *Agent) AdminHandler(uiDir string) http.Handler {
 		HealthOpen:      a.cfg.Telemetry.Auth.HealthOpen(),
 		CORSOrigins:     a.cfg.Telemetry.CORSOrigins,
 		AnalysisMaxRows: a.cfg.Telemetry.Store.AnalysisMaxRows,
+		Detectors:       scanDetectors(a.cfg, a.logger),
 	}).Handler()
 }
 

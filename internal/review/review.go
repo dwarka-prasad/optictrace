@@ -108,7 +108,17 @@ func Run(o Options) *Report {
 		rep.ComparedBase = true
 		rep.PolicyChanges = diffPolicies(o.Records, engine.New(o.Base), head)
 	}
-	rep.Leaks = scan.Records(o.Records, time.Time{}).Findings
+	// Org-specific detectors apply to the PR check too — otherwise a leak the
+	// team explicitly configured for would pass review and fail `scan`.
+	custom, err := o.Head.Detectors()
+	if err != nil {
+		custom = nil // Validate already proved these compile; never fail review over it
+	}
+	sc := scan.NewScannerWith(time.Time{}, custom)
+	for i := range o.Records {
+		sc.Add(&o.Records[i])
+	}
+	rep.Leaks = sc.Report().Findings
 	rep.Suggestions = suggest.Records(o.Records, head).Actionable()
 	if o.Spec != nil {
 		rep.SpecFindings = spec.Check(o.Spec, o.Records)

@@ -77,13 +77,26 @@ type key struct{ kind, method, route, location, field string }
 // gigabytes resident before the first detector runs, on an endpoint that is
 // reachable without authentication. Folding incrementally costs one record.
 type Scanner struct {
-	agg     map[key]*Finding
-	scanned int
-	since   time.Time
+	agg       map[key]*Finding
+	scanned   int
+	since     time.Time
+	detectors []Detector
 }
 
-func NewScanner(since time.Time) *Scanner {
-	return &Scanner{agg: map[key]*Finding{}, since: since}
+// NewScanner scans with the built-in detector set.
+func NewScanner(since time.Time) *Scanner { return NewScannerWith(since, nil) }
+
+// NewScannerWith appends org-specific detectors to the built-ins. Custom
+// detectors run last so a built-in's checksum-anchored match wins the
+// severity when both fire on the same value.
+func NewScannerWith(since time.Time, custom []Detector) *Scanner {
+	dets := Detectors
+	if len(custom) > 0 {
+		dets = make([]Detector, 0, len(Detectors)+len(custom))
+		dets = append(dets, Detectors...)
+		dets = append(dets, custom...)
+	}
+	return &Scanner{agg: map[key]*Finding{}, since: since, detectors: dets}
 }
 
 // Add folds one record into the report.
@@ -114,25 +127,25 @@ func (s *Scanner) Add(rec *store.Record) {
 	}
 
 	scanBody(rec.RequestBody, func(field, val string) {
-		record("request_body", field, Find(val))
+		record("request_body", field, FindWith(s.detectors, val))
 	})
 	scanBody(rec.ResponseBody, func(field, val string) {
-		record("response_body", field, Find(val))
+		record("response_body", field, FindWith(s.detectors, val))
 	})
 	if rec.Query != "" {
 		if vals, err := url.ParseQuery(rec.Query); err == nil {
 			for name, list := range vals {
 				for _, v := range list {
-					record("query", name, Find(v))
+					record("query", name, FindWith(s.detectors, v))
 				}
 			}
 		}
 	}
 	for name, val := range rec.RequestHeaders {
-		record("request_headers", name, Find(val))
+		record("request_headers", name, FindWith(s.detectors, val))
 	}
 	for name, val := range rec.ResponseHeaders {
-		record("response_headers", name, Find(val))
+		record("response_headers", name, FindWith(s.detectors, val))
 	}
 }
 

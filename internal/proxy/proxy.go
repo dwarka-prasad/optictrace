@@ -50,6 +50,10 @@ type Interceptor struct {
 	collector  *metrics.Collector // nil = metrics disabled
 	writer     *store.AsyncWriter // nil = storage disabled
 	dispatcher *export.Dispatcher // nil = no exporters configured
+
+	// gqlPaths are the path globs whose request bodies carry a GraphQL
+	// operation name. Empty means the GraphQL path is never taken.
+	gqlPaths [][]string
 }
 
 // Option configures optional telemetry sinks.
@@ -75,6 +79,9 @@ func NewInterceptor(cfg *config.Config, eng *engine.Engine, logger *slog.Logger,
 		logger:     logger,
 		name:       cfg.Service.Name,
 		consoleLog: config.Bool(cfg.Telemetry.ConsoleLog),
+	}
+	for _, g := range cfg.Service.GraphQLPaths {
+		ic.gqlPaths = append(ic.gqlPaths, engine.SplitPath(g))
 	}
 	ic.engine.Store(eng)
 	for _, o := range opts {
@@ -116,6 +123,18 @@ func (ic *Interceptor) Wrap(next http.Handler) http.Handler {
 		drew := policy.SampleRate >= 1.0 || rand.Float64() < policy.SampleRate
 		buffer := drew || policy.TailSampled()
 
+		// GraphQL puts every operation on one path, so the operation name is
+		// the only thing that distinguishes them — and it lives in the body.
+		// Buffer it here even when the sampling draw or a restriction would
+		// otherwise skip capture: the name is needed for the route label and
+		// for rules that target an operation. What gets STORED is still
+		// decided by policy below, so this changes what we can see, not what
+		// we keep.
+		gql := ic.isGraphQL(r.URL.Path)
+		if gql {
+			buffer = true
+		}
+
 		if ic.collector != nil {
 			ic.collector.InflightInc()
 			defer ic.collector.InflightDec()
@@ -123,7 +142,7 @@ func (ic *Interceptor) Wrap(next http.Handler) http.Handler {
 
 		// --- Request-side capture (tee, never consume) -------------------
 		var reqBuf *limitedBuffer
-		if buffer && policy.CaptureRequestBody && r.Body != nil {
+		if buffer && (policy.CaptureRequestBody || gql) && r.Body != nil {
 			reqBuf = &limitedBuffer{limit: policy.CaptureLimitBytes}
 			r.Body = &teeReadCloser{rc: r.Body, tee: reqBuf}
 		}
@@ -151,8 +170,17 @@ func (ic *Interceptor) Wrap(next http.Handler) http.Handler {
 			// actually happened rather than the 200 we initialised with.
 			rw.status = http.StatusSwitchingProtocols
 		}
+		// Re-resolve policy now that the operation is known. Sound because
+		// governance applies to telemetry, not to the traffic itself — the
+		// response has already gone to the client untouched either way.
+		operation := ""
+		if gql && reqBuf != nil {
+			if operation = graphQLOperation(reqBuf.Bytes()); operation != "" {
+				policy = ic.engine.Load().EvaluateOp(r.Method, r.URL.Path, operation)
+			}
+		}
 		keep := policy.KeepBody(drew, rw.status, elapsed)
-		ic.emit(r, rw, reqBuf, &policy, keep, elapsed)
+		ic.emit(r, rw, reqBuf, &policy, keep, elapsed, operation)
 	})
 }
 
@@ -197,10 +225,30 @@ func isUpgrade(r *http.Request) bool {
 
 // emit builds the canonical record and fans it out to the sinks. keep is the
 // final body-retention decision (uniform draw, possibly rescued by tail rules).
-func (ic *Interceptor) emit(r *http.Request, rw *recordingWriter, reqBuf *limitedBuffer, p *engine.Policy, keep bool, elapsed time.Duration) {
+// isGraphQL reports whether this path is configured as a GraphQL endpoint.
+func (ic *Interceptor) isGraphQL(urlPath string) bool {
+	if len(ic.gqlPaths) == 0 {
+		return false
+	}
+	segs := engine.SplitPath(urlPath)
+	for _, g := range ic.gqlPaths {
+		if engine.MatchSegments(g, segs) {
+			return true
+		}
+	}
+	return false
+}
+
+func (ic *Interceptor) emit(r *http.Request, rw *recordingWriter, reqBuf *limitedBuffer, p *engine.Policy, keep bool, elapsed time.Duration, operation string) {
 	route := p.RoutePattern
 	if route == "" {
 		route = engine.NormalizeRoute(r.URL.Path)
+	}
+	if operation != "" {
+		// One route per operation. Cardinality stays bounded because the name
+		// is validated as a plain identifier and capped in length, and the
+		// collector's existing label guard covers the rest.
+		route += ":" + operation
 	}
 
 	stream := isStream(rw, elapsed)

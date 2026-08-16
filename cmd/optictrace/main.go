@@ -344,12 +344,21 @@ func reviewChanges(a reviewArgs) {
 // scanTraffic is the safety net: it looks for values that LOOK sensitive in
 // records that already passed governance — the field you forgot to declare.
 func scanTraffic(configPath string, window time.Duration, failOn string) {
-	_, records := loadTraffic(configPath, window)
+	cfg, records := loadTraffic(configPath, window)
 	if len(records) == 0 {
 		fmt.Fprintln(os.Stderr, "✗ no traffic captured in this window — nothing to scan")
 		os.Exit(1)
 	}
-	report := scan.Records(records, time.Now().Add(-window))
+	custom, err := cfg.Detectors()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+		os.Exit(1)
+	}
+	sc := scan.NewScannerWith(time.Now().Add(-window), custom)
+	for i := range records {
+		sc.Add(&records[i])
+	}
+	report := sc.Report()
 	crit, high, med := report.Counts()
 
 	if len(report.Findings) == 0 {
@@ -578,6 +587,18 @@ func isFlag(s string) bool { return len(s) > 0 && s[0] == '-' }
 
 // openStore resolves the configured driver. Both implementations satisfy the
 // same LogStore contract, enforced by the conformance suite in internal/store.
+// scanDetectors compiles the org-specific scan detectors. Validate already
+// proved they compile, so a failure here means the file changed underneath us;
+// log it and carry on with the built-ins rather than refusing to serve.
+func scanDetectors(cfg *config.Config, logger *slog.Logger) []scan.Detector {
+	dets, err := cfg.Detectors()
+	if err != nil {
+		logger.Error("ignoring scan.detectors", "error", err)
+		return nil
+	}
+	return dets
+}
+
 func openStore(cfg *config.StoreCfg) (store.LogStore, error) {
 	switch cfg.Driver {
 	case "postgres":
@@ -739,6 +760,7 @@ func run(configPath, uiDir string) {
 			HealthOpen:      cfg.Telemetry.Auth.HealthOpen(),
 			CORSOrigins:     cfg.Telemetry.CORSOrigins,
 			AnalysisMaxRows: cfg.Telemetry.Store.AnalysisMaxRows,
+			Detectors:       scanDetectors(cfg, logger),
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}

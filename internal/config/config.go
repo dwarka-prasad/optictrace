@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/dwarka-prasad/optictrace/internal/scan"
 )
 
 // CaptureField enumerates the telemetry channels a rule may restrict.
@@ -39,7 +41,32 @@ type Config struct {
 	Service   Service   `yaml:"service"`
 	Defaults  Defaults  `yaml:"defaults"`
 	Telemetry Telemetry `yaml:"telemetry"`
+	Scan      ScanCfg   `yaml:"scan"`
 	Rules     []Rule    `yaml:"rules"`
+}
+
+// ScanCfg configures `optictrace scan`, the leak detector that looks for
+// sensitive values which slipped past governance.
+type ScanCfg struct {
+	// Detectors are org-specific patterns, added to the built-in set rather
+	// than replacing it. The built-ins cover credentials and regulated
+	// identifiers that look the same everywhere; these cover the ones that
+	// do not — internal employee IDs, customer account formats, national
+	// identifiers outside the US.
+	Detectors []DetectorCfg `yaml:"detectors"`
+}
+
+// DetectorCfg is one user-defined sensitive-value pattern.
+type DetectorCfg struct {
+	Kind     string `yaml:"kind"`     // finding label, e.g. "aadhaar"
+	Severity string `yaml:"severity"` // critical | high | medium
+	Why      string `yaml:"why"`      // what a reader should understand about the risk
+	Pattern  string `yaml:"pattern"`  // Go regexp
+	// Verify names a built-in checksum to confirm a regex hit — "luhn",
+	// "iban", "us_ssn", "verhoeff". Strongly preferred over a bare pattern:
+	// a detector that cries wolf gets switched off, which is worse than not
+	// having it. Empty means no checksum.
+	Verify string `yaml:"verify"`
 }
 
 // Telemetry configures the observability sinks: the admin/metrics endpoint,
@@ -214,6 +241,15 @@ type Service struct {
 	Name     string `yaml:"name"`
 	Listen   string `yaml:"listen"`
 	Upstream string `yaml:"upstream"`
+	// GraphQLPaths lists path globs served by GraphQL. On these routes the
+	// request body is parsed for an operation name, which then becomes part
+	// of the route label and can be matched by a rule.
+	//
+	// Opt-in because it means buffering the request body on those routes.
+	// The alternative — every operation collapsing into one `/graphql` route
+	// — makes latency percentiles, per-operation rules and spec inference
+	// meaningless for a GraphQL service.
+	GraphQLPaths []string `yaml:"graphql_paths"`
 	// HTTP2 serves cleartext HTTP/2 (h2c) on the proxy listener in addition
 	// to HTTP/1.1. Off by default: it changes protocol negotiation for every
 	// client, and HTTP/1.1 is what most upstreams speak.
@@ -269,6 +305,14 @@ type Rule struct {
 type Match struct {
 	Path    string   `yaml:"path"`
 	Methods []string `yaml:"methods"`
+	// GraphQLOperation matches the operation name inside a GraphQL request
+	// body, as a glob. Every GraphQL operation POSTs to the same path, so
+	// without this a rule cannot target one: you could not redact a field on
+	// createPaymentMethod without applying the same rule to every query.
+	//
+	// Requires service.graphql_paths to include the route, since extracting
+	// the name means reading the request body before the response.
+	GraphQLOperation string `yaml:"graphql_operation"`
 }
 
 // Redact lists what to mask in *captured* telemetry. The proxied traffic
@@ -283,6 +327,20 @@ type Redact struct {
 }
 
 const DefaultCaptureLimitBytes = 64 * 1024
+
+// Detectors compiles the configured detectors. Validate has already proved
+// they compile, so an error here means the config was mutated after loading.
+func (c *Config) Detectors() ([]scan.Detector, error) {
+	out := make([]scan.Detector, 0, len(c.Scan.Detectors))
+	for _, d := range c.Scan.Detectors {
+		det, err := scan.NewDetector(d.Kind, d.Severity, d.Why, d.Pattern, d.Verify)
+		if err != nil {
+			return nil, fmt.Errorf("scan.detectors[%s]: %w", d.Kind, err)
+		}
+		out = append(out, det)
+	}
+	return out, nil
+}
 
 // MaxAnalysisRows mirrors store.MaxAnalysisMaxRows. Duplicated rather than
 // imported to keep config free of a dependency on store.
@@ -531,6 +589,22 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("telemetry.exporters: duplicate name %q", e.Name)
 		}
 		seen[e.Name] = true
+	}
+	// Compiled here so a bad pattern fails `optictrace validate` — and the
+	// CI check that runs it — rather than at scan time in production.
+	seenKind := map[string]bool{}
+	for i, d := range c.Scan.Detectors {
+		if _, err := scan.NewDetector(d.Kind, d.Severity, d.Why, d.Pattern, d.Verify); err != nil {
+			name := d.Kind
+			if name == "" {
+				name = fmt.Sprintf("#%d", i)
+			}
+			return fmt.Errorf("scan.detectors[%s]: %w", name, err)
+		}
+		if seenKind[d.Kind] {
+			return fmt.Errorf("scan.detectors: duplicate kind %q", d.Kind)
+		}
+		seenKind[d.Kind] = true
 	}
 	for i := range c.Rules {
 		if err := c.Rules[i].validate(); err != nil {

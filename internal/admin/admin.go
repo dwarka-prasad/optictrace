@@ -57,6 +57,9 @@ type Server struct {
 	// AnalysisMaxRows bounds how many records /api/scan and /api/spec read.
 	// 0 uses store.DefaultAnalysisMaxRows.
 	AnalysisMaxRows int
+	// Detectors are org-specific scan patterns from optic.yaml, added to the
+	// built-in set.
+	Detectors []scan.Detector
 
 	startedAt time.Time
 }
@@ -464,7 +467,7 @@ func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 	since := time.Now().Add(-window)
 	// Streamed, not materialised: these are full records including bodies,
 	// and this endpoint is reachable without a token in the default posture.
-	sc := scan.NewScanner(since)
+	sc := scan.NewScannerWith(since, s.Detectors)
 	if err := s.Reader.RecentFunc(r.Context(), since, s.AnalysisMaxRows, func(rec *store.Record) error {
 		sc.Add(rec)
 		return nil

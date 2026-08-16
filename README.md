@@ -496,7 +496,7 @@ for a complete workflow. This repo dogfoods it in
 | WebSockets | ✅ | Upgrades pass through; the exchange is recorded as a `101`, and the connection itself is not inspected |
 | HTTP/2 (h2c) | ✅ | Opt-in via `service.http2: true` |
 | gRPC | ⬜ | Needs `service.http2`, and even then bodies are length-prefixed protobuf — without descriptors there is nothing to redact or meter. Use the SDK middleware |
-| GraphQL | ◐ | Bodies are JSON and fully governed; every operation shares one route, so per-operation rules and metrics need `graphql_operation` matching |
+| GraphQL | ✅ | Set `service.graphql_paths`; the operation name then becomes part of the route and is matchable with `match.graphql_operation` |
 
 ---
 

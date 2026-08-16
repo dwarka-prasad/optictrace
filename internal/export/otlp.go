@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -131,14 +132,29 @@ func (e *otlpExporter) span(rec *store.Record) map[string]any {
 		attrs = append(attrs, attrFloat("optictrace.meter."+k, v))
 	}
 
+	// Join the caller's trace when it sent one, so this span lands inside the
+	// application's own trace instead of as an orphan root. Without this every
+	// exported span is a separate single-span trace, and you cannot click from
+	// a slow OpticTrace span into the request it describes — which is most of
+	// the reason to export to OTLP at all.
+	traceID, parentID, sampled := traceContext(rec.RequestHeaders)
 	span := map[string]any{
-		"traceId":           randomHex(16),
+		"traceId":           traceID,
 		"spanId":            randomHex(8),
 		"name":              rec.Method + " " + rec.Route,
 		"kind":              2, // SPAN_KIND_SERVER
 		"startTimeUnixNano": fmt.Sprint(start),
 		"endTimeUnixNano":   fmt.Sprint(end),
 		"attributes":        attrs,
+	}
+	if parentID != "" {
+		span["parentSpanId"] = parentID
+	}
+	if sampled {
+		span["flags"] = 1 // W3C sampled bit, propagated from the caller
+	}
+	if ts := rec.RequestHeaders["tracestate"]; ts != "" {
+		span["traceState"] = ts
 	}
 	// 5xx marks the span as errored so it surfaces in tracing UIs.
 	if rec.Status >= 500 {
@@ -161,9 +177,63 @@ func attrFloat(k string, v float64) map[string]any {
 	return map[string]any{"key": k, "value": map[string]any{"doubleValue": v}}
 }
 
-// randomHex produces trace/span IDs. OpticTrace observes traffic rather than
-// participating in a trace context, so IDs are generated per record; a future
-// version could adopt an inbound traceparent header instead.
+// traceContext extracts W3C Trace Context from the captured request headers,
+// returning the trace ID to use, the parent span ID (empty if there is none),
+// and whether the caller marked the trace sampled.
+//
+// A malformed or absent header must never cost us the span, so anything
+// unparseable falls back to a fresh root trace — the previous behaviour for
+// every record.
+//
+//	traceparent: 00-<32 hex trace id>-<16 hex span id>-<2 hex flags>
+func traceContext(headers map[string]string) (traceID, parentID string, sampled bool) {
+	raw := headerLookup(headers, "traceparent")
+	parts := strings.Split(raw, "-")
+	if len(parts) != 4 {
+		return randomHex(16), "", false
+	}
+	version, tid, pid, flags := parts[0], parts[1], parts[2], parts[3]
+	// Version ff is forbidden by the spec; anything else may carry extra
+	// fields we ignore, but 00 is the only layout defined today.
+	if version != "00" ||
+		!isHex(tid, 32) || !isHex(pid, 16) || !isHex(flags, 2) ||
+		tid == strings.Repeat("0", 32) || pid == strings.Repeat("0", 16) {
+		return randomHex(16), "", false
+	}
+	f, err := strconv.ParseUint(flags, 16, 8)
+	return tid, pid, err == nil && f&0x01 != 0
+}
+
+// headerLookup finds a header case-insensitively. Captured headers preserve
+// whatever casing the client sent, and HTTP header names are case-insensitive.
+func headerLookup(headers map[string]string, name string) string {
+	if v, ok := headers[name]; ok {
+		return v
+	}
+	for k, v := range headers {
+		if strings.EqualFold(k, name) {
+			return v
+		}
+	}
+	return ""
+}
+
+// isHex reports whether s is exactly n lowercase-or-uppercase hex digits.
+func isHex(s string, n int) bool {
+	if len(s) != n {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// randomHex produces trace/span IDs for records that arrived without a usable
+// inbound trace context.
 func randomHex(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {

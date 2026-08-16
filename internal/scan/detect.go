@@ -115,13 +115,17 @@ type Match struct {
 
 // Find runs every detector over a string. A value already replaced by the
 // redaction placeholder is skipped — that one worked as intended.
-func Find(s string) []Match {
+func Find(s string) []Match { return FindWith(Detectors, s) }
+
+// FindWith runs a specific detector set, so a Scanner configured with
+// org-specific detectors uses them alongside the built-ins.
+func FindWith(dets []Detector, s string) []Match {
 	if s == "" || strings.Contains(s, "[REDACTED]") && len(s) < 24 {
 		return nil
 	}
 	var out []Match
-	for i := range Detectors {
-		d := &Detectors[i]
+	for i := range dets {
+		d := &dets[i]
 		for _, hit := range d.re.FindAllString(s, 4) {
 			if d.verify != nil && !d.verify(hit) {
 				continue
