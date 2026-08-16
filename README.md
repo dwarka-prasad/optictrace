@@ -867,6 +867,50 @@ in-memory store in **its own module**, deliberately outside the
 reach `internal/`. It passes the full suite using only `ext`. CI builds it on
 every PR, so a hole in the extension surface fails the build.
 
+### Authentication, authorization and audit
+
+The admin surface has three more hooks: `ext.RegisterAuthenticator`,
+`ext.RegisterAuthorizer` and `ext.RegisterAuditor`, plus
+`ext.RegisterAdminRoutes` for a login callback.
+
+Policy is written against **capabilities**, never URLs. Every route declares
+what it exposes, and the core owns that mapping — because only the core knows
+which handlers return captured payloads:
+
+| Capability | Routes | What it grants |
+|---|---|---|
+| `public` | `/healthz`, login callbacks | reachable without credentials |
+| `metrics` | `/metrics` | Prometheus exposition |
+| `read:stats` | `/api/stats`, `/api/routes`, `/api/services`, `/api/usage`, … | aggregates only, no payloads |
+| `read:payload` | `/api/logs`, `/api/logs/{id}` | **captured request/response bodies** |
+| `export` | `/api/export` | **bulk egress of the whole store** |
+| `analyse` | `/api/scan`, `/api/spec` | reads payloads, returns derived output |
+| `read:config` | `/api/config` | the governance policy |
+| `ingest` | `/api/ingest` | SDK writes |
+| `admin` | `/api/reload` | changes agent state |
+| `ui` | `/` | dashboard assets |
+
+`read:payload` and `export` are separate on purpose: "can inspect one request
+while debugging" and "can download everything" are different grants, and
+conflating them is how access reviews go badly.
+
+Three properties the core guarantees, each with a test:
+
+- **Fail closed.** A panicking authenticator yields 401; a panicking authorizer
+  yields 403. An extension bug cannot open the API.
+- **Composition narrows.** Every registered authorizer must allow, so adding
+  one can never widen access.
+- **Denials don't leak.** The reason goes to the audit trail and the log, never
+  to the caller.
+
+An audit event carries what was *reached*, not just which URL was called —
+record count, ids, the filter used, the tenant — because "alice listed logs"
+answers no question an auditor would ask.
+
+[`examples/adminauth`](examples/adminauth) is a complete worked example: SSO
+with a redirect-and-callback flow, RBAC over the capabilities above, and a
+JSONL audit log — again in its own module, again unable to reach `internal/`.
+
 ### What extensions inherit
 
 Records handed to a `Store` or an `Exporter` are already governed — restricted

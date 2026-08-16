@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dwarka-prasad/optictrace/ext"
 	"github.com/dwarka-prasad/optictrace/internal/config"
 	"github.com/dwarka-prasad/optictrace/internal/export"
 	"github.com/dwarka-prasad/optictrace/internal/metrics"
@@ -61,70 +62,91 @@ type Server struct {
 	// built-in set.
 	Detectors []scan.Detector
 
+	// access holds the resolved authn/authz/audit chain, built by Handler.
+	access *accessControl
+
 	startedAt time.Time
 }
 
 func (s *Server) Handler() http.Handler {
 	s.startedAt = time.Now()
+	s.access = &accessControl{
+		authns:    ext.Authenticators(),
+		authzs:    ext.Authorizers(),
+		auds:      ext.Auditors(),
+		tokenAuth: s.AuthToken != "",
+	}
 	mux := http.NewServeMux()
 
-	if s.Collector != nil {
-		mux.Handle("GET /metrics", s.Collector.Handler())
+	// Every route declares what it exposes. An extension writes policy against
+	// these capabilities rather than against URLs, so it never has to track
+	// OpticTrace's routing — and a route cannot be added without classifying
+	// it, because there is no unclassified path through this function.
+	seen := map[string]bool{}
+	route := func(pattern string, capability ext.Capability, h http.Handler) {
+		seen[pattern] = true
+		mux.Handle(pattern, s.guard(capability, h))
 	}
-	mux.HandleFunc("GET /healthz", s.health)
-	mux.HandleFunc("GET /api/logs", s.listLogs)
-	mux.HandleFunc("GET /api/logs/{id}", s.getLog)
-	mux.HandleFunc("GET /api/stats", s.stats)
-	mux.HandleFunc("GET /api/routes", s.routes)
-	mux.HandleFunc("GET /api/rules/stats", s.ruleStats)
-	mux.HandleFunc("GET /api/system", s.system)
-	mux.HandleFunc("GET /api/spec", s.inferSpec)
-	mux.HandleFunc("GET /api/usage", s.usage)
-	mux.HandleFunc("GET /api/scan", s.scan)
-	mux.HandleFunc("GET /api/services", s.services)
-	mux.HandleFunc("GET /api/export", s.export)
-	mux.HandleFunc("GET /api/config", s.getConfig)
-	mux.HandleFunc("POST /api/config/validate", s.validateConfig)
-	mux.HandleFunc("POST /api/reload", s.reload)
-	mux.HandleFunc("POST /api/ingest", s.ingest)
-	mux.HandleFunc("/", s.ui)
+	routeFunc := func(pattern string, capability ext.Capability, h http.HandlerFunc) {
+		route(pattern, capability, h)
+	}
 
-	return withCORS(s.CORSOrigins, s.withAuth(mux))
+	if s.Collector != nil {
+		route("GET /metrics", ext.CapMetrics, s.Collector.Handler())
+	}
+	// /healthz is public only when configured to be; HealthOpen=false makes
+	// orchestrator probes authenticate like anything else.
+	healthCap := ext.CapReadStats
+	if s.HealthOpen {
+		healthCap = ext.CapPublic
+	}
+	routeFunc("GET /healthz", healthCap, s.health)
+
+	// Aggregates only — counts, latencies, totals. No captured payloads.
+	routeFunc("GET /api/stats", ext.CapReadStats, s.stats)
+	routeFunc("GET /api/routes", ext.CapReadStats, s.routes)
+	routeFunc("GET /api/rules/stats", ext.CapReadStats, s.ruleStats)
+	routeFunc("GET /api/services", ext.CapReadStats, s.services)
+	routeFunc("GET /api/system", ext.CapReadStats, s.system)
+	routeFunc("GET /api/usage", ext.CapReadStats, s.usage)
+
+	// These return captured request/response bodies to the caller — the
+	// capability that lets a person read customer data.
+	routeFunc("GET /api/logs", ext.CapReadPayload, s.listLogs)
+	routeFunc("GET /api/logs/{id}", ext.CapReadPayload, s.getLog)
+
+	// Bulk egress of the whole store, separated on purpose: "can inspect one
+	// request while debugging" and "can download everything" are different
+	// grants, and conflating them is how audits go badly.
+	routeFunc("GET /api/export", ext.CapExport, s.export)
+
+	// Read payloads server-side, return derived output only.
+	routeFunc("GET /api/scan", ext.CapAnalyse, s.scan)
+	routeFunc("GET /api/spec", ext.CapAnalyse, s.inferSpec)
+
+	routeFunc("GET /api/config", ext.CapReadConfig, s.getConfig)
+	routeFunc("POST /api/config/validate", ext.CapReadConfig, s.validateConfig)
+	routeFunc("POST /api/reload", ext.CapAdmin, s.reload)
+	routeFunc("POST /api/ingest", ext.CapIngest, s.ingest)
+	routeFunc("/", ext.CapUI, s.ui)
+
+	// Routes contributed by extensions — a login callback, a role API, an
+	// audit viewer. Registered last so a collision with a core route panics
+	// here rather than silently shadowing one.
+	for _, rt := range ext.AdminRoutes() {
+		if seen[rt.Pattern] {
+			panic("admin: extension route " + rt.Pattern + " collides with a core route")
+		}
+		route(rt.Pattern, rt.Capability, rt.Handler)
+	}
+
+	return withCORS(s.CORSOrigins, mux)
 }
 
-// withAuth gates the control plane behind a bearer token. Comparison is
-// constant-time so a timing side channel can't be used to guess the token
-// byte by byte.
-func (s *Server) withAuth(next http.Handler) http.Handler {
-	if s.AuthToken == "" {
-		return next // disabled: the port is expected to be firewalled
-	}
-	want := []byte(s.AuthToken)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.HealthOpen && r.URL.Path == "/healthz" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		// Preflight carries no credentials by design.
-		if r.Method == http.MethodOptions {
-			next.ServeHTTP(w, r)
-			return
-		}
-		got := ""
-		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-			got = strings.TrimPrefix(h, "Bearer ")
-		} else if t := r.URL.Query().Get("token"); t != "" {
-			// Query fallback exists so a browser can load the dashboard;
-			// it is inherently weaker (proxies log URLs), hence documented.
-			got = t
-		}
-		if subtle.ConstantTimeCompare([]byte(got), want) != 1 {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="optictrace"`)
-			httpError(w, http.StatusUnauthorized, "missing or invalid bearer token")
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+// constantTimeEqual compares credentials without leaking their length
+// difference through timing. Used by the built-in bearer check in access.go.
+func constantTimeEqual(got, want string) bool {
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 // withCORS allows listed browser origins — normally just a dashboard dev
@@ -198,6 +220,15 @@ func (s *Server) listLogs(w http.ResponseWriter, r *http.Request) {
 	if recs == nil {
 		recs = []store.Record{}
 	}
+	// The audit trail needs what was reached, not just that /api/logs was
+	// called: "listed logs" answers no question an auditor would ask.
+	ids := make([]int64, 0, len(recs))
+	for i := range recs {
+		ids = append(ids, recs[i].ID)
+	}
+	ext.NoteAccess(r.Context(), ext.Accessed{
+		Count: len(recs), RecordIDs: ids, Filter: r.URL.RawQuery,
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"total": total, "records": recs})
 }
 
@@ -216,6 +247,9 @@ func (s *Server) getLog(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusNotFound, "record not found")
 		return
 	}
+	ext.NoteAccess(r.Context(), ext.Accessed{
+		Count: 1, RecordIDs: []int64{id}, Consumer: rec.Labels["tenant"],
+	})
 	writeJSON(w, http.StatusOK, rec)
 }
 
@@ -476,6 +510,7 @@ func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	report := sc.Report()
+	ext.NoteAccess(r.Context(), ext.Accessed{Count: report.Scanned, Filter: r.URL.RawQuery})
 	crit, high, med := report.Counts()
 	if report.Findings == nil {
 		report.Findings = []scan.Finding{}
@@ -521,6 +556,7 @@ func (s *Server) inferSpec(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusNotFound, "no traffic captured in this window")
 		return
 	}
+	ext.NoteAccess(r.Context(), ext.Accessed{Count: seen, Filter: r.URL.RawQuery})
 	doc := inf.Spec()
 	if r.URL.Query().Get("format") == "json" {
 		writeJSON(w, http.StatusOK, doc)
@@ -578,6 +614,11 @@ func (s *Server) export(w http.ResponseWriter, r *http.Request) {
 		if err != nil || len(recs) == 0 {
 			break
 		}
+		// Accumulated per page: an export that streams 12,000 records must
+		// audit as 12,000, and NoteAccess adds rather than replaces. IDs are
+		// deliberately omitted — naming every row of a bulk export would bloat
+		// the audit record without telling anyone more than the count does.
+		ext.NoteAccess(r.Context(), ext.Accessed{Count: len(recs), Filter: r.URL.RawQuery})
 		for i := range recs {
 			rec := &recs[i]
 			if cw != nil {
