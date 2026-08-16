@@ -46,8 +46,22 @@ jobs:
           cat review.md >> "$GITHUB_STEP_SUMMARY"
           exit $code
 
+      # A PR from a fork gets a read-only GITHUB_TOKEN no matter what the
+      # permissions block says, so createComment would 403 — and with
+      # if: always() that 403 would fail the job, turning a contributor's
+      # first PR red for a reason unrelated to their change. The review still
+      # ran and is already in the job summary, so skip the comment instead.
+      - name: Note that the comment is skipped on forks
+        if: always() && hashFiles('review.md') != '' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          {
+            echo
+            echo "> This PR comes from a fork, so the workflow token is read-only and"
+            echo "> the review could not be posted as a comment. It is above in full."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Comment
-        if: always() && hashFiles('review.md') != ''
+        if: always() && hashFiles('review.md') != '' && github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/github-script@v8
         with:
           script: |
