@@ -10,6 +10,10 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 ## [Unreleased]
 
+### Security
+
+- **The audit trail no longer records the bearer token.** The admin API accepts `?token=` so a browser can load the dashboard, so a request's raw query string can contain the credential — and `ext.Accessed.Filter` was recording it verbatim. An audit trail is written to be *read*, by auditors and SIEMs and whoever investigates an incident, so a live credential in it is handed to a wider set of people than held the token in the first place. Credential-shaped query parameters (`token`, `access_token`, `api_key`, `apikey`, `password`, `secret`) are masked before the filter is recorded; everything else survives intact, since the filter is the useful part. Found by running a licensed build end to end and reading the resulting trail.
+
 ## [0.8.1] — 2026-08-16
 
 ### Added

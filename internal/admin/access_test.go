@@ -513,3 +513,63 @@ func TestIdentityReachesHandlers(t *testing.T) {
 		t.Error("InGroup is wrong")
 	}
 }
+
+// An audit trail is written to be READ — by auditors, by a SIEM, by whoever
+// investigates an incident. The admin API accepts ?token= so a browser can
+// load the dashboard, so the raw query string can carry the bearer token;
+// recording it would hand a live credential to everyone with log access,
+// which is a wider set than those who had the token.
+func TestAuditedFilterNeverContainsCredentials(t *testing.T) {
+	auditor := &fakeAuditor{}
+	withRegistered(t, nil, nil, []ext.Auditor{auditor})
+
+	h := serverWithRecords(t, "s3cret-token", 3).Handler()
+	do(t, h, "GET", "/api/logs?token=s3cret-token&status_min=200", nil)
+
+	e := auditor.last(t)
+	if strings.Contains(e.Accessed.Filter, "s3cret-token") {
+		t.Errorf("the audit trail recorded the bearer token: %q", e.Accessed.Filter)
+	}
+	// The placeholder is the product-wide "[REDACTED]", which url.Values.Encode
+	// percent-encodes to %5BREDACTED%5D. Assert the property — secret gone,
+	// marker present — rather than pinning the encoding.
+	if !strings.Contains(e.Accessed.Filter, "REDACTED") {
+		t.Errorf("the token param should be present but masked, got %q", e.Accessed.Filter)
+	}
+	// The non-credential part is the useful bit and must survive.
+	if !strings.Contains(e.Accessed.Filter, "status_min=200") {
+		t.Errorf("redaction destroyed the useful filter: %q", e.Accessed.Filter)
+	}
+}
+
+func TestAuditableQueryMasksKnownCredentialParams(t *testing.T) {
+	for _, tc := range []struct{ raw, mustNotContain string }{
+		{"token=abc123", "abc123"},
+		{"TOKEN=abc123", "abc123"}, // header/param names are case-insensitive in practice
+		{"access_token=abc123", "abc123"},
+		{"api_key=abc123", "abc123"},
+		{"apikey=abc123", "abc123"},
+		{"password=abc123", "abc123"},
+		{"secret=abc123", "abc123"},
+	} {
+		t.Run(tc.raw, func(t *testing.T) {
+			r := httptest.NewRequest("GET", "/api/logs?"+tc.raw, nil)
+			if got := auditableQuery(r); strings.Contains(got, tc.mustNotContain) {
+				t.Errorf("auditableQuery(%q) = %q — leaks the value", tc.raw, got)
+			}
+		})
+	}
+	t.Run("ordinary params are untouched", func(t *testing.T) {
+		r := httptest.NewRequest("GET", "/api/logs?status_min=500&method=POST", nil)
+		got := auditableQuery(r)
+		if !strings.Contains(got, "status_min=500") || !strings.Contains(got, "method=POST") {
+			t.Errorf("auditableQuery = %q, want both params intact", got)
+		}
+	})
+	t.Run("empty query stays empty", func(t *testing.T) {
+		r := httptest.NewRequest("GET", "/api/logs", nil)
+		if got := auditableQuery(r); got != "" {
+			t.Errorf("auditableQuery = %q, want empty", got)
+		}
+	})
+}

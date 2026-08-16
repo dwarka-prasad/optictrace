@@ -199,6 +199,34 @@ func withCORS(allowed []string, next http.Handler) http.Handler {
 	})
 }
 
+// auditableQuery renders a request's query string for the audit trail with
+// credentials removed.
+//
+// The admin API accepts ?token= so a browser can load the dashboard, which
+// means the raw query string can contain the bearer token. An audit trail is
+// written to be READ — by auditors, by a SIEM, by whoever investigates an
+// incident — so putting a live credential in it hands that credential to
+// everyone with access to the log, which is a wider set than those who had the
+// token to begin with.
+func auditableQuery(r *http.Request) string {
+	q := r.URL.Query()
+	if len(q) == 0 {
+		return ""
+	}
+	redacted := false
+	for key := range q {
+		switch strings.ToLower(key) {
+		case "token", "access_token", "api_key", "apikey", "password", "secret":
+			q.Set(key, "[REDACTED]")
+			redacted = true
+		}
+	}
+	if !redacted {
+		return r.URL.RawQuery
+	}
+	return q.Encode()
+}
+
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":         "ok",
@@ -227,7 +255,7 @@ func (s *Server) listLogs(w http.ResponseWriter, r *http.Request) {
 		ids = append(ids, recs[i].ID)
 	}
 	ext.NoteAccess(r.Context(), ext.Accessed{
-		Count: len(recs), RecordIDs: ids, Filter: r.URL.RawQuery,
+		Count: len(recs), RecordIDs: ids, Filter: auditableQuery(r),
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"total": total, "records": recs})
 }
@@ -510,7 +538,7 @@ func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	report := sc.Report()
-	ext.NoteAccess(r.Context(), ext.Accessed{Count: report.Scanned, Filter: r.URL.RawQuery})
+	ext.NoteAccess(r.Context(), ext.Accessed{Count: report.Scanned, Filter: auditableQuery(r)})
 	crit, high, med := report.Counts()
 	if report.Findings == nil {
 		report.Findings = []scan.Finding{}
@@ -556,7 +584,7 @@ func (s *Server) inferSpec(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusNotFound, "no traffic captured in this window")
 		return
 	}
-	ext.NoteAccess(r.Context(), ext.Accessed{Count: seen, Filter: r.URL.RawQuery})
+	ext.NoteAccess(r.Context(), ext.Accessed{Count: seen, Filter: auditableQuery(r)})
 	doc := inf.Spec()
 	if r.URL.Query().Get("format") == "json" {
 		writeJSON(w, http.StatusOK, doc)
@@ -618,7 +646,7 @@ func (s *Server) export(w http.ResponseWriter, r *http.Request) {
 		// audit as 12,000, and NoteAccess adds rather than replaces. IDs are
 		// deliberately omitted — naming every row of a bulk export would bloat
 		// the audit record without telling anyone more than the count does.
-		ext.NoteAccess(r.Context(), ext.Accessed{Count: len(recs), Filter: r.URL.RawQuery})
+		ext.NoteAccess(r.Context(), ext.Accessed{Count: len(recs), Filter: auditableQuery(r)})
 		for i := range recs {
 			rec := &recs[i]
 			if cw != nil {
