@@ -1,0 +1,147 @@
+package ext
+
+import "time"
+
+// DefaultAnalysisMaxRows bounds how many records an analysis pass reads when
+// no explicit limit is given. These are FULL records including bodies, so at
+// the default 64 KiB capture limit this is a memory ceiling, not just a row
+// count. Override with telemetry.store.analysis_max_rows.
+const DefaultAnalysisMaxRows = 20_000
+
+// MaxAnalysisMaxRows is the hard ceiling on that knob.
+const MaxAnalysisMaxRows = 500_000
+
+// AnalysisLimit resolves a requested limit against the defaults.
+func AnalysisLimit(limit int) int {
+	if limit <= 0 {
+		return DefaultAnalysisMaxRows
+	}
+	if limit > MaxAnalysisMaxRows {
+		return MaxAnalysisMaxRows
+	}
+	return limit
+}
+
+// Record is one captured HTTP exchange, post-governance.
+type Record struct {
+	ID      int64     `json:"id"`
+	Time    time.Time `json:"time"`
+	Service string    `json:"service"`
+	Method  string    `json:"method"`
+	Path    string    `json:"path"`
+	// Query is the sanitized query string (policy-masked, stable ordering).
+	Query  string `json:"query,omitempty"`
+	Route  string `json:"route"` // low-cardinality route pattern
+	Status int    `json:"status"`
+	// DurationMS is milliseconds (float) — the natural unit for SDKs in
+	// every language to produce and for the dashboard to consume.
+	DurationMS float64 `json:"duration_ms"`
+	Remote     string  `json:"remote"`
+	Source     string  `json:"source"` // "proxy" or an SDK name
+	// Stream marks a long-lived streaming response (SSE or chunked). Its
+	// DurationMS is a connection lifetime, not a latency, so percentile
+	// aggregations exclude it — one 10-minute stream would otherwise define
+	// a route's p95 for the whole window.
+	Stream bool `json:"stream,omitempty"`
+
+	RequestHeaders  map[string]string `json:"request_headers,omitempty"`
+	ResponseHeaders map[string]string `json:"response_headers,omitempty"`
+	RequestBody     string            `json:"request_body,omitempty"`
+	ResponseBody    string            `json:"response_body,omitempty"`
+	ReqTruncated    bool              `json:"req_truncated,omitempty"`
+	RespTruncated   bool              `json:"resp_truncated,omitempty"`
+
+	ReqBytes     int64             `json:"req_bytes"`
+	RespBytes    int64             `json:"resp_bytes"`
+	Labels       map[string]string `json:"labels,omitempty"`
+	MatchedRules []string          `json:"matched_rules,omitempty"`
+	// Meters holds numeric usage extracted from the response by rule-level
+	// meter paths (e.g. LLM token counts) — the raw material for billing.
+	Meters map[string]float64 `json:"meters,omitempty"`
+}
+
+// Filter narrows a log query. Zero values mean "no constraint".
+type Filter struct {
+	Method     string
+	PathPrefix string
+	Search     string // substring across path + bodies
+	StatusMin  int
+	StatusMax  int
+	Since      time.Time
+	Until      time.Time
+	Limit      int
+	Offset     int
+}
+
+// TimeBucket is one point in an aggregated traffic series.
+type TimeBucket struct {
+	Time       time.Time `json:"time"`
+	Count      int64     `json:"count"`
+	Errors     int64     `json:"errors"` // status >= 500
+	AvgLatency float64   `json:"avg_latency_ms"`
+}
+
+// RouteStat aggregates one route's traffic.
+type RouteStat struct {
+	Route      string  `json:"route"`
+	Method     string  `json:"method"`
+	Count      int64   `json:"count"`
+	Errors     int64   `json:"errors"`
+	AvgLatency float64 `json:"avg_latency_ms"`
+	P95Latency float64 `json:"p95_latency_ms"`
+}
+
+// Stats is the dashboard's aggregate view over a time window.
+type Stats struct {
+	Total        int64            `json:"total"`
+	Errors       int64            `json:"errors"`
+	ErrorRate    float64          `json:"error_rate"`
+	P50LatencyMS float64          `json:"p50_latency_ms"`
+	P95LatencyMS float64          `json:"p95_latency_ms"`
+	P99LatencyMS float64          `json:"p99_latency_ms"`
+	StatusCounts map[string]int64 `json:"status_counts"` // by class: 2xx, 4xx...
+	Series       []TimeBucket     `json:"series"`
+	TopRoutes    []RouteStat      `json:"top_routes"`
+}
+
+// RouteDetail extends RouteStat with the percentiles the Routes dashboard
+// shows for every route (not just the top 10).
+type RouteDetail struct {
+	RouteStat
+	P50Latency float64 `json:"p50_latency_ms"`
+	P99Latency float64 `json:"p99_latency_ms"`
+	ReqBytes   int64   `json:"req_bytes"`
+	RespBytes  int64   `json:"resp_bytes"`
+}
+
+// RuleMatch is how often one governance rule fired in a window.
+type RuleMatch struct {
+	Rule  string `json:"rule"`
+	Count int64  `json:"count"`
+}
+
+// Usage aggregates one consumer's traffic for cost attribution.
+type Usage struct {
+	Consumer   string             `json:"consumer"` // label value; "" -> "(unattributed)"
+	Requests   int64              `json:"requests"`
+	Errors     int64              `json:"errors"`
+	ReqBytes   int64              `json:"req_bytes"`
+	RespBytes  int64              `json:"resp_bytes"`
+	DurationMS float64            `json:"duration_ms_total"`
+	Meters     map[string]float64 `json:"meters,omitempty"`
+}
+
+// ServiceStat summarizes one service in a multi-service deployment. One
+// agent proxies one service, but many SDKs can report into a single agent,
+// so the store may hold several.
+type ServiceStat struct {
+	Service    string    `json:"service"`
+	Requests   int64     `json:"requests"`
+	Errors     int64     `json:"errors"`
+	ErrorRate  float64   `json:"error_rate"`
+	AvgLatency float64   `json:"avg_latency_ms"`
+	P95Latency float64   `json:"p95_latency_ms"`
+	Routes     int64     `json:"routes"`
+	Sources    string    `json:"sources"` // e.g. "proxy, express"
+	LastSeen   time.Time `json:"last_seen"`
+}

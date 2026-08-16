@@ -25,6 +25,7 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
+	"github.com/dwarka-prasad/optictrace/ext"
 	"github.com/dwarka-prasad/optictrace/internal/admin"
 	"github.com/dwarka-prasad/optictrace/internal/config"
 	"github.com/dwarka-prasad/optictrace/internal/engine"
@@ -605,8 +606,17 @@ func openStore(cfg *config.StoreCfg) (store.LogStore, error) {
 		return store.NewPostgres(cfg.DSN)
 	case "clickhouse":
 		return store.NewClickHouse(cfg.DSN)
-	default:
+	case "sqlite", "":
 		return store.NewSQLite(cfg.DSN)
+	default:
+		// An out-of-tree driver registered via ext.RegisterStore. Validate
+		// already accepted the name on that basis, so a miss here means the
+		// registry changed after the config was loaded.
+		open, ok := ext.LookupStore(cfg.Driver)
+		if !ok {
+			return nil, fmt.Errorf("no store driver registered as %q", cfg.Driver)
+		}
+		return open(cfg.DSN, cfg.Settings)
 	}
 }
 

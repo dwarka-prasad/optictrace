@@ -805,6 +805,79 @@ See [`examples/exporters/`](examples/exporters/) for a working CSV plugin.
 
 ---
 
+## Writing an extension
+
+Almost all of OpticTrace lives under `internal/`, which Go forbids other modules
+from importing — that keeps the implementation free to change. The one exception
+is [`ext/`](ext), the extension surface: the record types and the two plugin
+interfaces, and nothing else. It follows semantic versioning; nothing under
+`internal/` does.
+
+A driver becomes configurable purely by being linked into the binary:
+
+```go
+package main
+
+import (
+    "github.com/dwarka-prasad/optictrace"
+    "github.com/dwarka-prasad/optictrace/ext"
+)
+
+func init() {
+    ext.RegisterStore("s3", func(dsn string, s ext.Settings) (ext.Store, error) {
+        return newS3Store(dsn, s.String("bucket", ""), s.Int("shards", 4))
+    })
+}
+```
+
+```yaml
+telemetry:
+  store:
+    driver: s3                    # accepted because it's registered
+    dsn: "s3://archive"
+    settings:                     # your keys; the core doesn't validate these
+      bucket: optic-archive
+      shards: 8
+```
+
+`ext.RegisterExporter` works the same way for output plugins
+(`telemetry.exporters[].type`).
+
+### Verify it against the same suite the built-in drivers run
+
+`ext/exttest` exports the conformance suite. Two drivers means two chances to
+drift apart; the suite is what stops them answering the same question
+differently — including the regression test for the erasure bug where purging
+a tenant named `acme_1` also destroyed `acmeX1`.
+
+```go
+func TestConformance(t *testing.T) {
+    exttest.RunStoreSuite(t, func(t *testing.T) ext.Store {
+        s, err := NewMyStore(dsn)
+        if err != nil { t.Fatal(err) }
+        t.Cleanup(func() { s.Close() })
+        return s   // must be empty
+    })
+}
+```
+
+[`examples/memstore`](examples/memstore) is a complete worked example: an
+in-memory store in **its own module**, deliberately outside the
+`github.com/dwarka-prasad/optictrace/...` path prefix so it genuinely cannot
+reach `internal/`. It passes the full suite using only `ext`. CI builds it on
+every PR, so a hole in the extension surface fails the build.
+
+### What extensions inherit
+
+Records handed to a `Store` or an `Exporter` are already governed — restricted
+fields absent, redacted fields holding the placeholder. Governance sits upstream
+of every sink, so no extension can see raw sensitive data and none has to be
+trusted with it. Two obligations follow: don't reconstruct what governance
+removed, and make `Purge` actually delete before it returns — it backs erasure
+requests.
+
+---
+
 ## Framework SDKs
 
 SDKs evaluate the same `optic.yaml` in-process and POST governed records to the agent's

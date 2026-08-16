@@ -22,6 +22,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/dwarka-prasad/optictrace/ext"
 	"github.com/dwarka-prasad/optictrace/internal/scan"
 )
 
@@ -193,6 +194,12 @@ type ExporterCfg struct {
 	BatchSize     int    `yaml:"batch_size"`     // default 50
 	FlushInterval string `yaml:"flush_interval"` // Go duration, default "3s"
 	QueueSize     int    `yaml:"queue_size"`     // per-exporter; default 1024
+
+	// Settings carries configuration for an out-of-tree exporter registered
+	// via ext.RegisterExporter. The decoder rejects unknown top-level keys on
+	// purpose — a typo must fail loudly rather than look like a working rule —
+	// so a plugin's own keys need somewhere legitimate to live, and this is it.
+	Settings ext.Settings `yaml:"settings"`
 }
 
 // Metrics controls the Prometheus exporter.
@@ -229,6 +236,9 @@ type StoreCfg struct {
 	// count — the control a data-retention policy is actually written in
 	// ("keep 30 days"). Go duration, e.g. "720h". Empty disables it.
 	RetentionMaxAge string `yaml:"retention_max_age"`
+	// Settings carries configuration for an out-of-tree store registered via
+	// ext.RegisterStore. See ExporterCfg.Settings for why this exists.
+	Settings ext.Settings `yaml:"settings"`
 	// AnalysisMaxRows bounds how many records one analysis pass reads —
 	// `scan`, `spec`, `suggest`, `review`, `replay` and the /api/scan and
 	// /api/spec endpoints. These read FULL records including bodies, so at
@@ -545,8 +555,15 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("telemetry.store.dsn must be a clickhouse:// URL when driver is clickhouse")
 		}
 	default:
-		return fmt.Errorf("telemetry.store.driver %q is not supported (sqlite, postgres, clickhouse, none)",
-			c.Telemetry.Store.Driver)
+		// An out-of-tree driver registered via ext.RegisterStore is a valid
+		// name; that is what makes a linked-in extension configurable without
+		// the core knowing anything about it.
+		if _, ok := ext.LookupStore(c.Telemetry.Store.Driver); !ok {
+			known := append([]string{"sqlite", "postgres", "clickhouse", "none"},
+				ext.RegisteredStores()...)
+			return fmt.Errorf("telemetry.store.driver %q is not supported (%s)",
+				c.Telemetry.Store.Driver, strings.Join(known, ", "))
+		}
 	}
 	if a := c.Telemetry.Auth; a != nil {
 		if a.Token == "" && a.TokenEnv == "" {
@@ -644,7 +661,14 @@ func (e *ExporterCfg) validate() error {
 			return fmt.Errorf("type command requires command: [executable, args...]")
 		}
 	default:
-		return fmt.Errorf("unknown type %q (file, webhook, command, otlp)", e.Type)
+		// An out-of-tree exporter registered via ext.RegisterExporter is a
+		// valid type. Its own keys live under `settings`, which the core does
+		// not validate — the plugin owns that.
+		if _, ok := ext.LookupExporter(e.Type); !ok {
+			known := append([]string{"file", "webhook", "command", "otlp"},
+				ext.RegisteredExporters()...)
+			return fmt.Errorf("unknown type %q (%s)", e.Type, strings.Join(known, ", "))
+		}
 	}
 	if e.FlushInterval != "" {
 		if _, err := time.ParseDuration(e.FlushInterval); err != nil {

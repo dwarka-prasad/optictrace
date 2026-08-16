@@ -12,6 +12,7 @@ package optictrace
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dwarka-prasad/optictrace/ext"
 	"github.com/dwarka-prasad/optictrace/internal/admin"
 	"github.com/dwarka-prasad/optictrace/internal/config"
 	"github.com/dwarka-prasad/optictrace/internal/engine"
@@ -82,8 +84,16 @@ func New(configPath string, opts ...AgentOption) (*Agent, error) {
 			sqlStore, err = store.NewPostgres(cfg.Telemetry.Store.DSN)
 		case "clickhouse":
 			sqlStore, err = store.NewClickHouse(cfg.Telemetry.Store.DSN)
-		default:
+		case "sqlite", "":
 			sqlStore, err = store.NewSQLite(cfg.Telemetry.Store.DSN)
+		default:
+			// Out-of-tree driver; see ext.RegisterStore.
+			open, ok := ext.LookupStore(cfg.Telemetry.Store.Driver)
+			if !ok {
+				return nil, fmt.Errorf("no store driver registered as %q",
+					cfg.Telemetry.Store.Driver)
+			}
+			sqlStore, err = open(cfg.Telemetry.Store.DSN, cfg.Telemetry.Store.Settings)
 		}
 		if err != nil {
 			return nil, err

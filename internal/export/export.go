@@ -26,18 +26,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/dwarka-prasad/optictrace/ext"
 	"github.com/dwarka-prasad/optictrace/internal/config"
 	"github.com/dwarka-prasad/optictrace/internal/store"
 )
 
-// Exporter delivers batches of governed records to one destination.
-type Exporter interface {
-	Name() string
-	Type() string
-	// Export delivers one batch. An error marks the whole batch failed.
-	Export(ctx context.Context, batch []*store.Record) error
-	Close() error
-}
+// Exporter delivers batches of governed records to one destination. The
+// contract lives in ext so out-of-tree plugins can implement it; this is an
+// alias, not a parallel definition.
+type Exporter = ext.Exporter
 
 // Stat is a point-in-time view of one exporter, for /api/system.
 type Stat struct {
@@ -91,7 +88,18 @@ func New(cfgs []config.ExporterCfg, logger *slog.Logger, m Metrics, serviceName 
 		case "otlp":
 			exp = newOTLPExporter(c, serviceName)
 		default:
-			err = fmt.Errorf("unknown exporter type %q", c.Type) // unreachable post-validation
+			// Not a built-in: an out-of-tree plugin may have registered it.
+			// Config validation already accepted the name on that basis, so
+			// reaching the error here means the registry changed after load.
+			if build, ok := ext.LookupExporter(c.Type); ok {
+				exp, err = build(ext.ExporterOptions{
+					Name: c.Name, Type: c.Type, Settings: c.Settings,
+					BatchSize: c.BatchSize, FlushInterval: c.FlushEvery(),
+					QueueSize: c.QueueSize, ServiceName: serviceName,
+				})
+			} else {
+				err = fmt.Errorf("unknown exporter type %q", c.Type)
+			}
 		}
 		if err != nil {
 			d.Shutdown()

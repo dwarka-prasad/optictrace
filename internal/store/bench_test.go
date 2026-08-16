@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/dwarka-prasad/optictrace/ext/exttest"
 )
 
 // seed builds a store with n records spread over 20 routes and 10 rules.
@@ -18,7 +20,7 @@ func seed(tb testing.TB, n int) *SQLiteStore {
 	ctx := context.Background()
 	tx, _ := s.db.Begin()
 	for i := 0; i < n; i++ {
-		r := confRecord(200, float64(i%1000), fmt.Sprintf("/api/r%d", i%20), "acme")
+		r := exttest.Record(200, float64(i%1000), fmt.Sprintf("/api/r%d", i%20), "acme")
 		r.Route = fmt.Sprintf("/api/r%d", i%20)
 		r.MatchedRules = []string{fmt.Sprintf("rule-%d", i%10)}
 		_ = r
