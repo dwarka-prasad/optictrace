@@ -63,7 +63,7 @@ rules:
     match:
       path: "/api/v1/payments/**"
     redact:
-      headers: [Authorization, X-Api-Key]
+      headers: [Authorization, X-Api-Key, Cookie]
       query_params: [api_key, session]
       json_fields:
         - "$.**.credit_card.number"
