@@ -10,6 +10,12 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-08-16
+
+### Added
+
+- **`cli` package** — the command line, importable. A binary that adds features can now *be* optictrace rather than reimplement it: register extensions with `ext`, then call `cli.Run(os.Args[1:], version)`. Every subcommand, flag and exit code is the same code, which is the only way to guarantee they behave the same. `cmd/optictrace` is now a six-line wrapper.
+
 ## [0.8.0] — 2026-08-16
 
 Every issue on the tracker at the start of this cycle, plus the extension
@@ -170,6 +176,7 @@ Measured with `make bench` (12th Gen Intel i5-1235U, Go 1.25):
 - Control-plane authentication is available but **off by default**.
 - Homebrew publishing is configured but disabled until a `homebrew-tap` repository exists.
 
-[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/dwarka-prasad/optictrace/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/dwarka-prasad/optictrace/releases/tag/v0.7.0
