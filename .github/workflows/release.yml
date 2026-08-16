@@ -47,16 +47,24 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Update the Homebrew tap
-        # Runs after goreleaser so the release assets (and their checksums)
-        # already exist to hash. Needs a token that can push to the tap repo;
-        # without one the step is skipped rather than failing the release.
-        if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        # Runs after goreleaser so the release assets — and the checksums.txt
+        # the formula is generated from — already exist to hash.
+        #
+        # The token is read into env rather than tested directly in `if:`,
+        # because the `secrets` context is not dependably available to step
+        # conditionals. Pushing to a *different* repo also needs a real PAT;
+        # the default GITHUB_TOKEN is scoped to this one. Without the secret
+        # the step no-ops instead of failing the release, so a fork or a
+        # first-time setup can still cut a release.
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "HOMEBREW_TAP_TOKEN not set — skipping tap update." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
           git config --global user.name "optictrace-release"
           git config --global user.email "noreply@github.com"
