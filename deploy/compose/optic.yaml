@@ -44,6 +44,7 @@ telemetry:
         tokens: 0.000002       # $2 per 1M tokens
 
 defaults:
+  # Capture is opt-out: everything is recorded unless a rule restricts it.
   capture:
     request_body: true
     response_body: true
