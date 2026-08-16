@@ -10,6 +10,8 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 ## [Unreleased]
 
+## [0.8.2] — 2026-08-16
+
 ### Security
 
 - **The audit trail no longer records the bearer token.** The admin API accepts `?token=` so a browser can load the dashboard, so a request's raw query string can contain the credential — and `ext.Accessed.Filter` was recording it verbatim. An audit trail is written to be *read*, by auditors and SIEMs and whoever investigates an incident, so a live credential in it is handed to a wider set of people than held the token in the first place. Credential-shaped query parameters (`token`, `access_token`, `api_key`, `apikey`, `password`, `secret`) are masked before the filter is recorded; everything else survives intact, since the filter is the useful part. Found by running a licensed build end to end and reading the resulting trail.
@@ -180,7 +182,8 @@ Measured with `make bench` (12th Gen Intel i5-1235U, Go 1.25):
 - Control-plane authentication is available but **off by default**.
 - Homebrew publishing is configured but disabled until a `homebrew-tap` repository exists.
 
-[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/dwarka-prasad/optictrace/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/dwarka-prasad/optictrace/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/dwarka-prasad/optictrace/releases/tag/v0.7.0
