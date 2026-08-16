@@ -25,7 +25,9 @@ service:
 # payload store all hang off a SEPARATE admin listener so you can firewall it
 # away from proxied traffic.
 telemetry:
-  admin_listen: ":9095"
+  # Loopback by default: the admin API serves the dashboard and every
+  # captured payload. Set "0.0.0.0:9095" only alongside `auth` below.
+  admin_listen: "127.0.0.1:9095"
   console_log: true          # structured JSON telemetry on stdout
   metrics:
     enabled: true
