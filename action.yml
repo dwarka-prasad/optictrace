@@ -138,7 +138,7 @@ runs:
       # Runs even when the review failed — the comment IS the failure report,
       # so suppressing it exactly when something is wrong would be perverse.
       if: always() && inputs.comment == 'true' && github.event_name == 'pull_request'
-      uses: actions/github-script@v7
+      uses: actions/github-script@v8
       with:
         github-token: ${{ inputs.github-token }}
         script: |
