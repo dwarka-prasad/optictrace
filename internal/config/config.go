@@ -15,6 +15,8 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -339,6 +341,35 @@ func applyTelemetryDefaults(t *Telemetry) {
 			0.25, 0.5, 1, 2.5, 5, 10,
 		}
 	}
+}
+
+// RestartRequired lists the settings that differ between two configs but
+// cannot be applied by a hot reload, which only swaps the rule engine and the
+// metrics label schema.
+//
+// Reload used to parse the whole file, validate it, apply the rules, and
+// silently discard everything else — reporting success either way. Someone
+// changing an exporter and reloading had no way to learn it had not taken
+// effect. Naming the fields is most of the fix.
+func (c *Config) RestartRequired(next *Config) []string {
+	var out []string
+	add := func(cond bool, field string) {
+		if cond {
+			out = append(out, field)
+		}
+	}
+	add(c.Service.Listen != next.Service.Listen, "service.listen")
+	add(c.Service.Upstream != next.Service.Upstream, "service.upstream")
+	add(c.Service.HTTP2 != next.Service.HTTP2, "service.http2")
+	add(c.Telemetry.AdminListen != next.Telemetry.AdminListen, "telemetry.admin_listen")
+	add(!slices.Equal(c.Telemetry.CORSOrigins, next.Telemetry.CORSOrigins), "telemetry.cors_origins")
+	add(c.Telemetry.Auth.Resolve() != next.Telemetry.Auth.Resolve(), "telemetry.auth")
+	add(!reflect.DeepEqual(c.Telemetry.TLS, next.Telemetry.TLS), "telemetry.tls")
+	add(!reflect.DeepEqual(c.Telemetry.Store, next.Telemetry.Store), "telemetry.store")
+	add(!reflect.DeepEqual(c.Telemetry.Exporters, next.Telemetry.Exporters), "telemetry.exporters")
+	add(!slices.Equal(c.Telemetry.Metrics.Buckets, next.Telemetry.Metrics.Buckets), "telemetry.metrics.buckets")
+	add(!reflect.DeepEqual(c.Telemetry.Billing, next.Telemetry.Billing), "telemetry.billing")
+	return out
 }
 
 // RequireProxyAddrs enforces the invariants of sidecar mode, where a listener

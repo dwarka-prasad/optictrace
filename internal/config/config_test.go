@@ -1,6 +1,7 @@
 package config
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -47,8 +48,8 @@ func TestAdminReachable(t *testing.T) {
 		{"127.0.0.1:9095", false},
 		{"localhost:9095", true}, // a name, not an IP — assume the worst
 		{"[::1]:9095", false},
-		{":9095", true},          // every interface
-		{"0.0.0.0:9095", true},   // explicit
+		{":9095", true},        // every interface
+		{"0.0.0.0:9095", true}, // explicit
 		{"192.168.1.5:9095", true},
 		{"garbage", true}, // unparseable — assume the worst
 	} {
@@ -205,6 +206,84 @@ func TestRequireProxyAddrs(t *testing.T) {
 				t.Errorf("expected an error mentioning %q", tc.want)
 			case tc.want != "" && !strings.Contains(err.Error(), tc.want):
 				t.Errorf("message %q does not mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// A reload only swaps the rule engine and the metrics label schema. Everything
+// else used to be parsed, validated and then silently discarded — the reload
+// reported success either way, so an operator changing an exporter had no way
+// to learn it had not taken effect.
+func TestRestartRequired(t *testing.T) {
+	load := func(y string) *Config {
+		t.Helper()
+		c, err := Parse([]byte(y))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		return c
+	}
+	old := load(base + `
+telemetry:
+  store:
+    driver: sqlite
+    dsn: a.db
+  exporters:
+    - name: audit
+      type: file
+      path: /tmp/a.jsonl
+`)
+
+	t.Run("identical configs need nothing", func(t *testing.T) {
+		if got := old.RestartRequired(load(base + `
+telemetry:
+  store:
+    driver: sqlite
+    dsn: a.db
+  exporters:
+    - name: audit
+      type: file
+      path: /tmp/a.jsonl
+`)); len(got) != 0 {
+			t.Errorf("unchanged config reported %v", got)
+		}
+	})
+
+	t.Run("rules alone are hot-swappable", func(t *testing.T) {
+		next := load(base + `
+telemetry:
+  store:
+    driver: sqlite
+    dsn: a.db
+  exporters:
+    - name: audit
+      type: file
+      path: /tmp/a.jsonl
+rules:
+  - name: r
+    match: {path: "/**"}
+    labels:
+      tenant: "header:X-Tenant"
+`)
+		if got := old.RestartRequired(next); len(got) != 0 {
+			t.Errorf("a rules-only change should apply cleanly, got %v", got)
+		}
+	})
+
+	for _, tc := range []struct{ name, yaml, want string }{
+		{"store dsn", base + "telemetry:\n  store:\n    driver: sqlite\n    dsn: b.db\n", "telemetry.store"},
+		{"exporter removed", base + "telemetry:\n  store:\n    driver: sqlite\n    dsn: a.db\n", "telemetry.exporters"},
+		{"admin listen", base + "telemetry:\n  admin_listen: \"0.0.0.0:9999\"\n", "telemetry.admin_listen"},
+		{"listen", "version: 1\nservice:\n  listen: \":9999\"\n  upstream: \"http://localhost:9000\"\n", "service.listen"},
+		{"http2", "version: 1\nservice:\n  listen: \":8080\"\n  upstream: \"http://localhost:9000\"\n  http2: true\n", "service.http2"},
+		{"buckets", base + "telemetry:\n  metrics:\n    buckets: [1, 2]\n", "telemetry.metrics.buckets"},
+		{"cors", base + "telemetry:\n  cors_origins: [\"http://localhost:3001\"]\n", "telemetry.cors_origins"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := old.RestartRequired(load(tc.yaml))
+			if !slices.Contains(got, tc.want) {
+				t.Errorf("RestartRequired = %v, want it to include %q", got, tc.want)
 			}
 		})
 	}

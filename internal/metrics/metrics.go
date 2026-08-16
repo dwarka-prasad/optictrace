@@ -4,9 +4,13 @@
 //   - The collector owns a private Registry (not the global default), so
 //     embedding OpticTrace in an app that already uses client_golang can
 //     never cause duplicate-registration panics.
-//   - Custom labels from optic.yaml become real Prometheus dimensions. The
-//     label schema is fixed at construction from engine.LabelKeys(); requests
-//     without a value export "" (Prometheus requires stable schemas).
+//   - Custom labels from optic.yaml become real Prometheus dimensions, taken
+//     from engine.LabelKeys(); requests without a value export "" (Prometheus
+//     requires stable schemas). A Prometheus metric cannot change its label
+//     set, so a config reload that adds a label REBUILDS the affected vectors
+//     (see SetLabelKeys) rather than mutating them. Without that, a newly
+//     added label would show up in the dashboard but silently never appear in
+//     /metrics — a Grafana panel that stays empty with no error anywhere.
 //   - The `route` label carries the matched rule's glob (or a normalized
 //     path), never the raw path — cardinality stays bounded by design.
 //   - P50/P95/P99 are derived by Prometheus from the latency histogram, e.g.:
@@ -15,8 +19,10 @@ package metrics
 
 import (
 	"net/http"
+	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -47,8 +53,20 @@ const OverLimit = "__over_limit__"
 
 // Collector aggregates per-request metrics and serves them via Handler().
 type Collector struct {
-	registry  *prometheus.Registry
-	labelKeys []string
+	// Two registries, because client_golang deliberately remembers a metric
+	// name's label schema for the lifetime of a Registry — Unregister leaves
+	// dimHashesByName intact so exposition stays consistent. A metric whose
+	// dimensions come from optic.yaml therefore cannot be re-registered with
+	// a new label set; it needs a fresh registry.
+	//
+	// stable holds everything whose schema is fixed at build time; dynamic
+	// holds only the two vectors that carry custom labels, and is replaced
+	// wholesale on reload. Handler gathers from both.
+	stable  *prometheus.Registry
+	dynamic atomic.Pointer[prometheus.Registry]
+	// rebuildMu serializes SetLabelKeys against itself; Observe is lock-free
+	// via the atomic pointers.
+	rebuildMu sync.Mutex
 
 	// Cardinality guard. Label values arrive from arbitrary request headers,
 	// so an unbounded value space is a real availability risk for the
@@ -57,8 +75,13 @@ type Collector struct {
 	cardMu         sync.Mutex
 	seen           map[string]map[string]struct{}
 
-	requests *prometheus.CounterVec
-	duration *prometheus.HistogramVec
+	// dims holds everything whose label schema depends on optic.yaml, so a
+	// reload can swap it atomically without locking the hot path.
+	dims atomic.Pointer[dimensions]
+	// buckets and constLabels are kept so the vectors can be rebuilt.
+	buckets     []float64
+	constLabels prometheus.Labels
+
 	reqSize  *prometheus.HistogramVec
 	respSize *prometheus.HistogramVec
 	// Streams are measured separately from requests — different phenomenon,
@@ -78,6 +101,30 @@ type Collector struct {
 	labelDistinct *prometheus.GaugeVec
 }
 
+// dimensions is the set of metrics whose label schema comes from optic.yaml.
+// Replaced wholesale on reload; never mutated in place.
+type dimensions struct {
+	keys     []string
+	requests *prometheus.CounterVec
+	duration *prometheus.HistogramVec
+}
+
+// newDimensions builds the config-dependent vectors for one label schema.
+func newDimensions(keys []string, buckets []float64, constLabels prometheus.Labels) *dimensions {
+	base := []string{"method", "route", "status", "status_class"}
+	return &dimensions{
+		keys: keys,
+		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "optictrace_requests_total", Help: "Total HTTP requests observed.",
+			ConstLabels: constLabels,
+		}, append(append([]string{}, base...), keys...)),
+		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "optictrace_request_duration_seconds", Help: "Request latency.",
+			Buckets: buckets, ConstLabels: constLabels,
+		}, append([]string{"method", "route"}, keys...)),
+	}
+}
+
 // New builds a Collector for one service. customKeys is the fixed set of
 // optic.yaml label names (from engine.LabelKeys()); maxLabelValues caps the
 // distinct values each may contribute (0 disables the guard).
@@ -85,25 +132,14 @@ func New(service string, buckets []float64, customKeys []string, maxLabelValues 
 	reg := prometheus.NewRegistry()
 	constLabels := prometheus.Labels{"service": service}
 
-	base := []string{"method", "route", "status", "status_class"}
-	withCustom := append(append([]string{}, base...), customKeys...)
-	durationLabels := append([]string{"method", "route"}, customKeys...)
-
 	sizeBuckets := prometheus.ExponentialBuckets(64, 4, 10) // 64B .. ~16MB
 
 	c := &Collector{
-		registry:       reg,
-		labelKeys:      customKeys,
+		stable:         reg,
 		maxLabelValues: maxLabelValues,
+		buckets:        buckets,
+		constLabels:    constLabels,
 		seen:           make(map[string]map[string]struct{}, len(customKeys)),
-		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "optictrace_requests_total", Help: "Total HTTP requests observed.",
-			ConstLabels: constLabels,
-		}, withCustom),
-		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Name: "optictrace_request_duration_seconds", Help: "Request latency.",
-			Buckets: buckets, ConstLabels: constLabels,
-		}, durationLabels),
 		reqSize: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "optictrace_request_size_bytes", Help: "Request body size.",
 			Buckets: sizeBuckets, ConstLabels: constLabels,
@@ -163,8 +199,9 @@ func New(service string, buckets []float64, customKeys []string, maxLabelValues 
 			ConstLabels: constLabels,
 		}, []string{"label"}),
 	}
+	c.installDimensions(newDimensions(customKeys, buckets, constLabels))
 	reg.MustRegister(
-		c.requests, c.duration, c.reqSize, c.respSize,
+		c.reqSize, c.respSize,
 		c.streams, c.streamDuration, c.streamsOpen,
 		c.inflight, c.dropped, c.ingested,
 		c.exported, c.exportFailed, c.exportDrops,
@@ -180,17 +217,21 @@ func (c *Collector) Observe(o Observation) {
 	status := strconv.Itoa(o.Status)
 	class := statusClass(o.Status)
 
-	counterVals := make([]string, 0, 4+len(c.labelKeys))
+	// One load: a concurrent reload must not be able to fill the counter's
+	// values from one schema and the histogram's from another.
+	d := c.dims.Load()
+
+	counterVals := make([]string, 0, 4+len(d.keys))
 	counterVals = append(counterVals, o.Method, o.Route, status, class)
-	durationVals := make([]string, 0, 2+len(c.labelKeys))
+	durationVals := make([]string, 0, 2+len(d.keys))
 	durationVals = append(durationVals, o.Method, o.Route)
-	for _, k := range c.labelKeys {
+	for _, k := range d.keys {
 		v := c.guard(k, o.Labels[k])
 		counterVals = append(counterVals, v)
 		durationVals = append(durationVals, v)
 	}
 
-	c.requests.WithLabelValues(counterVals...).Inc()
+	d.requests.WithLabelValues(counterVals...).Inc()
 	if o.Stream {
 		// Deliberately NOT on c.duration. A stream's lifetime is not request
 		// latency, and mixing them lets one long connection swamp a route's
@@ -198,7 +239,7 @@ func (c *Collector) Observe(o Observation) {
 		c.streams.WithLabelValues(o.Method, o.Route).Inc()
 		c.streamDuration.WithLabelValues(o.Method, o.Route).Observe(o.Duration.Seconds())
 	} else {
-		c.duration.WithLabelValues(durationVals...).Observe(o.Duration.Seconds())
+		d.duration.WithLabelValues(durationVals...).Observe(o.Duration.Seconds())
 	}
 	if o.ReqBytes > 0 {
 		c.reqSize.WithLabelValues(o.Method, o.Route).Observe(float64(o.ReqBytes))
@@ -206,6 +247,55 @@ func (c *Collector) Observe(o Observation) {
 	if o.RespBytes > 0 {
 		c.respSize.WithLabelValues(o.Method, o.Route).Observe(float64(o.RespBytes))
 	}
+}
+
+// LabelKeys returns the custom label schema currently in effect.
+func (c *Collector) LabelKeys() []string { return c.dims.Load().keys }
+
+// SetLabelKeys re-points the config-dependent metrics at a new label schema,
+// returning true if anything changed.
+//
+// A Prometheus metric's label set is immutable — and a Registry refuses to
+// re-register a name under a different schema even after Unregister — so this
+// swaps in a freshly built registry holding freshly built vectors. Request
+// counts and latency buckets therefore restart from zero, and the old series
+// go stale.
+//
+// That is the correct trade. Before this existed, adding a `labels:` key and
+// reloading made the label appear in the dashboard while never appearing in
+// /metrics: a Grafana panel built on it returned no data, with no error
+// anywhere to explain why. Only the two config-dependent vectors are affected;
+// every other counter lives in the stable registry and survives.
+func (c *Collector) SetLabelKeys(keys []string) bool {
+	c.rebuildMu.Lock()
+	defer c.rebuildMu.Unlock()
+
+	old := c.dims.Load()
+	if slices.Equal(old.keys, keys) {
+		return false
+	}
+	fresh := newDimensions(keys, c.buckets, c.constLabels)
+
+	// Unregister before registering: same metric names, different label sets,
+	// which Prometheus rejects as a duplicate if both are present.
+	c.installDimensions(fresh)
+
+	// The cardinality guard tracked values for the previous schema; keys that
+	// went away should not keep occupying their budget.
+	c.cardMu.Lock()
+	c.seen = make(map[string]map[string]struct{}, len(keys))
+	c.cardMu.Unlock()
+	return true
+}
+
+// installDimensions registers a dimension set into a private registry and
+// publishes both atomically, so a scrape or an Observe never sees the vectors
+// and the registry disagree.
+func (c *Collector) installDimensions(d *dimensions) {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(d.requests, d.duration)
+	c.dynamic.Store(reg)
+	c.dims.Store(d)
 }
 
 // guard enforces the per-label cardinality cap, returning either the original
@@ -265,7 +355,13 @@ func (c *Collector) ExportDropped(exporter string) {
 
 // Handler serves the /metrics endpoint in Prometheus exposition format.
 func (c *Collector) Handler() http.Handler {
-	return promhttp.HandlerFor(c.registry, promhttp.HandlerOpts{})
+	// Resolved per scrape rather than captured once: the dynamic registry is
+	// replaced on reload, and a handler built at startup would keep serving
+	// the old label schema forever.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		g := prometheus.Gatherers{c.stable, c.dynamic.Load()}
+		promhttp.HandlerFor(g, promhttp.HandlerOpts{}).ServeHTTP(w, r)
+	})
 }
 
 func statusClass(code int) string {

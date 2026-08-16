@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -676,14 +677,40 @@ func run(configPath, uiDir string) {
 		os.Exit(1)
 	}
 
+	// live tracks the config currently in effect, so a reload can report what
+	// it could not apply. Only the reload closure touches it, and SIGHUP and
+	// POST /api/reload are both serialized through reloadMu.
+	live := cfg
+	var reloadMu sync.Mutex
 	reload := func() error {
+		reloadMu.Lock()
+		defer reloadMu.Unlock()
+
 		newCfg, err := config.Load(configPath)
 		if err != nil {
 			logger.Error("reload rejected: config invalid", "error", err)
 			return err
 		}
-		interceptor.SwapEngine(engine.New(newCfg))
-		logger.Info("configuration reloaded", "rules", len(newCfg.Rules))
+		newEng := engine.New(newCfg)
+		interceptor.SwapEngine(newEng)
+
+		// A new `labels:` key has to become a real Prometheus dimension, which
+		// means rebuilding the vectors — their label sets are immutable. Without
+		// this the label appears in the dashboard but never in /metrics, and a
+		// Grafana panel built on it stays empty with nothing to explain why.
+		relabeled := false
+		if collector != nil {
+			relabeled = collector.SetLabelKeys(newEng.LabelKeys())
+		}
+		// Everything a reload cannot apply is named rather than discarded in
+		// silence, which is how it behaved before.
+		if stale := live.RestartRequired(newCfg); len(stale) > 0 {
+			logger.Warn("reload applied rules only — these changes need a restart",
+				"fields", strings.Join(stale, ", "))
+		}
+		live = newCfg
+		logger.Info("configuration reloaded",
+			"rules", len(newCfg.Rules), "metrics_relabeled", relabeled)
 		return nil
 	}
 

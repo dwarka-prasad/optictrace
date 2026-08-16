@@ -15,6 +15,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/dwarka-prasad/optictrace/internal/admin"
@@ -37,6 +39,8 @@ type Agent struct {
 	dispatcher  *export.Dispatcher
 	logger      *slog.Logger
 	adminSrv    *http.Server
+	// reloadMu serializes Reload against itself; cfg is only touched there.
+	reloadMu sync.Mutex
 }
 
 // AgentOption customizes construction.
@@ -121,14 +125,30 @@ func (a *Agent) Middleware(next http.Handler) http.Handler {
 	return a.interceptor.Wrap(next)
 }
 
-// Reload re-reads optic.yaml and atomically swaps the rule engine.
+// Reload re-reads optic.yaml, atomically swaps the rule engine, and re-points
+// the metrics label schema. Settings that cannot be hot-swapped are reported
+// rather than silently ignored — see Config.RestartRequired.
 func (a *Agent) Reload() error {
+	a.reloadMu.Lock()
+	defer a.reloadMu.Unlock()
+
 	cfg, err := config.Load(a.configPath)
 	if err != nil {
 		return err
 	}
-	a.interceptor.SwapEngine(engine.New(cfg))
-	a.logger.Info("configuration reloaded", "rules", len(cfg.Rules))
+	eng := engine.New(cfg)
+	a.interceptor.SwapEngine(eng)
+	relabeled := false
+	if a.collector != nil {
+		relabeled = a.collector.SetLabelKeys(eng.LabelKeys())
+	}
+	if stale := a.cfg.RestartRequired(cfg); len(stale) > 0 {
+		a.logger.Warn("reload applied rules only — these changes need a restart",
+			"fields", strings.Join(stale, ", "))
+	}
+	a.cfg = cfg
+	a.logger.Info("configuration reloaded",
+		"rules", len(cfg.Rules), "metrics_relabeled", relabeled)
 	return nil
 }
 
