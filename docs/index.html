@@ -420,7 +420,7 @@
     </p>
     <div class="hero-actions">
       <a class="btn btn-primary" href="https://github.com/dwarka-prasad/optictrace">Get started</a>
-      <span class="install"><b>go install</b> github.com/dwarka-prasad/optictrace/cmd/optictrace@latest</span>
+      <span class="install"><b>brew install</b> dwarka-prasad/tap/optictrace</span>
     </div>
 
     <figure class="hero-figure">
@@ -867,6 +867,11 @@ docker compose up --build
 <span class="c"># http://localhost:9095  dashboard · metrics · APIs</span>
 <span class="c"># http://localhost:3000  Grafana</span>
 <span class="c"># http://localhost:9090  Prometheus</span></pre>
+      <p class="prose" style="margin-top:1.4rem;font-size:0.93rem;color:var(--ink-3)">
+        Prefer just the binary? <code>brew install dwarka-prasad/tap/optictrace</code> covers
+        macOS and Linux on Intel and ARM, <code>go install</code> builds from source, and every
+        release ships checksummed, cosign-signed archives with an SBOM.
+      </p>
       <div class="hero-actions" style="margin-top:1.8rem">
         <a class="btn btn-primary" href="https://github.com/dwarka-prasad/optictrace">Read the docs on GitHub</a>
         <a class="btn btn-ghost" href="https://github.com/dwarka-prasad/optictrace/releases">Download a release</a>
