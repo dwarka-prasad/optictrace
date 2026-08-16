@@ -288,3 +288,115 @@ rules:
 		})
 	}
 }
+
+// Rule validation is where the package's stated premise lives: "validation is
+// strict and happens once at load time so the hot path never has to handle
+// malformed input." Every other package is written to trust that.
+func TestRuleValidation(t *testing.T) {
+	rule := func(body string) string {
+		return base + "rules:\n  - name: r\n" + body
+	}
+	for _, tc := range []struct{ name, yaml, want string }{
+		{"no path", rule("    match: {methods: [GET]}\n"), "match.path is required"},
+		{"path without a slash", rule(`    match: {path: "api/**"}` + "\n"), "must start with '/'"},
+		{"unknown method", rule(`    match: {path: "/**", methods: [FETCH]}` + "\n"), "unknown HTTP method"},
+		{"unknown restrict field", rule("    match: {path: \"/**\"}\n    restrict: [cookies]\n"), "unknown field"},
+		{"json field without $.", rule("    match: {path: \"/**\"}\n    redact:\n      json_fields: [\"card.number\"]\n"), "must be a dotted path"},
+		{"json field that is just $.", rule("    match: {path: \"/**\"}\n    redact:\n      json_fields: [\"$.\"]\n"), "must be a dotted path"},
+		{"label source without a kind", rule("    match: {path: \"/**\"}\n    labels: {tenant: \"X-Tenant\"}\n"), "must be 'header:<Name>'"},
+		{"label source with a bad kind", rule("    match: {path: \"/**\"}\n    labels: {tenant: \"cookie:t\"}\n"), "must be 'header:<Name>'"},
+		{"sample above 1", rule("    match: {path: \"/**\"}\n    sample: 1.5\n"), "must be in (0, 1]"},
+		{"sample of zero", rule("    match: {path: \"/**\"}\n    sample: 0.0\n"), "must be in (0, 1]"},
+		{"meter without $.", rule("    match: {path: \"/**\"}\n    meter: {tokens: \"usage.total\"}\n"), "must be a dotted path"},
+		{"unparseable keep_slower_than", rule("    match: {path: \"/**\"}\n    keep_slower_than: \"soon\"\n"), "keep_slower_than"},
+		{"negative keep_slower_than", rule("    match: {path: \"/**\"}\n    keep_slower_than: \"-1s\"\n"), "must be positive"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte(tc.yaml))
+			if err == nil {
+				t.Fatal("expected rejection")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("message %q does not mention %q", err, tc.want)
+			}
+			// The rule's name should be in the message so a large config
+			// points at the offending rule.
+			if !strings.Contains(err.Error(), "rule r") {
+				t.Errorf("message %q does not name the rule", err)
+			}
+		})
+	}
+}
+
+// HTTP methods are normalized at load time so the hot path can compare
+// without folding case on every request.
+func TestMethodsNormalizedAtLoad(t *testing.T) {
+	cfg, err := Parse([]byte(base + "rules:\n  - name: r\n    match: {path: \"/**\", methods: [get, Post]}\n"))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	got := cfg.Rules[0].Match.Methods
+	if len(got) != 2 || got[0] != "GET" || got[1] != "POST" {
+		t.Errorf("methods = %v, want [GET POST]", got)
+	}
+}
+
+func TestExporterValidation(t *testing.T) {
+	exp := func(body string) string { return base + "telemetry:\n  exporters:\n" + body }
+	for _, tc := range []struct{ name, yaml, want string }{
+		{"no name", exp("    - type: file\n      path: /tmp/a\n"), "name is required"},
+		{"duplicate names", exp(
+			"    - {name: a, type: file, path: /tmp/a}\n    - {name: a, type: file, path: /tmp/b}\n"),
+			"duplicate name"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte(tc.yaml))
+			if err == nil {
+				t.Fatal("expected rejection")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("message %q does not mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestScanDetectorValidation(t *testing.T) {
+	det := func(body string) string { return base + "scan:\n  detectors:\n" + body }
+	for _, tc := range []struct{ name, yaml, want string }{
+		{"unknown verifier",
+			det("    - {kind: a, severity: high, pattern: 'x+', verify: sha256}\n"),
+			"not a known checksum"},
+		{"pattern matching everything",
+			det("    - {kind: a, severity: high, pattern: 'x*'}\n"),
+			"matches the empty string"},
+		{"bad severity",
+			det("    - {kind: a, severity: urgent, pattern: 'x+'}\n"),
+			"must be critical"},
+		{"duplicate kinds",
+			det("    - {kind: a, severity: high, pattern: 'x+'}\n    - {kind: a, severity: medium, pattern: 'y+'}\n"),
+			"duplicate kind"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte(tc.yaml))
+			if err == nil {
+				t.Fatal("expected rejection")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("message %q does not mention %q", err, tc.want)
+			}
+		})
+	}
+
+	t.Run("valid detectors compile", func(t *testing.T) {
+		cfg, err := Parse([]byte(det(
+			"    - {kind: aadhaar, severity: high, why: 'DPDP', pattern: '\\d{12}', verify: verhoeff}\n")))
+		if err != nil {
+			t.Fatalf("should be valid: %v", err)
+		}
+		dets, err := cfg.Detectors()
+		if err != nil || len(dets) != 1 {
+			t.Fatalf("Detectors() = %v, %v", dets, err)
+		}
+	})
+}

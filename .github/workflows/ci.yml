@@ -38,9 +38,11 @@ jobs:
       - name: Governance rule assertions
         # Fails the build if a change stops a rule from redacting/restricting.
         run: go run ./cmd/optictrace test -config optic.yaml -tests optic.test.yaml
-      - name: Build Gin SDK
+      - name: Test Gin SDK
         working-directory: sdks/gin
-        run: go build ./... && go vet ./...
+        # Tested, not just built: this module holds the Hijack/Flush/Pusher
+        # adapter surface, which is exactly where a wrapper breaks silently.
+        run: go build ./... && go vet ./... && go test -race ./...
 
   ui:
     runs-on: ubuntu-latest
