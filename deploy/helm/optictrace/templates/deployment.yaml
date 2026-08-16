@@ -25,6 +25,17 @@ spec:
             - /etc/optictrace/optic.yaml
             - -ui
             - /usr/share/optictrace/ui
+          {{- if .Values.auth.enabled }}
+          env:
+            # The token reaches the process as an env var, so it never appears
+            # in the ConfigMap. /healthz stays open by default, which is why
+            # the probes below keep working with auth on.
+            - name: OPTICTRACE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret | default (printf "%s-admin-token" (include "optictrace.fullname" .)) }}
+                  key: {{ .Values.auth.existingSecretKey }}
+          {{- end }}
           ports:
             - name: proxy
               containerPort: {{ .Values.service.proxyPort }}

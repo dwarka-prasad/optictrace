@@ -10,7 +10,15 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 ## [Unreleased]
 
+### Security
+
+- **The admin API is no longer exposed by default.** Three defaults combined into more than the sum of their parts: `admin_listen` bound all interfaces, auth was off, and `Access-Control-Allow-Origin: *` was set *outside* the auth wrapper — so any web page a developer visited could read the entire capture store with one `fetch()`. Now `admin_listen` defaults to `127.0.0.1:9095`, CORS is an explicit allowlist (`telemetry.cors_origins`) that sends no headers at all when empty, and a wildcard origin is rejected at load time unless auth is enabled. The Compose stack publishes its ports on `127.0.0.1` instead of `0.0.0.0`, and the Helm chart enables auth by default with a generated token that survives upgrades. ([#6](https://github.com/dwarka-prasad/optictrace/issues/6))
+
+  **Breaking:** if you relied on reaching the dashboard from another host, set `admin_listen: "0.0.0.0:9095"` explicitly — and set `telemetry.auth` while you're there.
+
 ### Fixed
+
+- **A missing `service.listen` silently bound port 80.** It reached `net/http` as `Addr: ""`, so the proxy either served where nobody expected it or failed with `bind: permission denied` on a port that appears nowhere in the config. `optictrace run` now refuses to start with a message naming the field; `validate` warns rather than errors, since embedded middleware legitimately has no listen address. Listen addresses are also checked for a parseable host:port. ([#15](https://github.com/dwarka-prasad/optictrace/issues/15))
 
 - **`purge` could delete another tenant's data** (SQLite). The label match used `LIKE` without an `ESCAPE` clause, so `%` and `_` in a value stayed live wildcards: purging `acme_1` also destroyed `acmeX1`, and `a%` destroyed every tenant beginning with `a` — while still reporting success. The Postgres driver compares exactly and was never affected, so the two drivers disagreed on the same input. Values are now matched literally, and `TestConformancePurgeIsLiteral` runs the case against **both** drivers so they cannot diverge again. ([#4](https://github.com/dwarka-prasad/optictrace/issues/4))
 

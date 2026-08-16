@@ -136,16 +136,17 @@ func (a *Agent) Reload() error {
 // on a listener you control.
 func (a *Agent) AdminHandler(uiDir string) http.Handler {
 	return (&admin.Server{
-		Logger:     a.logger,
-		Collector:  a.collector,
-		Reader:     a.reader,
-		Writer:     a.writer,
-		Dispatcher: a.dispatcher,
-		ConfigPath: a.configPath,
-		Reload:     a.Reload,
-		UIDir:      uiDir,
-		AuthToken:  a.cfg.Telemetry.Auth.Resolve(),
-		HealthOpen: a.cfg.Telemetry.Auth.HealthOpen(),
+		Logger:      a.logger,
+		Collector:   a.collector,
+		Reader:      a.reader,
+		Writer:      a.writer,
+		Dispatcher:  a.dispatcher,
+		ConfigPath:  a.configPath,
+		Reload:      a.Reload,
+		UIDir:       uiDir,
+		AuthToken:   a.cfg.Telemetry.Auth.Resolve(),
+		HealthOpen:  a.cfg.Telemetry.Auth.HealthOpen(),
+		CORSOrigins: a.cfg.Telemetry.CORSOrigins,
 	}).Handler()
 }
 

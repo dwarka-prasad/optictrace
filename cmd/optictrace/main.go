@@ -583,6 +583,18 @@ func validate(path string) {
 	}
 	fmt.Printf("✓ %s is valid — service %q, %d rule(s), %d custom label(s)\n",
 		path, cfg.Service.Name, len(cfg.Rules), len(engine.New(cfg).LabelKeys()))
+	// Not an error: a config for embedded middleware has neither address. But
+	// having one without the other is almost always an omission, and finding
+	// out at `run` is worse than finding out here.
+	if err := cfg.RequireProxyAddrs(); err != nil &&
+		(cfg.Service.Listen != "" || cfg.Service.Upstream != "") {
+		fmt.Printf("  note: %v — fine for embedded middleware, but `optictrace run` will refuse this\n", err)
+	}
+	if cfg.Telemetry.Auth.Resolve() == "" && cfg.Telemetry.AdminReachable() {
+		fmt.Printf("  note: telemetry.admin_listen %q is reachable beyond loopback and telemetry.auth is not set —\n"+
+			"        anyone who can reach that port can read every captured payload\n",
+			cfg.Telemetry.AdminListen)
+	}
 }
 
 func run(configPath, uiDir string) {
@@ -590,6 +602,13 @@ func run(configPath, uiDir string) {
 
 	cfg, err := config.Load(configPath)
 	if err != nil {
+		logger.Error("invalid configuration", "error", err)
+		os.Exit(1)
+	}
+	// `run` is the only path that opens a listener, so it is where the
+	// sidecar's address requirements are enforced. Without this an omitted
+	// service.listen reaches net/http as Addr:"" and binds port 80.
+	if err := cfg.RequireProxyAddrs(); err != nil {
 		logger.Error("invalid configuration", "error", err)
 		os.Exit(1)
 	}
@@ -669,17 +688,18 @@ func run(configPath, uiDir string) {
 	adminSrv := &http.Server{
 		Addr: cfg.Telemetry.AdminListen,
 		Handler: (&admin.Server{
-			Logger:     logger,
-			Collector:  collector,
-			Reader:     reader,
-			Writer:     writer,
-			Dispatcher: dispatcher,
-			ConfigPath: configPath,
-			Reload:     reload,
-			UIDir:      uiDir,
-			Version:    version,
-			AuthToken:  cfg.Telemetry.Auth.Resolve(),
-			HealthOpen: cfg.Telemetry.Auth.HealthOpen(),
+			Logger:      logger,
+			Collector:   collector,
+			Reader:      reader,
+			Writer:      writer,
+			Dispatcher:  dispatcher,
+			ConfigPath:  configPath,
+			Reload:      reload,
+			UIDir:       uiDir,
+			Version:     version,
+			AuthToken:   cfg.Telemetry.Auth.Resolve(),
+			HealthOpen:  cfg.Telemetry.Auth.HealthOpen(),
+			CORSOrigins: cfg.Telemetry.CORSOrigins,
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -689,8 +709,12 @@ func run(configPath, uiDir string) {
 			"listen", cfg.Telemetry.AdminListen,
 			"auth", cfg.Telemetry.Auth.Resolve() != "",
 			"tls", tlsCfg != nil)
-		if cfg.Telemetry.Auth.Resolve() == "" {
-			logger.Warn("admin server is unauthenticated — do not expose this port publicly",
+		if cfg.Telemetry.Auth.Resolve() == "" && cfg.Telemetry.AdminReachable() {
+			// Loopback-only and unauthenticated is a reasonable local posture,
+			// so only warn when the port actually accepts remote connections.
+			logger.Warn("admin server is reachable beyond loopback WITHOUT authentication — "+
+				"anyone who can reach this port can read every captured payload; "+
+				"set telemetry.auth.token_env",
 				"listen", cfg.Telemetry.AdminListen)
 		}
 		var err error

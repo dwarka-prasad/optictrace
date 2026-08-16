@@ -27,6 +27,19 @@ persistence:
   size: 1Gi
   storageClass: ""
 
+# Admin API authentication. ON by default: the admin port serves the dashboard
+# and every captured payload, and inside a cluster it is reachable by anything
+# that can resolve the Service. Turning this off is a deliberate choice.
+auth:
+  enabled: true
+  # Leave empty to generate a random token on first install. It is preserved
+  # across upgrades, so clients holding it keep working.
+  #   kubectl get secret <release>-optictrace-admin-token -o jsonpath='{.data.token}' | base64 -d
+  token: ""
+  # Bring your own Secret instead (e.g. from an external secrets operator).
+  existingSecret: ""
+  existingSecretKey: token
+
 # Rendered verbatim into the ConfigMap as optic.yaml.
 config:
   version: 1

@@ -5,4 +5,18 @@ metadata:
   labels: {{- include "optictrace.labels" . | nindent 4 }}
 data:
   optic.yaml: |
-{{ toYaml .Values.config | indent 4 }}
+{{- /*
+  The admin API can read every captured payload, so when auth is enabled we
+  inject telemetry.auth.token_env here rather than leaving it to the operator
+  to remember. token_env (not token) keeps the secret out of the ConfigMap —
+  the value arrives via the env var wired up in deployment.yaml.
+
+  An explicit config.telemetry.auth in values.yaml always wins.
+*/ -}}
+{{- $cfg := deepCopy .Values.config }}
+{{- if and .Values.auth.enabled (not (dig "telemetry" "auth" false $cfg)) }}
+{{- $tel := (dig "telemetry" (dict) $cfg) }}
+{{- $_ := set $tel "auth" (dict "token_env" "OPTICTRACE_ADMIN_TOKEN") }}
+{{- $_ := set $cfg "telemetry" $tel }}
+{{- end }}
+{{ toYaml $cfg | indent 4 }}

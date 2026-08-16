@@ -11,8 +11,12 @@ services:
   optictrace:
     build: .
     ports:
-      - "8080:8080"   # proxied traffic
-      - "9095:9095"   # admin: dashboard + /metrics + APIs
+      # Bound to loopback deliberately. Docker's default "9095:9095" publishes
+      # on 0.0.0.0, which would put the dashboard — and every captured payload
+      # behind it — on your LAN. Change to "0.0.0.0:9095:9095" only alongside
+      # telemetry.auth in deploy/compose/optic.yaml.
+      - "127.0.0.1:8080:8080"   # proxied traffic
+      - "127.0.0.1:9095:9095"   # admin: dashboard + /metrics + APIs
     volumes:
       - ./deploy/compose/optic.yaml:/etc/optictrace/optic.yaml:ro
       - optic-data:/data

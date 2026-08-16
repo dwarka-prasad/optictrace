@@ -11,7 +11,13 @@ service:
   upstream: "http://demo-upstream:9000"
 
 telemetry:
-  admin_listen: ":9095"
+  # Inside the container this must bind all interfaces to be reachable at all;
+  # the exposure boundary is the host port publish in docker-compose.yml, which
+  # is pinned to 127.0.0.1. If you republish this on 0.0.0.0, uncomment `auth`
+  # below — the admin API can read every captured payload.
+  admin_listen: "0.0.0.0:9095"
+  # auth:
+  #   token_env: OPTICTRACE_ADMIN_TOKEN
   console_log: true
   metrics:
     enabled: true

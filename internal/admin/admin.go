@@ -51,6 +51,9 @@ type Server struct {
 	// /healthz reachable for orchestrator probes.
 	AuthToken  string
 	HealthOpen bool
+	// CORSOrigins lists browser origins allowed to call the API
+	// cross-origin. Empty means no CORS headers are sent at all.
+	CORSOrigins []string
 
 	startedAt time.Time
 }
@@ -80,7 +83,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/ingest", s.ingest)
 	mux.HandleFunc("/", s.ui)
 
-	return withCORS(s.withAuth(mux))
+	return withCORS(s.CORSOrigins, s.withAuth(mux))
 }
 
 // withAuth gates the control plane behind a bearer token. Comparison is
@@ -118,14 +121,49 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 	})
 }
 
-// withCORS allows the dashboard dev server (next dev on another port) to call
-// the API. The admin listener is trusted-network-only by deployment design.
-func withCORS(next http.Handler) http.Handler {
+// withCORS allows listed browser origins — normally just a dashboard dev
+// server — to call the API cross-origin.
+//
+// This used to send `Access-Control-Allow-Origin: *` unconditionally, outside
+// the auth wrapper. Combined with auth being off by default, that let any page
+// a developer visited read the entire capture store with one fetch(). Now
+// nothing is sent unless an origin is explicitly allowed, so the browser's
+// same-origin policy protects the API even when auth is off. The dashboard
+// itself is served same-origin and needs no CORS at all.
+func withCORS(allowed []string, next http.Handler) http.Handler {
+	if len(allowed) == 0 {
+		return next
+	}
+	wildcard := false
+	set := make(map[string]bool, len(allowed))
+	for _, o := range allowed {
+		if o == "*" {
+			wildcard = true
+		}
+		set[o] = true
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		origin := r.Header.Get("Origin")
+		// Vary regardless of the outcome: the response body differs by origin,
+		// and a cache must not serve one origin's response to another.
+		w.Header().Add("Vary", "Origin")
+		switch {
+		case origin == "":
+			// Not a cross-origin request; no headers needed.
+		case wildcard:
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		case set[origin]:
+			// Echo the specific origin rather than the wildcard, so this stays
+			// correct if credentials are ever added.
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
+		if w.Header().Get("Access-Control-Allow-Origin") != "" {
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		}
 		if r.Method == http.MethodOptions {
+			// A preflight from a disallowed origin gets no CORS headers, which
+			// is what makes the browser block the real request.
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}

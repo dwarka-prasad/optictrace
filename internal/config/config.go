@@ -12,6 +12,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -44,8 +45,20 @@ type Config struct {
 type Telemetry struct {
 	// AdminListen is the address of the admin server (/metrics, dashboard,
 	// query APIs). Kept separate from proxied traffic on purpose: you can
-	// firewall it independently. Default ":9095".
-	AdminListen string        `yaml:"admin_listen"`
+	// firewall it independently.
+	//
+	// Default "127.0.0.1:9095" — loopback, NOT all interfaces. The admin API
+	// can read every captured payload, so exposing it is a deliberate act:
+	// set "0.0.0.0:9095" explicitly (and turn on `auth`) when you mean it.
+	AdminListen string `yaml:"admin_listen"`
+	// CORSOrigins allows listed browser origins to call the admin API
+	// cross-origin — normally just a dashboard dev server, e.g.
+	// "http://localhost:3001". Empty (the default) sends no CORS headers at
+	// all, so the browser same-origin policy protects the API even when auth
+	// is off. "*" is accepted but rejected by Validate unless auth is
+	// enabled, because a wildcard plus no credentials lets any page a
+	// developer visits read the entire capture store.
+	CORSOrigins []string      `yaml:"cors_origins"`
 	ConsoleLog  *bool         `yaml:"console_log"` // structured stdout telemetry (default true)
 	Metrics     Metrics       `yaml:"metrics"`
 	Store       StoreCfg      `yaml:"store"`
@@ -53,6 +66,20 @@ type Telemetry struct {
 	Billing     *Billing      `yaml:"billing"`
 	Auth        *AdminAuth    `yaml:"auth"`
 	TLS         *AdminTLS     `yaml:"tls"`
+}
+
+// AdminReachable reports whether AdminListen accepts connections from beyond
+// loopback. Used to decide how loudly to warn about an unauthenticated port.
+func (t *Telemetry) AdminReachable() bool {
+	host, _, err := net.SplitHostPort(t.AdminListen)
+	if err != nil {
+		return true // unparseable: assume the worst
+	}
+	if host == "" {
+		return true // ":9095" binds every interface
+	}
+	ip := net.ParseIP(host)
+	return ip == nil || !ip.IsLoopback()
 }
 
 // AdminAuth protects the control plane. It is off by default because the
@@ -268,7 +295,9 @@ func Parse(raw []byte) (*Config, error) {
 
 func applyTelemetryDefaults(t *Telemetry) {
 	if t.AdminListen == "" {
-		t.AdminListen = ":9095"
+		// Loopback by default. The admin API can read every captured payload,
+		// so binding all interfaces must be something you asked for.
+		t.AdminListen = "127.0.0.1:9095"
 	}
 	if t.Store.Driver == "" {
 		t.Store.Driver = "sqlite"
@@ -302,6 +331,51 @@ func applyTelemetryDefaults(t *Telemetry) {
 	}
 }
 
+// RequireProxyAddrs enforces the invariants of sidecar mode, where a listener
+// is actually opened. It is separate from Validate because embedded middleware
+// and the analysis subcommands legitimately have neither address.
+//
+// The failure this prevents: an omitted `listen` reaches net/http as Addr:""
+// and binds port 80 — either quietly serving where nobody expects it, or
+// failing with "listen tcp :80: bind: permission denied", a port number that
+// appears nowhere in the user's config and gives them nothing to search for.
+func (c *Config) RequireProxyAddrs() error {
+	if c.Service.Listen == "" {
+		return fmt.Errorf(`service.listen is required to run the proxy ` +
+			`(an empty listen address binds port 80); set e.g. listen: ":8080"`)
+	}
+	if c.Service.Upstream == "" {
+		return fmt.Errorf("service.upstream is required to run the proxy: " +
+			"there is nowhere to forward requests to")
+	}
+	return nil
+}
+
+// validateHostPort rejects addresses net/http would otherwise accept and then
+// bind somewhere surprising. An empty string is Addr:"" — port 80.
+func validateHostPort(field, addr string) error {
+	if addr == "" {
+		return fmt.Errorf("%s must not be empty (an empty address binds port 80)", field)
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%s %q must be host:port, e.g. \":9095\" or \"127.0.0.1:9095\"", field, addr)
+	}
+	if port == "" {
+		return fmt.Errorf("%s %q is missing a port", field, addr)
+	}
+	if _, err := net.LookupPort("tcp", port); err != nil {
+		return fmt.Errorf("%s %q: %q is not a valid port", field, addr, port)
+	}
+	if host != "" && net.ParseIP(host) == nil {
+		// A hostname is legal but almost always a mistake in a listen address.
+		if _, err := net.LookupHost(host); err != nil {
+			return fmt.Errorf("%s %q: host %q does not resolve", field, addr, host)
+		}
+	}
+	return nil
+}
+
 var validMethods = map[string]bool{
 	"GET": true, "POST": true, "PUT": true, "PATCH": true,
 	"DELETE": true, "HEAD": true, "OPTIONS": true, "TRACE": true, "CONNECT": true,
@@ -316,6 +390,36 @@ func (c *Config) Validate() error {
 		u, err := url.Parse(c.Service.Upstream)
 		if err != nil || u.Scheme == "" || u.Host == "" {
 			return fmt.Errorf("service.upstream %q is not a valid absolute URL", c.Service.Upstream)
+		}
+	}
+	// Only the *format* is checked here. Whether a listen address is required
+	// at all depends on how OpticTrace is being used: embedded middleware and
+	// the analysis subcommands never open a listener, and the proxy package's
+	// tests drive the interceptor directly with an upstream but no listener.
+	// The sidecar's hard requirement lives in RequireProxyAddrs, called by
+	// `run`, which is the only path that actually binds a port.
+	if c.Service.Listen != "" {
+		if err := validateHostPort("service.listen", c.Service.Listen); err != nil {
+			return err
+		}
+	}
+	if err := validateHostPort("telemetry.admin_listen", c.Telemetry.AdminListen); err != nil {
+		return err
+	}
+	for _, o := range c.Telemetry.CORSOrigins {
+		if o == "*" {
+			// A wildcard means any page the operator visits can read the
+			// capture store cross-origin. Only defensible when a credential
+			// is also required.
+			if c.Telemetry.Auth.Resolve() == "" {
+				return fmt.Errorf(`telemetry.cors_origins: "*" requires telemetry.auth ` +
+					"(a wildcard origin without a token lets any website read captured traffic)")
+			}
+			continue
+		}
+		u, err := url.Parse(o)
+		if err != nil || u.Scheme == "" || u.Host == "" || u.Path != "" {
+			return fmt.Errorf("telemetry.cors_origins: %q must be a scheme://host[:port] origin", o)
 		}
 	}
 	switch c.Telemetry.Store.Driver {

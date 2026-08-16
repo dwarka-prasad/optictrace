@@ -267,7 +267,8 @@ service:
 
 # ── where telemetry goes ──────────────────────────────────
 telemetry:
-  admin_listen: ":9095"              # dashboard + /metrics + APIs
+  admin_listen: "127.0.0.1:9095"     # dashboard + /metrics + APIs (loopback by default)
+  cors_origins: []                   # browser origins allowed cross-origin; none by default
   console_log: true                  # structured JSON on stdout
   metrics:
     enabled: true
@@ -869,7 +870,9 @@ the agent itself — no separate frontend deployment.
 
 </details>
 
-Develop it with `cd ui && npm run dev` (talks to the agent on `:9095` via CORS).
+Develop it with `cd ui && npm run dev`. The dev server runs on a different port, so
+add its origin to `telemetry.cors_origins` (e.g. `["http://localhost:3001"]`) — the
+agent sends no CORS headers unless an origin is explicitly allowed.
 
 ---
 
