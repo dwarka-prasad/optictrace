@@ -10,6 +10,10 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 ## [Unreleased]
 
+### Fixed
+
+- **`purge` could delete another tenant's data** (SQLite). The label match used `LIKE` without an `ESCAPE` clause, so `%` and `_` in a value stayed live wildcards: purging `acme_1` also destroyed `acmeX1`, and `a%` destroyed every tenant beginning with `a` — while still reporting success. The Postgres driver compares exactly and was never affected, so the two drivers disagreed on the same input. Values are now matched literally, and `TestConformancePurgeIsLiteral` runs the case against **both** drivers so they cannot diverge again. ([#4](https://github.com/dwarka-prasad/optictrace/issues/4))
+
 ### Added
 
 - **Homebrew tap** — `brew install dwarka-prasad/tap/optictrace`, covering macOS and Linux on Intel and ARM. Published as a *formula* rather than a cask: casks are macOS-only, and a cask of an unsigned binary trips Gatekeeper quarantine. `scripts/update-tap.sh` regenerates it from each release's published `checksums.txt`, so the formula's hashes cannot drift from the artifacts users download.

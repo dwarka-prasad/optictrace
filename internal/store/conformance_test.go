@@ -170,6 +170,51 @@ func TestConformance(t *testing.T) {
 	}
 }
 
+// TestConformancePurgeIsLiteral guards the one mistake an erasure tool must
+// never make: deleting a bystander's data. SQLite matches labels with LIKE, so
+// a tenant value containing % or _ used to be interpreted as a wildcard —
+// purging "acme_1" also destroyed "acmeX1", and "a%" destroyed every tenant
+// beginning with "a". Postgres compares exactly and never had the bug, which is
+// exactly why this belongs in the shared suite: the drivers must agree.
+func TestConformancePurgeIsLiteral(t *testing.T) {
+	cases := []struct{ name, target, bystander string }{
+		{"underscore", "acme_1", "acmeX1"},
+		{"percent", "a%", "apex"},
+		{"backslash", `acme\1`, `acme\\1`},
+	}
+	for _, d := range drivers(t) {
+		for _, tc := range cases {
+			t.Run(d.name+"/"+tc.name, func(t *testing.T) {
+				ctx := context.Background()
+				s := d.open(t)
+				for _, tenant := range []string{tc.target, tc.bystander} {
+					if err := s.Save(ctx, confRecord(200, 1, "/api/x", tenant)); err != nil {
+						t.Fatalf("save %q: %v", tenant, err)
+					}
+				}
+				removed, err := s.Purge(ctx, "tenant", tc.target, time.Time{})
+				if err != nil {
+					t.Fatalf("purge: %v", err)
+				}
+				if removed != 1 {
+					t.Errorf("purge %q removed %d rows, want 1", tc.target, removed)
+				}
+				recs, total, err := s.Query(ctx, Filter{})
+				if err != nil {
+					t.Fatalf("query: %v", err)
+				}
+				if total != 1 {
+					t.Fatalf("purging %q left %d rows, want only %q to survive",
+						tc.target, total, tc.bystander)
+				}
+				if got := recs[0].Labels["tenant"]; got != tc.bystander {
+					t.Errorf("survivor is %q, want the bystander %q", got, tc.bystander)
+				}
+			})
+		}
+	}
+}
+
 func TestConformanceStatsAndRetention(t *testing.T) {
 	for _, d := range drivers(t) {
 		t.Run(d.name, func(t *testing.T) {

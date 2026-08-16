@@ -468,9 +468,15 @@ func (s *SQLiteStore) Purge(ctx context.Context, label, value string, before tim
 		return 0, err
 	}
 	// {"tenant":"acme"} -> "tenant":"acme"
-	needle := "%" + strings.TrimSuffix(strings.TrimPrefix(string(pair), "{"), "}") + "%"
+	inner := strings.TrimSuffix(strings.TrimPrefix(string(pair), "{"), "}")
+	// LIKE treats % and _ as wildcards, so a tenant named "acme_1" would also
+	// match "acmeX1" and "a%" would match every tenant beginning with "a" —
+	// deleting a neighbour's data, which is the one mistake this must never
+	// make. Escape them (and the escape character itself) and declare ESCAPE.
+	// Postgres compares exactly and needs none of this.
+	needle := "%" + likeEscape(inner) + "%"
 
-	query := `DELETE FROM logs WHERE labels LIKE ?`
+	query := `DELETE FROM logs WHERE labels LIKE ? ESCAPE '\'`
 	args := []any{needle}
 	if !before.IsZero() {
 		query += ` AND ts < ?`
@@ -481,6 +487,14 @@ func (s *SQLiteStore) Purge(ctx context.Context, label, value string, before tim
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// likeEscape neutralizes LIKE metacharacters so a value is matched literally.
+// The backslash must be escaped first, or it would double-escape the escapes
+// added afterwards.
+func likeEscape(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
 }
 
 func (s *SQLiteStore) Close() error { return s.db.Close() }
