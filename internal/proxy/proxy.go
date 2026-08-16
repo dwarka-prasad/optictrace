@@ -17,11 +17,13 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -130,16 +132,67 @@ func (ic *Interceptor) Wrap(next http.Handler) http.Handler {
 		// Meters need response bytes even when body *storage* is restricted
 		// or sampled out — the buffer is then used for extraction only.
 		rw := &recordingWriter{ResponseWriter: w, status: http.StatusOK}
+		if ic.collector != nil {
+			rw.onStream = ic.collector.StreamOpened
+		}
 		if (buffer && policy.CaptureResponseBody) || len(policy.Meters) > 0 {
 			rw.buf = &limitedBuffer{limit: policy.CaptureLimitBytes}
 		}
 
 		next.ServeHTTP(rw, r)
+		if rw.streamNoted {
+			ic.collector.StreamClosed()
+		}
 
 		elapsed := time.Since(start)
+		if rw.hijacked && !rw.wroteHeader && isUpgrade(r) {
+			// ReverseProxy writes the 101 straight to the hijacked connection,
+			// so WriteHeader is never called on this wrapper. Record what
+			// actually happened rather than the 200 we initialised with.
+			rw.status = http.StatusSwitchingProtocols
+		}
 		keep := policy.KeepBody(drew, rw.status, elapsed)
 		ic.emit(r, rw, reqBuf, &policy, keep, elapsed)
 	})
+}
+
+// streamMinDuration is how long a repeatedly-flushed response must last before
+// it counts as a stream rather than a slow one. SSE is recognised by content
+// type regardless; this catches chunked streaming that does not announce
+// itself. A second or more of incremental flushing is not a request/response
+// exchange in any useful sense.
+const streamMinDuration = time.Second
+
+// isStream reports whether this exchange was a long-lived stream rather than a
+// request/response pair. The distinction matters because a 10-minute SSE
+// connection would otherwise land in the latency histogram as a single
+// 600,000 ms observation and make the route's p95 meaningless.
+func isStream(rw *recordingWriter, elapsed time.Duration) bool {
+	if rw.hijacked {
+		// A protocol upgrade (WebSocket) is a connection, not an exchange.
+		// Its "duration" is however long the client stayed connected.
+		return true
+	}
+	if isEventStream(rw.Header().Get("Content-Type")) {
+		return true // definitive: SSE
+	}
+	return rw.flushes >= 2 && elapsed >= streamMinDuration
+}
+
+// isEventStream matches the SSE content type, ignoring any parameters.
+func isEventStream(ct string) bool {
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	return strings.EqualFold(strings.TrimSpace(ct), "text/event-stream")
+}
+
+// isUpgrade reports whether the client asked to switch protocols.
+func isUpgrade(r *http.Request) bool {
+	if !strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") {
+		return false
+	}
+	return r.Header.Get("Upgrade") != ""
 }
 
 // emit builds the canonical record and fans it out to the sinks. keep is the
@@ -149,6 +202,8 @@ func (ic *Interceptor) emit(r *http.Request, rw *recordingWriter, reqBuf *limite
 	if route == "" {
 		route = engine.NormalizeRoute(r.URL.Path)
 	}
+
+	stream := isStream(rw, elapsed)
 
 	rec := &store.Record{
 		Time:         time.Now(),
@@ -163,6 +218,7 @@ func (ic *Interceptor) emit(r *http.Request, rw *recordingWriter, reqBuf *limite
 		ReqBytes:     requestSize(r, reqBuf),
 		RespBytes:    rw.written,
 		MatchedRules: p.MatchedRules,
+		Stream:       stream,
 	}
 
 	if p.CaptureHeaders {
@@ -194,7 +250,7 @@ func (ic *Interceptor) emit(r *http.Request, rw *recordingWriter, reqBuf *limite
 		ic.collector.Observe(metrics.Observation{
 			Method: rec.Method, Route: rec.Route, Status: rec.Status,
 			Duration: elapsed, ReqBytes: rec.ReqBytes, RespBytes: rec.RespBytes,
-			Labels: rec.Labels,
+			Labels: rec.Labels, Stream: stream,
 		})
 	}
 	if ic.writer != nil {
@@ -328,12 +384,30 @@ type recordingWriter struct {
 	written     int64
 	wroteHeader bool
 	buf         *limitedBuffer // nil when response capture is restricted
+	// flushes counts explicit Flush calls. A handler that flushes repeatedly
+	// is streaming, which is how SSE-by-any-content-type is recognised.
+	flushes int
+	// hijacked records that the connection was taken over (a protocol
+	// upgrade). Nothing after that point is observable through this writer.
+	hijacked bool
+	// onStream fires once, when the response headers identify a stream.
+	onStream    func()
+	streamNoted bool
 }
 
 func (w *recordingWriter) WriteHeader(code int) {
 	if !w.wroteHeader {
 		w.status = code
 		w.wroteHeader = true
+		// SSE announces itself in the response headers, so a stream can be
+		// counted while it is open rather than only once it ends — which for
+		// a long-lived connection is the difference between seeing it and
+		// not. Streams that never set the content type are still classified
+		// at the end, they just don't move the live gauge.
+		if w.onStream != nil && isEventStream(w.Header().Get("Content-Type")) {
+			w.streamNoted = true
+			w.onStream()
+		}
 	}
 	w.ResponseWriter.WriteHeader(code)
 }
@@ -352,7 +426,41 @@ func (w *recordingWriter) Write(p []byte) (int, error) {
 
 // Flush passes through so streaming upstreams (SSE, chunked) keep working.
 func (w *recordingWriter) Flush() {
+	w.flushes++
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
 }
+
+// Hijack surrenders the connection, which is how protocol upgrades
+// (WebSocket) work.
+//
+// Without this method the wrapper is not an http.Hijacker, and because it
+// embeds ResponseWriter as an *interface* it does not promote one either.
+// httputil.ReverseProxy's upgrade path asks http.NewResponseController for
+// the raw connection, gets ErrNotSupported, and hands the request to the
+// error handler — which turned every WebSocket upgrade into a 502. The
+// upgrade was not passing through uninspected, as the docs claimed; it was
+// failing outright.
+//
+// Once hijacked, bytes flow directly between client and upstream and are
+// invisible to us. That is the correct trade: the alternative is buffering a
+// long-lived bidirectional stream in memory. We record the exchange up to the
+// upgrade and stop there.
+func (w *recordingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, http.ErrNotSupported
+	}
+	conn, brw, err := h.Hijack()
+	if err == nil {
+		w.hijacked = true
+	}
+	return conn, brw, err
+}
+
+// Unwrap exposes the wrapped writer to http.ResponseController, so controller
+// methods this type does not implement explicitly — SetReadDeadline,
+// SetWriteDeadline, and anything added in future Go releases — keep working
+// through the wrapper instead of silently returning ErrNotSupported.
+func (w *recordingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }

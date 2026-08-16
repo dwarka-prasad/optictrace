@@ -21,6 +21,9 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+
 	"github.com/dwarka-prasad/optictrace/internal/admin"
 	"github.com/dwarka-prasad/optictrace/internal/config"
 	"github.com/dwarka-prasad/optictrace/internal/engine"
@@ -729,13 +732,24 @@ func run(configPath, uiDir string) {
 		}
 	}()
 
+	proxyHandler := handler
+	if cfg.Service.HTTP2 {
+		// Cleartext HTTP/2. Without this the listener is HTTP/1.1-only, so an
+		// h2c client cannot complete a handshake — which is why gRPC could
+		// not traverse the sidecar at all, rather than merely being
+		// unparsed. HTTP/1.1 clients are unaffected: h2c.NewHandler only
+		// takes over on the HTTP/2 preface or an `Upgrade: h2c`, so
+		// WebSocket upgrades still reach the handler below.
+		proxyHandler = h2c.NewHandler(handler, &http2.Server{})
+	}
 	proxySrv := &http.Server{
 		Addr:              cfg.Service.Listen,
-		Handler:           handler,
+		Handler:           proxyHandler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
 		logger.Info("optictrace listening",
+			"h2c", cfg.Service.HTTP2,
 			"service", cfg.Service.Name,
 			"listen", cfg.Service.Listen,
 			"upstream", cfg.Service.Upstream,

@@ -10,6 +10,11 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 ## [Unreleased]
 
+### Added
+
+- **Cleartext HTTP/2 (h2c)** behind `service.http2: true`. Off by default: it changes protocol negotiation for every client. This is what an HTTP/2 client needs to connect at all — it is *not* gRPC support, and the docs now say so plainly rather than describing gRPC as merely "not specifically supported". ([#11](https://github.com/dwarka-prasad/optictrace/issues/11))
+- **Streams are measured separately from requests.** `optictrace_stream_duration_seconds` (1s–4.5h buckets), `optictrace_streams_total` and `optictrace_streams_open` cover SSE, chunked responses and upgraded connections. Their durations no longer enter `optictrace_request_duration_seconds` or the dashboard's route percentiles, where a single 10-minute SSE connection used to define a route's p95 for the whole window. Records carry a `stream` flag; existing databases are migrated in place. ([#12](https://github.com/dwarka-prasad/optictrace/issues/12))
+
 ### Security
 
 - **The admin API is no longer exposed by default.** Three defaults combined into more than the sum of their parts: `admin_listen` bound all interfaces, auth was off, and `Access-Control-Allow-Origin: *` was set *outside* the auth wrapper — so any web page a developer visited could read the entire capture store with one `fetch()`. Now `admin_listen` defaults to `127.0.0.1:9095`, CORS is an explicit allowlist (`telemetry.cors_origins`) that sends no headers at all when empty, and a wildcard origin is rejected at load time unless auth is enabled. The Compose stack publishes its ports on `127.0.0.1` instead of `0.0.0.0`, and the Helm chart enables auth by default with a generated token that survives upgrades. ([#6](https://github.com/dwarka-prasad/optictrace/issues/6))
@@ -17,6 +22,8 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
   **Breaking:** if you relied on reaching the dashboard from another host, set `admin_listen: "0.0.0.0:9095"` explicitly — and set `telemetry.auth` while you're there.
 
 ### Fixed
+
+- **WebSocket upgrades returned 502 instead of passing through.** `recordingWriter` embeds `http.ResponseWriter` as an interface, so it promoted neither `Hijack` nor `Unwrap`; `httputil.ReverseProxy` could not take the connection and handed the request to the error handler. The docs described this as passing through uninspected — it was failing outright. It now implements both, so upgrades work and `http.ResponseController` methods reach the underlying writer. ([#5](https://github.com/dwarka-prasad/optictrace/issues/5))
 
 - **A missing `service.listen` silently bound port 80.** It reached `net/http` as `Addr: ""`, so the proxy either served where nobody expected it or failed with `bind: permission denied` on a port that appears nowhere in the config. `optictrace run` now refuses to start with a message naming the field; `validate` warns rather than errors, since embedded middleware legitimately has no listen address. Listen addresses are also checked for a parseable host:port. ([#15](https://github.com/dwarka-prasad/optictrace/issues/15))
 
@@ -108,7 +115,7 @@ Measured with `make bench` (12th Gen Intel i5-1235U, Go 1.25):
 
 - ClickHouse is not implemented; `sqlite`, `postgres` and `none` are the available store drivers.
 - The AI mock path (`optictrace mock -ai`) is implemented but has not been exercised against the live Anthropic API.
-- Hijacked connections (WebSockets) pass through uninspected by nature; gRPC and GraphQL are not specifically supported.
+- Hijacked connections (WebSockets) pass through; once upgraded the bytes are not inspected. gRPC needs `service.http2` and is still not parseable without descriptors.
 - Control-plane authentication is available but **off by default**.
 - Homebrew publishing is configured but disabled until a `homebrew-tap` repository exists.
 

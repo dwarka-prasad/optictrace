@@ -492,7 +492,10 @@ for a complete workflow. This repo dogfoods it in
 | Express / FastAPI / Gin SDKs | ✅ | Express and FastAPI carry semantically identical engine ports, so redaction happens in-process |
 | Docker / Compose / Helm | ✅ | Multi-stage non-root image; Compose stack with Prometheus; chart with probes, optional PVC and ServiceMonitor |
 | Admin-port authentication | ✅ | Optional bearer token (constant-time, `token_env`) + TLS. **Off by default** — enable it whenever the port could be reachable |
-| gRPC / GraphQL / WebSockets | ⬜ | JSON over HTTP is the supported surface; hijacked connections pass through uninspected |
+| WebSockets | ✅ | Upgrades pass through; the exchange is recorded as a `101`, and the connection itself is not inspected |
+| HTTP/2 (h2c) | ✅ | Opt-in via `service.http2: true` |
+| gRPC | ⬜ | Needs `service.http2`, and even then bodies are length-prefixed protobuf — without descriptors there is nothing to redact or meter. Use the SDK middleware |
+| GraphQL | ◐ | Bodies are JSON and fully governed; every operation shares one route, so per-operation rules and metrics need `graphql_operation` matching |
 
 ---
 
@@ -964,7 +967,13 @@ Documented so nobody discovers them the hard way:
 
 - Rule match counts use a `LIKE` scan over stored JSON — fine at the default 100k-row retention, worth an indexed join table beyond that.
 - The AI mock path is implemented but has never run against the live Anthropic API.
-- Hijacked connections (WebSockets) pass through uninspected by nature.
+- Hijacked connections (WebSockets) pass through; once upgraded, the bytes are
+  between client and upstream, so the record covers the exchange up to the `101`.
+  Their duration is a connection lifetime, so they are marked as streams and kept
+  out of latency percentiles.
+- Streaming responses (SSE, chunked) reach the client as they are produced, but
+  telemetry is emitted when the stream closes — a long-lived stream is invisible
+  until then, apart from `optictrace_streams_open`.
 - Admin authentication is available but **off by default**; enable `telemetry.auth` if the port is reachable.
 
 ---

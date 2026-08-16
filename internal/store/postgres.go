@@ -46,8 +46,11 @@ CREATE TABLE IF NOT EXISTS logs (
 	resp_bytes    BIGINT NOT NULL DEFAULT 0,
 	labels        JSONB NOT NULL DEFAULT '{}'::jsonb,
 	matched_rules JSONB NOT NULL DEFAULT '[]'::jsonb,
-	meters        JSONB NOT NULL DEFAULT '{}'::jsonb
+	meters        JSONB NOT NULL DEFAULT '{}'::jsonb,
+	stream        BOOLEAN NOT NULL DEFAULT false
 );
+-- Added after the initial release; harmless when the column already exists.
+ALTER TABLE logs ADD COLUMN IF NOT EXISTS stream BOOLEAN NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS idx_logs_ts      ON logs(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_logs_status  ON logs(status);
 CREATE INDEX IF NOT EXISTS idx_logs_route   ON logs(route, method);
@@ -86,21 +89,22 @@ func (s *PostgresStore) Save(ctx context.Context, r *Record) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO logs (ts, service, method, path, query, route, status, duration_ms,
 			remote, source, req_headers, resp_headers, req_body, resp_body,
-			req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
+			req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters, stream)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
 		r.Time.UnixMilli(), r.Service, r.Method, r.Path, r.Query, r.Route, r.Status,
 		r.DurationMS, r.Remote, r.Source,
 		jsonbOr(r.RequestHeaders, "{}"), jsonbOr(r.ResponseHeaders, "{}"),
 		r.RequestBody, r.ResponseBody, r.ReqTruncated, r.RespTruncated,
 		r.ReqBytes, r.RespBytes,
 		jsonbOr(r.Labels, "{}"), jsonbOr(r.MatchedRules, "[]"), jsonbOr(r.Meters, "{}"),
+		r.Stream,
 	)
 	return err
 }
 
 const pgColumns = `id, ts, service, method, path, query, route, status, duration_ms,
 	remote, source, req_headers, resp_headers, req_body, resp_body,
-	req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters`
+	req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters, stream`
 
 func (s *PostgresStore) Query(ctx context.Context, f Filter) ([]Record, int64, error) {
 	where, args := pgBuildWhere(f)
@@ -154,9 +158,9 @@ func (s *PostgresStore) Stats(ctx context.Context, since time.Time, bucket time.
 	// percentile_cont does in one query what SQLite needs three OFFSET scans
 	// for — the main reason this driver exists at scale.
 	err = s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_ms), 0),
-		        COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms), 0),
-		        COALESCE(percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_ms), 0)
+		`SELECT COALESCE(percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE NOT stream), 0),
+		        COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE NOT stream), 0),
+		        COALESCE(percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE NOT stream), 0)
 		 FROM logs WHERE ts >= $1`, sinceMs).
 		Scan(&st.P50LatencyMS, &st.P95LatencyMS, &st.P99LatencyMS)
 	if err != nil {
@@ -207,7 +211,7 @@ func (s *PostgresStore) Stats(ctx context.Context, since time.Time, bucket time.
 		`SELECT route, method, COUNT(*) c,
 		        COALESCE(SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END), 0),
 		        COALESCE(AVG(duration_ms), 0),
-		        COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms), 0)
+		        COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE NOT stream), 0)
 		 FROM logs WHERE ts >= $1 GROUP BY route, method ORDER BY c DESC LIMIT 10`, sinceMs)
 	if err != nil {
 		return nil, err
@@ -229,9 +233,9 @@ func (s *PostgresStore) RouteStats(ctx context.Context, since time.Time) ([]Rout
 		        COALESCE(SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END), 0),
 		        COALESCE(AVG(duration_ms), 0),
 		        COALESCE(SUM(req_bytes), 0), COALESCE(SUM(resp_bytes), 0),
-		        COALESCE(percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_ms), 0),
-		        COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms), 0),
-		        COALESCE(percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_ms), 0)
+		        COALESCE(percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE NOT stream), 0),
+		        COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE NOT stream), 0),
+		        COALESCE(percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE NOT stream), 0)
 		 FROM logs WHERE ts >= $1 GROUP BY route, method ORDER BY c DESC LIMIT 200`,
 		since.UnixMilli())
 	if err != nil {
@@ -274,7 +278,7 @@ func (s *PostgresStore) ServiceStats(ctx context.Context, since time.Time) ([]Se
 		        COUNT(DISTINCT route),
 		        string_agg(DISTINCT source, ', '),
 		        MAX(ts),
-		        COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms), 0)
+		        COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE NOT stream), 0)
 		 FROM logs WHERE ts >= $1 GROUP BY svc ORDER BY 2 DESC`, since.UnixMilli())
 	if err != nil {
 		return nil, err
@@ -473,7 +477,7 @@ func pgScan(row scannable) (*Record, error) {
 	err := row.Scan(&r.ID, &ts, &r.Service, &r.Method, &r.Path, &r.Query, &r.Route,
 		&r.Status, &r.DurationMS, &r.Remote, &r.Source, &reqH, &respH,
 		&r.RequestBody, &r.ResponseBody, &r.ReqTruncated, &r.RespTruncated,
-		&r.ReqBytes, &r.RespBytes, &labels, &rules, &meters)
+		&r.ReqBytes, &r.RespBytes, &labels, &rules, &meters, &r.Stream)
 	if err != nil {
 		return nil, err
 	}

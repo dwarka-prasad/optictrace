@@ -27,6 +27,11 @@ type Record struct {
 	DurationMS float64 `json:"duration_ms"`
 	Remote     string  `json:"remote"`
 	Source     string  `json:"source"` // "proxy" or an SDK name
+	// Stream marks a long-lived streaming response (SSE or chunked). Its
+	// DurationMS is a connection lifetime, not a latency, so percentile
+	// aggregations exclude it — one 10-minute stream would otherwise define
+	// a route's p95 for the whole window.
+	Stream bool `json:"stream,omitempty"`
 
 	RequestHeaders  map[string]string `json:"request_headers,omitempty"`
 	ResponseHeaders map[string]string `json:"response_headers,omitempty"`

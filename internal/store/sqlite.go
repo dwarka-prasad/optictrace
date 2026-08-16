@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS logs (
 	resp_bytes    INTEGER NOT NULL DEFAULT 0,
 	labels        TEXT NOT NULL DEFAULT '',
 	matched_rules TEXT NOT NULL DEFAULT '',
-	meters        TEXT NOT NULL DEFAULT ''
+	meters        TEXT NOT NULL DEFAULT '',
+	stream        INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_logs_ts     ON logs(ts);
 CREATE INDEX IF NOT EXISTS idx_logs_status ON logs(status);
@@ -59,13 +60,19 @@ func NewSQLite(dsn string) (*SQLiteStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
-	// Migration for databases created before the meters column existed;
-	// "duplicate column" from up-to-date schemas is expected and ignored.
-	for _, col := range []string{"meters", "query"} {
-		_, err := db.Exec(`ALTER TABLE logs ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`)
+	// Migrations for databases created before a column existed. CREATE TABLE
+	// IF NOT EXISTS is a no-op on an existing table, so new columns have to be
+	// added explicitly. "duplicate column" from up-to-date schemas is expected
+	// and ignored. Order matters only in that it is append-only.
+	for _, m := range []struct{ col, decl string }{
+		{"meters", `TEXT NOT NULL DEFAULT ''`},
+		{"query", `TEXT NOT NULL DEFAULT ''`},
+		{"stream", `INTEGER NOT NULL DEFAULT 0`},
+	} {
+		_, err := db.Exec(`ALTER TABLE logs ADD COLUMN ` + m.col + ` ` + m.decl)
 		if err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
-			return nil, fmt.Errorf("migrate schema (%s): %w", col, err)
+			return nil, fmt.Errorf("migrate schema (%s): %w", m.col, err)
 		}
 	}
 	return &SQLiteStore{db: db}, nil
@@ -75,8 +82,8 @@ func (s *SQLiteStore) Save(ctx context.Context, r *Record) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO logs (ts, service, method, path, query, route, status, duration_ms,
 			remote, source, req_headers, resp_headers, req_body, resp_body,
-			req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters, stream)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.Time.UnixMilli(), r.Service, r.Method, r.Path, r.Query, r.Route, r.Status,
 		r.DurationMS,
 		r.Remote, r.Source,
@@ -85,6 +92,7 @@ func (s *SQLiteStore) Save(ctx context.Context, r *Record) error {
 		boolInt(r.ReqTruncated), boolInt(r.RespTruncated),
 		r.ReqBytes, r.RespBytes,
 		mustJSON(r.Labels), mustJSON(r.MatchedRules), mustJSON(r.Meters),
+		boolInt(r.Stream),
 	)
 	return err
 }
@@ -103,7 +111,7 @@ func (s *SQLiteStore) Query(ctx context.Context, f Filter) ([]Record, int64, err
 	}
 	q := "SELECT id, ts, service, method, path, query, route, status, duration_ms, remote, source, " +
 		"req_headers, resp_headers, req_body, resp_body, req_trunc, resp_trunc, " +
-		"req_bytes, resp_bytes, labels, matched_rules, meters FROM logs" + where +
+		"req_bytes, resp_bytes, labels, matched_rules, meters, stream FROM logs" + where +
 		" ORDER BY id DESC LIMIT ? OFFSET ?"
 	rows, err := s.db.QueryContext(ctx, q, append(args, limit, f.Offset)...)
 	if err != nil {
@@ -125,7 +133,7 @@ func (s *SQLiteStore) Query(ctx context.Context, f Filter) ([]Record, int64, err
 func (s *SQLiteStore) Get(ctx context.Context, id int64) (*Record, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, ts, service, method, path, query, route,
 		status, duration_ms, remote, source, req_headers, resp_headers, req_body,
-		resp_body, req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters
+		resp_body, req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters, stream
 		FROM logs WHERE id = ?`, id)
 	return scanRecord(row)
 }
@@ -155,7 +163,7 @@ func (s *SQLiteStore) Stats(ctx context.Context, since time.Time, bucket time.Du
 			offset = st.Total - 1
 		}
 		err := s.db.QueryRowContext(ctx,
-			`SELECT duration_ms FROM logs WHERE ts >= ? ORDER BY duration_ms LIMIT 1 OFFSET ?`,
+			`SELECT duration_ms FROM logs WHERE ts >= ? AND stream = 0 ORDER BY duration_ms LIMIT 1 OFFSET ?`,
 			sinceMs, offset).Scan(pc.dst)
 		if err != nil && err != sql.ErrNoRows {
 			return nil, err
@@ -227,7 +235,7 @@ func (s *SQLiteStore) Stats(ctx context.Context, since time.Time, bucket time.Du
 			offset = rs.Count - 1
 		}
 		err := s.db.QueryRowContext(ctx,
-			`SELECT duration_ms FROM logs WHERE ts >= ? AND route = ? AND method = ?
+			`SELECT duration_ms FROM logs WHERE ts >= ? AND route = ? AND method = ? AND stream = 0
 			 ORDER BY duration_ms LIMIT 1 OFFSET ?`,
 			sinceMs, rs.Route, rs.Method, offset).Scan(&rs.P95Latency)
 		if err != nil && err != sql.ErrNoRows {
@@ -274,7 +282,7 @@ func (s *SQLiteStore) RouteStats(ctx context.Context, since time.Time) ([]RouteD
 				offset = rd.Count - 1
 			}
 			err := s.db.QueryRowContext(ctx,
-				`SELECT duration_ms FROM logs WHERE ts >= ? AND route = ? AND method = ?
+				`SELECT duration_ms FROM logs WHERE ts >= ? AND route = ? AND method = ? AND stream = 0
 				 ORDER BY duration_ms LIMIT 1 OFFSET ?`,
 				sinceMs, rd.Route, rd.Method, offset).Scan(pc.dst)
 			if err != nil && err != sql.ErrNoRows {
@@ -309,7 +317,7 @@ func (s *SQLiteStore) Recent(ctx context.Context, since time.Time, limit int) ([
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, ts, service, method, path, query, route, status, duration_ms, remote, source,
 		        req_headers, resp_headers, req_body, resp_body, req_trunc, resp_trunc,
-		        req_bytes, resp_bytes, labels, matched_rules, meters
+		        req_bytes, resp_bytes, labels, matched_rules, meters, stream
 		 FROM logs WHERE ts >= ? ORDER BY id DESC LIMIT ?`, since.UnixMilli(), limit)
 	if err != nil {
 		return nil, err
@@ -539,16 +547,17 @@ func scanRecord(row scannable) (*Record, error) {
 	var r Record
 	var ts int64
 	var reqH, respH, labels, rules, meters string
-	var reqT, respT int
+	var reqT, respT, stream int
 	err := row.Scan(&r.ID, &ts, &r.Service, &r.Method, &r.Path, &r.Query, &r.Route,
 		&r.Status, &r.DurationMS, &r.Remote, &r.Source, &reqH, &respH,
 		&r.RequestBody, &r.ResponseBody, &reqT, &respT,
-		&r.ReqBytes, &r.RespBytes, &labels, &rules, &meters)
+		&r.ReqBytes, &r.RespBytes, &labels, &rules, &meters, &stream)
 	if err != nil {
 		return nil, err
 	}
 	r.Time = time.UnixMilli(ts)
 	r.ReqTruncated, r.RespTruncated = reqT != 0, respT != 0
+	r.Stream = stream != 0
 	fromJSON(reqH, &r.RequestHeaders)
 	fromJSON(respH, &r.ResponseHeaders)
 	fromJSON(labels, &r.Labels)

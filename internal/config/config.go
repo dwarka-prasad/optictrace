@@ -206,6 +206,16 @@ type Service struct {
 	Name     string `yaml:"name"`
 	Listen   string `yaml:"listen"`
 	Upstream string `yaml:"upstream"`
+	// HTTP2 serves cleartext HTTP/2 (h2c) on the proxy listener in addition
+	// to HTTP/1.1. Off by default: it changes protocol negotiation for every
+	// client, and HTTP/1.1 is what most upstreams speak.
+	//
+	// This is what an HTTP/2 client needs in order to connect at all — but it
+	// is NOT gRPC support. gRPC bodies are length-prefixed protobuf frames,
+	// so without message descriptors the governance engine cannot match
+	// fields, redact them, or meter them; you would get method names and byte
+	// counts. Use the SDK middleware for gRPC services.
+	HTTP2 bool `yaml:"http2"`
 }
 
 // Defaults holds the global capture posture applied before any rule.

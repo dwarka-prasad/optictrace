@@ -33,6 +33,11 @@ type Observation struct {
 	ReqBytes  int64
 	RespBytes int64
 	Labels    map[string]string // values for the custom label schema
+	// Stream marks a long-lived response (SSE, chunked streaming) rather
+	// than a request/response exchange. Its duration is recorded on a
+	// separate histogram: a 10-minute stream observed as a 600s request
+	// makes the route's p95 meaningless for the whole window.
+	Stream bool
 }
 
 // OverLimit replaces a custom label's value once that label has already
@@ -56,9 +61,14 @@ type Collector struct {
 	duration *prometheus.HistogramVec
 	reqSize  *prometheus.HistogramVec
 	respSize *prometheus.HistogramVec
-	inflight prometheus.Gauge
-	dropped  prometheus.Counter
-	ingested prometheus.Counter
+	// Streams are measured separately from requests — different phenomenon,
+	// different useful bucket range.
+	streams        *prometheus.CounterVec
+	streamDuration *prometheus.HistogramVec
+	streamsOpen    prometheus.Gauge
+	inflight       prometheus.Gauge
+	dropped        prometheus.Counter
+	ingested       prometheus.Counter
 
 	exported     *prometheus.CounterVec
 	exportFailed *prometheus.CounterVec
@@ -102,6 +112,22 @@ func New(service string, buckets []float64, customKeys []string, maxLabelValues 
 			Name: "optictrace_response_size_bytes", Help: "Response body size.",
 			Buckets: sizeBuckets, ConstLabels: constLabels,
 		}, []string{"method", "route"}),
+		streams: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "optictrace_streams_total", Help: "Long-lived streaming responses observed (SSE or chunked).",
+			ConstLabels: constLabels,
+		}, []string{"method", "route"}),
+		streamDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "optictrace_stream_duration_seconds",
+			Help: "How long streaming responses stayed open. Separate from request latency on purpose.",
+			// 1s .. ~4.5h: streams live on a different timescale than requests,
+			// so the request buckets (1ms..10s) would put every stream in +Inf.
+			Buckets:     prometheus.ExponentialBuckets(1, 2, 15),
+			ConstLabels: constLabels,
+		}, []string{"method", "route"}),
+		streamsOpen: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "optictrace_streams_open", Help: "Streaming responses currently open.",
+			ConstLabels: constLabels,
+		}),
 		inflight: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "optictrace_inflight_requests", Help: "Requests currently being proxied.",
 			ConstLabels: constLabels,
@@ -139,6 +165,7 @@ func New(service string, buckets []float64, customKeys []string, maxLabelValues 
 	}
 	reg.MustRegister(
 		c.requests, c.duration, c.reqSize, c.respSize,
+		c.streams, c.streamDuration, c.streamsOpen,
 		c.inflight, c.dropped, c.ingested,
 		c.exported, c.exportFailed, c.exportDrops,
 		c.labelCapped, c.labelDistinct,
@@ -164,7 +191,15 @@ func (c *Collector) Observe(o Observation) {
 	}
 
 	c.requests.WithLabelValues(counterVals...).Inc()
-	c.duration.WithLabelValues(durationVals...).Observe(o.Duration.Seconds())
+	if o.Stream {
+		// Deliberately NOT on c.duration. A stream's lifetime is not request
+		// latency, and mixing them lets one long connection swamp a route's
+		// percentiles for the whole window.
+		c.streams.WithLabelValues(o.Method, o.Route).Inc()
+		c.streamDuration.WithLabelValues(o.Method, o.Route).Observe(o.Duration.Seconds())
+	} else {
+		c.duration.WithLabelValues(durationVals...).Observe(o.Duration.Seconds())
+	}
 	if o.ReqBytes > 0 {
 		c.reqSize.WithLabelValues(o.Method, o.Route).Observe(float64(o.ReqBytes))
 	}
@@ -205,6 +240,11 @@ func (c *Collector) guard(key, value string) string {
 // InflightInc/Dec bracket a proxied request.
 func (c *Collector) InflightInc() { c.inflight.Inc() }
 func (c *Collector) InflightDec() { c.inflight.Dec() }
+
+// StreamOpened/Closed bracket a streaming response, so a live SSE connection
+// is visible while it is open rather than only once it ends.
+func (c *Collector) StreamOpened() { c.streamsOpen.Inc() }
+func (c *Collector) StreamClosed() { c.streamsOpen.Dec() }
 
 // StoreDropped counts a telemetry record lost to backpressure.
 func (c *Collector) StoreDropped() { c.dropped.Inc() }
