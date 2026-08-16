@@ -77,9 +77,12 @@ func New(configPath string, opts ...AgentOption) (*Agent, error) {
 	if cfg.Telemetry.Store.Driver != "none" {
 		var sqlStore store.LogStore
 		var err error
-		if cfg.Telemetry.Store.Driver == "postgres" {
+		switch cfg.Telemetry.Store.Driver {
+		case "postgres":
 			sqlStore, err = store.NewPostgres(cfg.Telemetry.Store.DSN)
-		} else {
+		case "clickhouse":
+			sqlStore, err = store.NewClickHouse(cfg.Telemetry.Store.DSN)
+		default:
 			sqlStore, err = store.NewSQLite(cfg.Telemetry.Store.DSN)
 		}
 		if err != nil {

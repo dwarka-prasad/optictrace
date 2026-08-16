@@ -18,6 +18,11 @@ import (
 //
 //	docker run -d -e POSTGRES_PASSWORD=optic -e POSTGRES_DB=optictrace -p 15432:5432 postgres:16-alpine
 //	OPTICTRACE_TEST_POSTGRES='postgres://postgres:optic@localhost:15432/optictrace?sslmode=disable' go test ./internal/store
+//
+// ClickHouse likewise, via OPTICTRACE_TEST_CLICKHOUSE:
+//
+//	docker run -d -e CLICKHOUSE_DB=optic -e CLICKHOUSE_USER=optic -e CLICKHOUSE_PASSWORD=optic -p 19010:9000 clickhouse/clickhouse-server:24.8-alpine
+//	OPTICTRACE_TEST_CLICKHOUSE='clickhouse://optic:optic@localhost:19010/optic' go test ./internal/store
 
 type driverFactory struct {
 	name string
@@ -46,6 +51,24 @@ func drivers(t *testing.T) []driverFactory {
 				}
 				// Each test starts from a clean table.
 				if _, err := s.db.Exec(`TRUNCATE logs RESTART IDENTITY`); err != nil {
+					t.Fatalf("truncate: %v", err)
+				}
+				t.Cleanup(func() { s.Close() })
+				return s
+			},
+		})
+	}
+	if dsn := os.Getenv("OPTICTRACE_TEST_CLICKHOUSE"); dsn != "" {
+		out = append(out, driverFactory{
+			name: "clickhouse",
+			open: func(t *testing.T) LogStore {
+				s, err := NewClickHouse(dsn)
+				if err != nil {
+					t.Fatalf("open clickhouse: %v", err)
+				}
+				// Each test starts from a clean table. TRUNCATE is synchronous
+				// for MergeTree, unlike ALTER ... DELETE.
+				if _, err := s.db.Exec(`TRUNCATE TABLE logs`); err != nil {
 					t.Fatalf("truncate: %v", err)
 				}
 				t.Cleanup(func() { s.Close() })

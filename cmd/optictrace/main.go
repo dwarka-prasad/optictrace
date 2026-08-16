@@ -603,6 +603,8 @@ func openStore(cfg *config.StoreCfg) (store.LogStore, error) {
 	switch cfg.Driver {
 	case "postgres":
 		return store.NewPostgres(cfg.DSN)
+	case "clickhouse":
+		return store.NewClickHouse(cfg.DSN)
 	default:
 		return store.NewSQLite(cfg.DSN)
 	}

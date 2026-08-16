@@ -281,7 +281,7 @@ telemetry:
     cert_file: /etc/optictrace/tls.crt
     key_file:  /etc/optictrace/tls.key
   store:
-    driver: sqlite                   # sqlite | none
+    driver: sqlite                   # sqlite | postgres | clickhouse | none                   # sqlite | none
     dsn: optictrace.db
     queue_size: 4096                 # async queue; overflow drops, never blocks
     retention_max_rows: 100000       # oldest rows pruned

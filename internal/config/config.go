@@ -213,9 +213,11 @@ type Metrics struct {
 
 // StoreCfg configures asynchronous payload persistence.
 type StoreCfg struct {
-	// Driver is "sqlite" (default), "postgres" (multi-node), or "none".
+	// Driver is "sqlite" (default), "postgres" (multi-node),
+	// "clickhouse" (column store, for volume), or "none".
 	Driver string `yaml:"driver"`
-	// DSN is the SQLite file path. Default "optictrace.db".
+	// DSN is the SQLite file path, or a postgres:// / clickhouse:// URL.
+	// Default "optictrace.db".
 	DSN string `yaml:"dsn"`
 	// QueueSize bounds the async write queue; writes are dropped (and
 	// counted) rather than ever blocking the request path. Default 4096.
@@ -538,8 +540,13 @@ func (c *Config) Validate() error {
 			!strings.HasPrefix(c.Telemetry.Store.DSN, "postgresql://") {
 			return fmt.Errorf("telemetry.store.dsn must be a postgres:// URL when driver is postgres")
 		}
+	case "clickhouse":
+		if !strings.HasPrefix(c.Telemetry.Store.DSN, "clickhouse://") {
+			return fmt.Errorf("telemetry.store.dsn must be a clickhouse:// URL when driver is clickhouse")
+		}
 	default:
-		return fmt.Errorf("telemetry.store.driver %q is not supported (sqlite, postgres, none)", c.Telemetry.Store.Driver)
+		return fmt.Errorf("telemetry.store.driver %q is not supported (sqlite, postgres, clickhouse, none)",
+			c.Telemetry.Store.Driver)
 	}
 	if a := c.Telemetry.Auth; a != nil {
 		if a.Token == "" && a.TokenEnv == "" {
