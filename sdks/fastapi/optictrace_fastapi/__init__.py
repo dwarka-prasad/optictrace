@@ -20,15 +20,30 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import re
 import time
+import urllib.error
 import urllib.request
 from typing import Optional
 
 import yaml
 
 from .engine import Engine, Policy, REDACTED  # noqa: F401 (public API)
+from .logs import OpticTraceLogHandler
+from .trace import HEADER as TRACEPARENT, TraceContext, current as current_span, from_header, outbound_headers
 
-__all__ = ["OpticTraceMiddleware", "Engine", "Policy", "REDACTED"]
+__all__ = [
+    "OpticTraceMiddleware",
+    "Engine",
+    "Policy",
+    "REDACTED",
+    "OpticTraceLogHandler",
+    "TraceContext",
+    "TRACEPARENT",
+    "current_span",
+    "from_header",
+    "outbound_headers",
+]
 
 
 class OpticTraceMiddleware:
@@ -46,6 +61,12 @@ class OpticTraceMiddleware:
         self.service = service_name or self.engine.service_name
         self.ingest_url = agent_url.rstrip("/") + "/api/ingest" if agent_url else None
         self.console_log = console_log
+        # Delivery counters. The previous version swallowed every failure with
+        # a bare `except: pass`, so a malformed timestamp made it drop 100% of
+        # records while looking perfectly healthy. Silence is the bug.
+        self.shipped = 0
+        self.ship_failed = 0
+        self.last_ship_error: Optional[str] = None
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -62,6 +83,12 @@ class OpticTraceMiddleware:
             k.decode("latin-1"): v.decode("latin-1") for k, v in scope.get("headers", [])
         }
 
+        # Adopt the caller's trace, or start one. Setting the ContextVar here
+        # is what lets a log line or an outbound call name this exact span
+        # without the application threading anything through by hand.
+        ctx = from_header(req_headers.get(TRACEPARENT, ""))
+        token = current_span.set(ctx)
+
         state = {
             "status": 200,
             "resp_headers": {},
@@ -75,6 +102,11 @@ class OpticTraceMiddleware:
 
         capture_req = sampled and policy.capture_request_body
         capture_resp = sampled and policy.capture_response_body
+        # Meters read the response bytes even when the body is not STORED:
+        # metering is independent of capture, which is what lets a rule keep a
+        # prompt private while still counting the tokens in it. Without this,
+        # `restrict: [response_body]` would silently zero the billing.
+        need_resp_bytes = capture_resp or bool(policy.meters)
 
         async def tee_receive():
             message = await receive()
@@ -98,20 +130,21 @@ class OpticTraceMiddleware:
             elif message["type"] == "http.response.body":
                 body = message.get("body", b"")
                 state["resp_bytes"] += len(body)
-                if capture_resp:
+                if need_resp_bytes:
                     room = policy.capture_limit - len(state["resp_body"])
                     if room > 0:
                         state["resp_body"] += body[:room]
-                    if len(body) > room:
+                    if len(body) > room and capture_resp:
                         state["resp_trunc"] = True
             await send(message)
 
         try:
             await self.app(scope, tee_receive, tee_send)
         finally:
+            current_span.reset(token)
             duration_ms = (time.perf_counter() - start) * 1000
             record = self._build_record(
-                scope, method, path, policy, req_headers, state, duration_ms
+                scope, method, path, policy, req_headers, state, duration_ms, ctx
             )
             if self.console_log or not self.ingest_url:
                 print(json.dumps({"msg": "http_exchange", **record}), flush=True)
@@ -119,10 +152,13 @@ class OpticTraceMiddleware:
                 # Fire-and-forget in a worker thread — urllib is blocking.
                 asyncio.get_running_loop().run_in_executor(None, self._ship, record)
 
-    def _build_record(self, scope, method, path, policy, req_headers, state, duration_ms):
+    def _build_record(self, scope, method, path, policy, req_headers, state, duration_ms, ctx=None):
         client = scope.get("client") or ("", 0)
         record = {
-            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            # RFC3339. `%z` renders "+0530", which the agent's strict RFC3339
+            # parser rejects — every record shipped that way was answered with
+            # a 400 and silently dropped by the old error handling.
+            "time": _rfc3339(time.time()),
             "service": self.service,
             "method": method,
             "path": path,
@@ -134,6 +170,11 @@ class OpticTraceMiddleware:
             "req_bytes": state["req_bytes"] or int(req_headers.get("content-length") or 0),
             "resp_bytes": state["resp_bytes"],
         }
+        if ctx is not None:
+            record["trace_id"] = ctx.trace_id
+            record["span_id"] = ctx.span_id
+            if ctx.parent_span_id:
+                record["parent_span_id"] = ctx.parent_span_id
         if policy.matched_rules:
             record["matched_rules"] = policy.matched_rules
         if policy.capture_headers:
@@ -146,11 +187,16 @@ class OpticTraceMiddleware:
             if state["req_trunc"]:
                 record["req_truncated"] = True
         if state["resp_body"]:
-            record["response_body"] = policy.redact_body(
-                bytes(state["resp_body"]), state["resp_headers"].get("content-type", "")
-            )
-            if state["resp_trunc"]:
-                record["resp_truncated"] = True
+            meters = policy.extract_meters(bytes(state["resp_body"]))
+            if meters:
+                record["meters"] = meters
+            # Buffered for metering is not the same as allowed to be stored.
+            if policy.capture_response_body:
+                record["response_body"] = policy.redact_body(
+                    bytes(state["resp_body"]), state["resp_headers"].get("content-type", "")
+                )
+                if state["resp_trunc"]:
+                    record["resp_truncated"] = True
         if policy.labels:
             query = {}
             qs = scope.get("query_string", b"").decode("latin-1")
@@ -160,15 +206,14 @@ class OpticTraceMiddleware:
                     query.setdefault(k, v)
             labels = {}
             for name, src in policy.labels.items():
-                kind, _, key = str(src).partition(":")
-                if kind == "header":
-                    labels[name] = req_headers.get(key.lower(), "")
-                elif kind == "query":
-                    labels[name] = query.get(key, "")
+                labels[name] = _label_value(str(src), req_headers, query, path)
             record["labels"] = labels
         return record
 
     def _ship(self, record: dict):
+        """Deliver one record. Never raises into the application — but never
+        silently succeeds either: failures are counted and the last one is
+        kept, so "is my telemetry actually arriving" has an answer."""
         try:
             req = urllib.request.Request(
                 self.ingest_url,
@@ -176,6 +221,64 @@ class OpticTraceMiddleware:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            urllib.request.urlopen(req, timeout=5).close()
-        except Exception:  # noqa: BLE001 — telemetry must never break the app
-            pass
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                resp.read()
+            self.shipped += 1
+        except urllib.error.HTTPError as e:
+            self.ship_failed += 1
+            self.last_ship_error = f"HTTP {e.code}: {e.read()[:200].decode('utf-8', 'replace')}"
+        except Exception as e:  # noqa: BLE001 — telemetry must never break the app
+            self.ship_failed += 1
+            self.last_ship_error = repr(e)
+
+
+def _rfc3339(epoch: float) -> str:
+    """RFC3339 in UTC with a 'Z' suffix — the one format the agent accepts."""
+    import datetime
+
+    return (
+        datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _label_value(src: str, headers: dict, query: dict, path: str) -> str:
+    """Resolve one label source, mirroring the Go engine.
+
+    Sources are `kind:key`, optionally followed by `|<regex>` whose single
+    capture group narrows the value — that is how `header:X-Region|^([a-z]{2})-`
+    turns ap-south-1 into ap, and the two engines have to agree on it or the
+    same optic.yaml produces different series depending on which one ran.
+
+    `json:` / `json_response:` are deliberately NOT handled here: this
+    middleware resolves labels from the request line, and reading the body
+    would mean re-parsing a payload the policy has already redacted. A config
+    using them gets an empty label from this SDK rather than a wrong one.
+    """
+    spec, sep, pattern = src.partition("|")
+    kind, _, key = spec.partition(":")
+    value = ""
+    if kind == "header":
+        value = headers.get(key.lower(), "")
+    elif kind == "query":
+        value = query.get(key, "")
+    elif kind == "static":
+        value = key
+    elif kind == "path":
+        # path:<n> is 1-based, matching the Go engine.
+        segs = [s for s in path.split("/") if s]
+        try:
+            idx = int(key)
+        except ValueError:
+            return ""
+        if 1 <= idx <= len(segs):
+            value = segs[idx - 1]
+    if sep and value:
+        m = re.search(pattern, value)
+        if not m:
+            return ""
+        # One capture group narrows the value; no group means "matched, keep
+        # the whole thing".
+        return m.group(1) if m.groups() else value
+    return value

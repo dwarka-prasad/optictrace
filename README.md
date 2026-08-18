@@ -34,6 +34,8 @@ Prometheus dimensions.
 - [Surfaces](#surfaces) — [CLI](#cli) · [control-plane API](#control-plane-api-9095) · [metrics](#metrics-exposed)
 - [Pull-request reviews](#pull-request-reviews)
 - [Traffic-powered tooling](#traffic-powered-tooling)
+- [Following one request](#following-one-request-across-services) — [what it logged](#what-the-request-logged)
+- [Examples](#examples) — runnable apps, not snippets
 - [Export plugins](#export-plugins)
 - [Framework SDKs](#framework-sdks)
 - [Developer dashboard](#developer-dashboard)
@@ -222,6 +224,12 @@ docker compose up --build
 | `http://localhost:8080` | your API, proxied through OpticTrace |
 | `http://localhost:9095` | dashboard · `/metrics` · query APIs |
 | `http://localhost:9090` | Prometheus, pre-configured to scrape OpticTrace |
+| `http://localhost:3000` | Grafana, dashboard provisioned |
+
+A one-shot `seeder` service drives multi-tenant traffic through the demo API as
+the stack comes up, so the dashboard has real records, labels and traces on it
+immediately — an empty dashboard tells you nothing about whether the rules
+work. Re-run it any time with `docker compose run --rm seeder`.
 
 ### Install
 
@@ -540,6 +548,8 @@ for a complete workflow. This repo dogfoods it in
 | `POST /api/config/validate` | Lint a candidate config |
 | `POST /api/reload` | Re-read config, hot-swap engine |
 | `POST /api/ingest` | Accept governed records from SDKs |
+| `POST /api/applogs/ingest` | Accept application log lines, correlated by span id |
+| `GET /api/applogs` | Lines a request logged (`?span=` / `?trace=` / `?level=`) |
 | `GET /api/system` | Agent health, store size, exporter stats |
 
 ### Metrics exposed
@@ -553,6 +563,8 @@ for a complete workflow. This repo dogfoods it in
 | `optictrace_inflight_requests` | gauge | — |
 | `optictrace_store_dropped_total` | counter | — |
 | `optictrace_sdk_ingested_total` | counter | — |
+| `optictrace_app_logs_stored_total` | counter | — |
+| `optictrace_app_logs_dropped_total` | counter | `reason` (orphan, level, span_cap) |
 | `optictrace_exported_total` | counter | `exporter` |
 | `optictrace_export_failed_total` | counter | `exporter` |
 | `optictrace_export_dropped_total` | counter | `exporter` |
@@ -963,6 +975,80 @@ so the two views line up. What OpticTrace adds is the **governed payload at
 every hop**: an APM shows you timings, this shows you the redacted request body
 you are actually allowed to look at.
 
+
+### What the request logged
+
+A span answers "what did this call do". The lines your application wrote while
+serving it answer "why did it do that" — and those two live in different
+systems, so answering both usually means copying a trace id into a log search
+and hoping the clocks agree.
+
+OpticTrace already hands your app the span: the `traceparent` on the forwarded
+request carries the span id it recorded. Ship your log lines with that id and
+they are filed under the exact request that produced them.
+
+```bash
+curl -X POST localhost:9095/api/applogs/ingest -d '[
+  {"trace_id":"4bf92f35…","span_id":"512227e3…","level":"info","message":"charge received"},
+  {"trace_id":"4bf92f35…","span_id":"512227e3…","level":"error","message":"gateway declined"}
+]'
+
+curl 'localhost:9095/api/applogs?span=512227e3…'
+```
+
+and the inspector shows them under the request itself:
+
+```
+POST /api/v1/payments/charge -> 201   tenant=acme-corp   span=ee6c471b
+  [info ] charge received    plan=platinum tenant=acme-corp
+  [error] gateway declined   reason=insufficient_funds
+```
+
+**Correlation is a fact here, not a guess.** Nothing is matched by timestamp.
+Under concurrent traffic — which is the normal case — timestamp matching files
+one tenant's log line inside another tenant's request, and that is precisely
+the cross-tenant bleed the tagging and purge machinery exists to prevent.
+
+**Log lines are the highest-risk surface in this tool**, so they run through
+policy on the way in rather than being stored raw and cleaned up later. A
+payload is structured and can be redacted by path; a log line is free text
+written by whoever was debugging that day:
+
+```yaml
+telemetry:
+  app_logs:
+    enabled: true
+    level_min: info            # debug is most of the volume, little of the value
+    max_lines_per_span: 200    # one retry loop must not write a million lines
+    max_message_bytes: 8192
+    retention_max_age: 168h    # logs outgrow records by orders of magnitude
+    drop_orphans: true         # lines with no span belong to no request
+    redact:
+      patterns:                # single-quoted: YAML rejects \s in double quotes
+        - 'Bearer\s+\S+'
+        - '\b\d{13,19}\b'
+      fields: [authorization, password, token, api_key]
+```
+
+An app that logs its own `Authorization` header while debugging — which is how
+this actually happens — is stored as `calling gateway with [REDACTED]`.
+
+Three consequences worth knowing before you turn it on:
+
+- **Erasure covers logs too.** `purge` deletes the log lines belonging to the
+  records it deletes, in one transaction. Deleting a tenant's requests while
+  leaving the lines those requests wrote is not erasure, and a log is the
+  likelier place for the personal data to be sitting.
+- **Orphans are dropped by default.** Startup, cron and background-worker lines
+  carry no span. Every drop is counted in
+  `optictrace_app_logs_dropped_total{reason="orphan"}` — data discarded
+  silently is data nobody knows they are missing. Set `drop_orphans: false` to
+  keep them unattributed.
+- **Storage support is optional.** `ext.AppLogStore` is a separate interface
+  from `ext.Store`, so a third-party driver that does not implement it is still
+  a complete driver. The endpoint says which of the two problems you have —
+  the feature is off, or your driver cannot store lines.
+
 ---
 
 ## Multi-tenant tagging
@@ -1102,6 +1188,33 @@ Values are client-controlled, so they pass through the cardinality guard
 
 SDKs evaluate the same `optic.yaml` in-process and POST governed records to the agent's
 `/api/ingest` — one dashboard and one metrics endpoint across your whole stack.
+Sensitive values never cross a process boundary in the clear: redaction happens
+inside the service that saw the data.
+
+Point the agent at no `service.listen` and no `service.upstream` and it runs in
+**collector mode** — the admin API, store and metrics, with no proxy, because
+the SDK is already in the request path:
+
+```yaml
+service:
+  name: shop        # no listen, no upstream
+telemetry:
+  admin_listen: "127.0.0.1:9095"
+  store: { driver: sqlite, dsn: shop.db }
+```
+
+| | Express | FastAPI | Gin / net-http |
+|---|:--:|:--:|:--:|
+| Restriction + redaction | ✅ | ✅ | ✅ |
+| Labels (`header:` `query:`) | ✅ | ✅ | ✅ |
+| Labels (`static:` `path:` `\|regex`) | — | ✅ | ✅ |
+| Labels (`json:` `json_response:`) | — | — | ✅ |
+| Meters | — | ✅ | ✅ |
+| Trace correlation | — | ✅ | ✅ |
+| Application logs | — | ✅ | — |
+
+<sub>Gin and net/http route through the same Go interceptor as the proxy, so they
+inherit everything it does. Express is a separate implementation and is behind.</sub>
 
 ### Node.js / Express
 
@@ -1113,10 +1226,24 @@ app.use(optictrace({ configPath: 'optic.yaml', agentUrl: 'http://localhost:9095'
 ### Python / FastAPI
 
 ```python
-from optictrace_fastapi import OpticTraceMiddleware
+from optictrace_fastapi import OpticTraceMiddleware, OpticTraceLogHandler, outbound_headers
+
 app.add_middleware(OpticTraceMiddleware,
                    config_path="optic.yaml", agent_url="http://localhost:9095")
+
+# Your ordinary logging, filed under the request that wrote it. Nothing at the
+# call site needs to know about OpticTrace — the span comes from a ContextVar
+# the middleware sets.
+logging.getLogger().addHandler(OpticTraceLogHandler("http://localhost:9095"))
+
+# Calls this service makes downstream, carrying THIS hop's span so they nest
+# under it instead of becoming siblings.
+await client.get(url, headers=outbound_headers())
 ```
+
+[`examples/python-shop`](examples/python-shop) is a working three-service
+FastAPI application built on this — real HTTP calls between services, logs
+correlated per span, and a 25-assertion verification suite.
 
 ### Go / net-http + Gin
 
@@ -1227,6 +1354,21 @@ proxy, not asserted from the code:
 
 ---
 
+## Examples
+
+Both are full applications with their own traffic drivers and assertion suites,
+not snippets — they exist so the claims above can be checked rather than taken
+on trust.
+
+| | |
+|---|---|
+| [`examples/python-shop`](examples/python-shop) | Three **FastAPI** services making real HTTP calls to each other, governed in-process by the SDK, reporting into one agent in collector mode. Shows trace correlation across services, application logs filed under the request that wrote them, redaction of a card number a service logs on purpose, and metering for billing. `./run.sh` then `verify.py` — 25 assertions. Optional Prometheus + Grafana. |
+| [`examples/lead-pipeline`](examples/lead-pipeline) | Three **Go** services behind sidecars, with the discriminator in the payload rather than a header — the multi-tenant tagging case. 19 assertions. |
+| [`examples/memstore`](examples/memstore) | A third-party `ext.Store` driver in a separate module, proving the extension surface works from outside the repo. Runs the same conformance suite as the built-in drivers. |
+| [`examples/adminauth`](examples/adminauth) | An authentication/authorization extension against the `ext.Authenticator` hooks — the template for SSO. |
+
+---
+
 ## Roadmap
 
 Ordered by value, not by ease. Each item states the problem it solves — if the rationale
@@ -1285,9 +1427,10 @@ Bug reports, rule-engine edge cases, and new SDK targets are all welcome — see
 2. **The rule engine is portable.** `internal/engine` (Go), `sdks/express/engine.js` and `sdks/fastapi/.../engine.py` must stay semantically identical.
 
 ```bash
-go build ./... && go test ./...        # Go agent
-cd ui && npm install && npm run dev    # dashboard
-./scripts/demo.sh                      # full local stack
+make setup      # dependencies, dashboard, binaries
+make dev        # full local stack + seeded traffic, dashboard on :9095
+make test-all   # every module, including the satellite ones
+make help       # every target
 ```
 
 ## Project layout

@@ -165,3 +165,104 @@ func TestLoadAcceptsBothShapes(t *testing.T) {
 		t.Error("missing file should error")
 	}
 }
+
+// A rule keyed on the request body is the one kind that is easiest to ship
+// broken, because the payload is the part a config author cannot see from the
+// route table. `optictrace test` used to evaluate cases without the body at
+// all, so those rules silently never matched and no case could catch it.
+// This locks the body into the evaluation context.
+func TestRunEvaluatesBodyRulesAndJSONLabels(t *testing.T) {
+	const cfg = `
+version: 1
+service: { name: test }
+rules:
+  - name: redact-card
+    match: { path: "/payments/**" }
+    redact: { json_fields: ["$.**.card.number"] }
+  - name: tag-marketplace
+    match:
+      path: "/payments/**"
+      body: { "$.**.source": "^(flipkart|amazon)$" }
+    labels: { channel: "static:marketplace" }
+  - name: label-from-body
+    match: { path: "/payments/**" }
+    labels:
+      partner: "json:$.**.source"
+      outcome: "json_response:$.status"
+`
+	parsed, err := config.Parse([]byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := engine.New(parsed)
+
+	cases := []Case{{
+		Name: "marketplace caller",
+		Request: Request{
+			Method:   "POST",
+			Path:     "/payments/charge",
+			Body:     map[string]any{"source": "flipkart", "card": map[string]any{"number": "4111111111111111"}},
+			Response: map[string]any{"status": "captured"},
+		},
+		Expect: Expect{
+			MatchedRules: &[]string{"redact-card", "tag-marketplace", "label-from-body"},
+			Labels:       map[string]string{"channel": "marketplace", "partner": "flipkart", "outcome": "captured"},
+			NotContains:  []string{"4111111111111111"},
+		},
+	}, {
+		Name: "off-criteria caller does not get the tag",
+		Request: Request{
+			Method: "POST",
+			Path:   "/payments/charge",
+			Body:   map[string]any{"source": "walk-in"},
+		},
+		Expect: Expect{
+			MatchedRules: &[]string{"redact-card", "label-from-body"},
+		},
+	}}
+
+	if res := Run(eng, cases); len(res.Failures) > 0 {
+		for _, f := range res.Failures {
+			t.Errorf("%s: %s: want %q got %q", f.Case, f.Assert, f.Want, f.Got)
+		}
+	}
+}
+
+// A label must never be able to read a value the policy redacts. config.Parse
+// refuses that combination outright, so the guard is checked there — but a case
+// asserting on a redacted body path must still see the mask, not the original.
+func TestRunLabelsSeeRedactedBody(t *testing.T) {
+	const cfg = `
+version: 1
+service: { name: test }
+rules:
+  - name: redact-and-tag
+    match:
+      path: "/payments/**"
+      body: { "$.note": "^plain$" }
+    redact: { json_fields: ["$.secret"] }
+    labels: { seen: "static:yes" }
+`
+	parsed, err := config.Parse([]byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []Case{{
+		Name: "redaction applies before criteria read the body",
+		Request: Request{
+			Method: "POST",
+			Path:   "/payments/charge",
+			Body:   map[string]any{"note": "plain", "secret": "hunter2"},
+		},
+		Expect: Expect{
+			MatchedRules: &[]string{"redact-and-tag"},
+			Labels:       map[string]string{"seen": "yes"},
+			NotContains:  []string{"hunter2"},
+		},
+	}}
+	if res := Run(engine.New(parsed), cases); len(res.Failures) > 0 {
+		for _, f := range res.Failures {
+			t.Errorf("%s: %s: want %q got %q", f.Case, f.Assert, f.Want, f.Got)
+		}
+	}
+}

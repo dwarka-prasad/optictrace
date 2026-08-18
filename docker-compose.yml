@@ -32,6 +32,20 @@ services:
       - "9000"
     restart: unless-stopped
 
+  # Runs once and exits: without it the stack comes up correct but empty, and
+  # an empty dashboard tells you nothing about whether the rules work.
+  seeder:
+    build:
+      context: .
+      dockerfile: deploy/compose/Dockerfile.seeder
+    environment:
+      PROXY: optictrace:8080
+      ADMIN: optictrace:9095
+      ROUNDS: "6"
+    depends_on:
+      - optictrace
+    restart: "no"
+
   prometheus:
     image: prom/prometheus:v2.53.0
     ports:

@@ -24,6 +24,13 @@ type (
 	RuleMatch   = ext.RuleMatch
 	Usage       = ext.Usage
 	ServiceStat = ext.ServiceStat
+	// AppLog is one application log line correlated to a span. AppLogStore is
+	// OPTIONAL — a driver is complete without it; detect support with a type
+	// assertion rather than assuming.
+	AppLog        = ext.AppLog
+	AppLogFilter  = ext.AppLogFilter
+	AppLogStore   = ext.AppLogStore
+	AppLogSummary = ext.AppLogSummary
 )
 
 const (

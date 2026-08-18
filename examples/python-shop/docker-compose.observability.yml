@@ -1,0 +1,32 @@
+# Prometheus + Grafana for the Python shop.
+#
+#   ./run.sh                                                    # shop on the host
+#   docker compose -f docker-compose.observability.yml up -d    # monitoring
+#
+#   http://localhost:9090   Prometheus
+#   http://localhost:3000   Grafana — anonymous viewer, or admin/optictrace
+#
+# Both containers use the HOST network so Prometheus can scrape an agent bound
+# to 127.0.0.1. The alternative — republishing the admin port on 0.0.0.0 — would
+# put every captured payload on the LAN to save a line of config.
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    network_mode: host
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../../deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    network_mode: host
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: optictrace
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./observability/grafana:/etc/grafana/provisioning:ro
+      - ../../deploy/grafana/dashboard.json:/var/lib/grafana/dashboards/optictrace.json:ro
+    depends_on: [prometheus]
+    restart: unless-stopped

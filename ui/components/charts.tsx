@@ -70,3 +70,72 @@ export function LatencyChart({ series }: { series: TimeBucket[] }) {
     </ResponsiveContainer>
   );
 }
+
+/** Traffic split by status class.
+ *
+ *  Stacked, not overlaid: the question this answers is "what proportion of my
+ *  traffic is failing", and a proportion needs a common baseline. Colour
+ *  carries the severity so the shape is readable without the legend. */
+export function StatusMixChart({ series }: { series: TimeBucket[] }) {
+  // The stats series carries total and 5xx; the remainder is everything that
+  // did not fail. Deriving it here keeps the API honest — it reports what it
+  // measured, not a pre-chewed shape for one chart.
+  const data = series.map((b) => ({
+    time: b.time,
+    ok: Math.max(0, b.count - b.errors),
+    errors: b.errors,
+  }));
+  return (
+    <ResponsiveContainer width="100%" height={200}>
+      <AreaChart data={data} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
+        <CartesianGrid stroke="#1e2a45" strokeDasharray="3 3" vertical={false} />
+        <XAxis dataKey="time" tickFormatter={fmtTime} tick={tickStyle} axisLine={false} tickLine={false} />
+        <YAxis tick={tickStyle} axisLine={false} tickLine={false} allowDecimals={false} />
+        <Tooltip contentStyle={tooltipStyle} labelFormatter={(v) => new Date(v as string).toLocaleString()} />
+        <Area type="monotone" dataKey="ok" stackId="1" name="succeeded" stroke="#34d399" fill="#34d399" fillOpacity={0.25} strokeWidth={1.5} />
+        <Area type="monotone" dataKey="errors" stackId="1" name="failed" stroke="#f87171" fill="#f87171" fillOpacity={0.4} strokeWidth={1.5} />
+      </AreaChart>
+    </ResponsiveContainer>
+  );
+}
+
+/** A horizontal bar list — for rankings where the label matters more than the
+ *  axis (tenants, services, log levels). Reads top-down like a table, which is
+ *  how people actually scan a ranking. */
+export function BarList({
+  items,
+  unit = '',
+  tone,
+}: {
+  items: { label: string; value: number; hint?: string }[];
+  unit?: string;
+  tone?: (label: string) => string;
+}) {
+  const max = Math.max(1, ...items.map((i) => i.value));
+  if (items.length === 0) {
+    return <p className="py-6 text-center text-xs text-[var(--muted)]">Nothing in this window.</p>;
+  }
+  return (
+    <div className="space-y-2">
+      {items.map((i) => (
+        <div key={i.label} className="space-y-1">
+          <div className="flex items-baseline justify-between gap-2 text-xs">
+            <span className="truncate font-mono">{i.label}</span>
+            <span className="shrink-0 tabular-nums text-[var(--muted)]">
+              {i.hint ?? `${i.value.toLocaleString()}${unit}`}
+            </span>
+          </div>
+          <div className="h-1.5 overflow-hidden rounded-full bg-[var(--border)]/60">
+            <div
+              className="h-full rounded-full"
+              style={{
+                width: `${(i.value / max) * 100}%`,
+                background: tone ? tone(i.label) : 'var(--accent)',
+              }}
+            />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}

@@ -8,4 +8,6 @@ RUN CGO_ENABLED=0 go build -o /out/mocktarget ./cmd/mocktarget
 FROM alpine:3.20
 COPY --from=build /out/mocktarget /usr/local/bin/mocktarget
 EXPOSE 9000
-ENTRYPOINT ["mocktarget", "-addr", ":9000"]
+# Ships its own application logs to the agent, so the compose tour shows what
+# a request logged next to the request itself rather than only the exchange.
+ENTRYPOINT ["mocktarget", "-addr", ":9000", "-applogs", "http://optictrace:9095"]

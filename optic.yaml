@@ -36,6 +36,42 @@ telemetry:
     # one buggy client can otherwise create unbounded Prometheus series.
     # Beyond this many distinct values, a label collapses to __over_limit__.
     max_label_values: 500              # 0 disables the guard
+  # ---------------------------------------------------------------------------
+  # APPLICATION LOGS — the lines your app wrote while serving a request.
+  #
+  # Correlation is a fact, not a guess. OpticTrace rewrites the traceparent on
+  # the request it FORWARDS, so the span-id in the header your app receives is
+  # the span OpticTrace recorded. An app that ships its logs with that span id
+  # gets them filed under the exact request that produced them; nothing is
+  # matched by timestamp, which under concurrency would file one tenant's line
+  # under another tenant's request.
+  #
+  # Post lines to POST /api/applogs/ingest, read them back with
+  # GET /api/applogs?trace=... or ?span=...
+  #
+  # Treat this as the highest-risk surface here. A payload is structured and
+  # can be redacted by path; a log line is free text written by whoever was
+  # debugging that day, and it routinely carries tokens and whole payloads
+  # inside stack traces. Everything below runs BEFORE anything is stored.
+  # ---------------------------------------------------------------------------
+  app_logs:
+    enabled: true
+    level_min: info            # debug is most of the volume and little of the value
+    max_lines_per_span: 200    # one retry loop must not write a million lines
+    max_message_bytes: 8192    # stack traces are long; the head is what matters
+    retention_max_age: 168h    # 7 days — logs outgrow records by orders of magnitude
+    # Lines with no span belong to no request (startup, cron, background jobs).
+    # Dropped by default; every drop is counted in
+    # optictrace_app_logs_dropped_total{reason="orphan"} rather than vanishing.
+    drop_orphans: true
+    redact:
+      # Single-quoted: YAML double quotes reject escapes like \s.
+      patterns:
+        - 'Bearer\s+\S+'          # the header someone logged while debugging
+        - '\b\d{13,19}\b'         # card-shaped digit runs
+        - '[\w.+-]+@[\w-]+\.[\w.]+' # email addresses
+      fields: [authorization, password, token, api_key]
+
   store:
     driver: sqlite            # sqlite | none
     dsn: optictrace.db
@@ -88,12 +124,19 @@ rules:
     match:
       path: "/api/v1/auth/**"
     restrict: [request_body, response_body, headers]
+    # Capture and attribution are independent: a label is read from the LIVE
+    # request, so this route can be billed to a tenant while none of its
+    # payload is recorded. Without this, every login is revenue you cannot
+    # attribute to a customer.
+    labels:
+      tenant: "header:X-Tenant-ID"
 
   # ---------------------------------------------------------------------------
   # REDACTION: payments flow — scrub credentials from headers and mask
   # sensitive JSON fields in captured payloads. Traffic itself is untouched;
   # redaction applies to what OpticTrace records.
   # ---------------------------------------------------------------------------
+
   - name: redact-payment-secrets
     match:
       path: "/api/v1/payments/**"
@@ -103,6 +146,11 @@ rules:
         - Authorization
         - X-Api-Key
         - Cookie
+      # A credential in a query string is still a credential, and it lands in
+      # the recorded URL rather than in a header — a separate place, needing a
+      # separate rule. Everything not named here survives, so `?page=2` is
+      # still there to debug with.
+      query_params: [api_key, session, token]
       json_fields:
         # `**` = recursive descent: match the field at ANY nesting depth,
         # so an upstream echoing the payload back can't leak it either.
@@ -111,14 +159,53 @@ rules:
         - "$.**.customer.email"
         - "$.*.ssn"            # `*` = any single key: ssn under any top-level object
     labels:
-      tenant: "header:X-Tenant-ID"   # becomes a Prometheus dimension + log field
-      region: "header:X-Region"
+      # Label sources: header, query, path:<n>, static, json, json_response —
+      # each optionally followed by |<regex> to capture part of the value.
+      tenant:  "header:X-Tenant-ID"           # a Prometheus dimension + log field
+      region:  "header:X-Region|^([a-z]{2})-" # eu-west-1 -> eu
+      # From the PAYLOAD. This is the case headers cannot reach: several
+      # partners calling one endpoint with the same tenant and the same
+      # product, separated only by a field of the body.
+      partner: "json:$.**.source"
+      # And from the response, once it is known.
+      outcome: "json_response:$.status"
     # Sampling. `sample` is a uniform draw made up front; the keep_* rules are
     # TAIL-BASED — they rescue the requests you actually want after the outcome
     # is known, instead of letting a coin flip discard your errors.
     # sample: 0.25              # capture bodies for 25% of matched requests
     # keep_errors: true         # ...but always keep 5xx
     # keep_slower_than: 500ms   # ...and anything this slow
+
+  # ---------------------------------------------------------------------------
+  # TAGGING BY CRITERIA. Rules merge top to bottom and later ones win, so a
+  # broad default plus a narrow override is all conditional tagging needs —
+  # there is deliberately no separate `tags:` block to learn.
+  #
+  # match.headers / match.query / match.body take regular expressions.
+  # Unanchored like Go's regexp, so write ^ and $ for a whole-value match;
+  # "." means "present and non-empty".
+  # ---------------------------------------------------------------------------
+  - name: tag-channel-default
+    match:
+      path: "/api/v1/payments/**"
+    labels:
+      channel: "static:direct"
+
+  - name: tag-marketplace-callers
+    match:
+      path: "/api/v1/payments/**"
+      body:
+        "$.**.source": "^(flipkart|amazon)$"
+    labels:
+      channel: "static:marketplace"
+
+  - name: tag-premium-plans
+    match:
+      path: "/api/v1/payments/**"
+      headers:
+        X-Plan: "^(gold|platinum)$"
+    labels:
+      tier: "static:premium"
 
   # ---------------------------------------------------------------------------
   # METERING: extract numeric usage from responses (here: LLM token counts)
@@ -143,3 +230,24 @@ rules:
     restrict: [request_body, response_body]
     redact:
       headers: [X-Webhook-Signature]
+
+  # Hot read path. Two things happen here, and they are independent:
+  #
+  #  - The customer's email is masked. It arrives in the RESPONSE, not the
+  #    request, which is the leak that gets missed — nobody sent it, so nobody
+  #    thinks of it as data they are storing.
+  #  - Bodies are sampled at 20%, but `keep_errors` and `keep_slower_than` are
+  #    tail-based: they rescue a record AFTER the outcome is known. A coin flip
+  #    that discards your 500s is worse than no sampling at all.
+  - name: sample-user-reads
+    match:
+      path: "/api/v1/users/**"
+      methods: [GET]
+    redact:
+      json_fields:
+        - "$.**.email"
+    sample: 0.2
+    keep_errors: true
+    keep_slower_than: 250ms
+    labels:
+      tenant: "header:X-Tenant-ID"

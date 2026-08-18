@@ -19,6 +19,13 @@ version: 1
 service:
   name: fastapi-test
 rules:
+  - name: meter-ai
+    match:
+      path: "/ai/**"
+    restrict: [response_body]
+    meter:
+      tokens: "$.usage.total_tokens"
+
   - name: no-capture-on-auth
     match: { path: "/auth/**" }
     restrict: [request_body, response_body, headers]
@@ -50,7 +57,10 @@ async def echo_app(scope, receive, send):
         body += msg.get("body", b"")
         if not msg.get("more_body"):
             break
-    payload = json.dumps({"ok": True, "echo": json.loads(body or b"{}")}).encode()
+    out = {"ok": True, "echo": json.loads(body or b"{}")}
+    if scope["path"].startswith("/ai/"):
+        out["usage"] = {"prompt_tokens": 86, "completion_tokens": 42, "total_tokens": 128}
+    payload = json.dumps(out).encode()
     await send({
         "type": "http.response.start",
         "status": 201,
@@ -130,6 +140,51 @@ async def main():
     assert "hunter2" not in auth_str, "restricted body leaked"
     assert "request_headers" not in auth, "restricted headers leaked"
     assert auth["status"] == 201
+
+    # --- the regression that made this SDK ship nothing at all ------------
+    # `%z` renders "+0530"; the agent parses RFC3339 strictly and answered 400
+    # for every record. Because _ship swallowed all exceptions, the SDK looked
+    # healthy while delivering zero. Assert the wire format, not just the
+    # fields — a field that never arrives is not a field.
+    from datetime import datetime
+
+    for rec in (pay, auth):
+        ts = rec["time"]
+        assert ts.endswith("Z"), f"timestamp {ts!r} is not UTC RFC3339"
+        # Python's parser is the closest stand-in for Go's RFC3339 here; the
+        # combination of "+0530" and this call is what fails.
+        datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+    # --- trace context ----------------------------------------------------
+    # Correlation is the whole reason app logs can be attributed at all.
+    assert len(pay["trace_id"]) == 32, pay["trace_id"]
+    assert len(pay["span_id"]) == 16, pay["span_id"]
+    assert pay["trace_id"] != auth["trace_id"], "separate requests share a trace id"
+
+    await call(
+        mw,
+        "POST",
+        "/payments/charge",
+        {"content-type": "application/json",
+         "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"},
+        b"{}",
+    )
+    inherited = emitted[-1]
+    assert inherited["trace_id"] == "4bf92f3577b34da6a3ce929d0e0e4736", "inbound trace not adopted"
+    assert inherited["parent_span_id"] == "00f067aa0ba902b7", "caller's span is not the parent"
+    assert inherited["span_id"] != "00f067aa0ba902b7", "this hop reused the caller's span"
+
+    # --- metering is independent of capture -------------------------------
+    # The Python SDK ignored `meter:` entirely, so anyone billing from a
+    # FastAPI service was attributing zero. Worse, this rule also restricts the
+    # response body — if metering read the STORED body instead of the raw
+    # bytes, the number would silently be missing exactly where it is
+    # deliberately private.
+    await call(mw, "POST", "/ai/complete",
+               {"content-type": "application/json"}, b'{"prompt":"hi"}')
+    ai = emitted[-1]
+    assert ai.get("meters", {}).get("tokens") == 128, f"meters not extracted: {ai.get('meters')}"
+    assert "response_body" not in ai, "restricted response body was stored"
 
     print("✓ ASGI middleware integration checks passed")
     if os.environ.get("OPTIC_AGENT_URL"):

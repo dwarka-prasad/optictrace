@@ -15,11 +15,15 @@
   request:
     method: POST
     path: /api/v1/auth/login
-    headers: { Authorization: "Bearer real-token" }
+    headers: { Authorization: "Bearer real-token", X-Tenant-ID: acme }
     body: { username: ada, password: hunter2 }
     response: { token: session-token }
   expect:
     matched_rules: [no-capture-on-auth]
+    # The header is NOT captured, yet the tenant label read from it is still
+    # present. Capture and attribution are separate mechanisms, and billing
+    # depends on that being true.
+    labels: { tenant: acme }
     captures_request_body: false
     captures_response_body: false
     captures_headers: false
@@ -41,9 +45,11 @@
       credit_card: { number: "4111111111111111", cvv: "123" }
       customer: { email: ada@example.com, name: Ada }
   expect:
-    matched_rules: [redact-payment-secrets]
+    # tag-channel-default is deliberately broad, so it fires here too.
+    matched_rules: [redact-payment-secrets, tag-channel-default]
     redacted_headers: [Authorization]
-    labels: { tenant: acme, region: ap-south-1 }
+    # region uses |^([a-z]{2})- so ap-south-1 becomes ap.
+    labels: { tenant: acme, region: ap }
     not_contains: ["4111111111111111", "123", "ada@example.com", "sk_live_abc"]
 
 - name: redaction follows a payload echoed back inside a wrapper
@@ -87,12 +93,132 @@
 
 - name: unmatched routes fall back to capturing everything
   request:
-    method: GET
-    path: /api/v1/users/42
-    response: { id: "42", name: Ada Lovelace }
+    method: POST
+    # /api/v1/orders is deliberately ungoverned, which is what `optictrace
+    # scan` exists to find. Capture is opt-OUT, so it records in full.
+    path: /api/v1/orders
+    body: { sku: SKU-1, qty: 2 }
+    response: { order_id: ord_9001 }
   expect:
     matched_rules: []
-    route: /api/v1/users/:id
+    route: /api/v1/orders
     captures_request_body: true
     captures_response_body: true
     captures_headers: true
+
+- name: an email in the response is masked on the read path
+  request:
+    method: GET
+    path: /api/v1/users/42
+    headers: { X-Tenant-ID: acme }
+    # Nobody sent this address — the upstream returned it. That is the leak
+    # that gets missed, because it does not look like data you are storing.
+    response: { id: "42", name: Ada Lovelace, email: ada@example.com }
+  expect:
+    matched_rules: [sample-user-reads]
+    # Once a rule matches, its glob IS the route label — that is what keeps
+    # /users/1 and /users/2 from becoming two Prometheus series.
+    route: /api/v1/users/**
+    labels: { tenant: acme }
+    not_contains: ["ada@example.com"]
+
+- name: a GET is not governed by the payments rule
+  request:
+    method: GET
+    path: /api/v1/payments/charge
+  expect:
+    # redact-payment-secrets is scoped to the writing methods, so a read of
+    # the same path must not silently inherit its redactions.
+    matched_rules: [tag-channel-default]
+
+# =============================================================================
+# Tagging: the cases that make multi-tenant traffic separable
+# =============================================================================
+
+- name: a credential in the query string is masked, ordinary params are kept
+  request:
+    method: POST
+    path: /api/v1/payments/charge?api_key=live_sk_1234&page=2
+    body: { source: direct, amount: 100 }
+    response: { status: captured }
+  expect:
+    redacted_query_params: [api_key]
+    not_contains: ["live_sk_1234"]
+
+- name: the partner is taken from the payload, not a header
+  request:
+    method: POST
+    path: /api/v1/payments/charge
+    headers: { X-Tenant-ID: acme }
+    # Two partners can call this endpoint with the same tenant and the same
+    # product. The only thing separating them is this field.
+    body:
+      source: flipkart
+      amount: 100
+      credit_card: { number: "4111111111111111", cvv: "123" }
+    response: { status: captured }
+  expect:
+    labels:
+      partner: flipkart
+      tenant: acme
+    # And the card is still masked — a body label must never be a way around
+    # redaction.
+    not_contains: ["4111111111111111", "123"]
+
+- name: body criteria classify a marketplace caller
+  request:
+    method: POST
+    path: /api/v1/payments/charge
+    body: { source: amazon, amount: 100 }
+    response: { status: captured }
+  expect:
+    matched_rules:
+      - redact-payment-secrets
+      - tag-channel-default
+      - tag-marketplace-callers
+    labels: { channel: marketplace, partner: amazon }
+
+- name: a caller matching no criteria keeps the default tag
+  request:
+    method: POST
+    path: /api/v1/payments/charge
+    body: { source: walk-in, amount: 100 }
+    response: { status: captured }
+  expect:
+    # tag-marketplace-callers must NOT fire, so the broad default survives.
+    matched_rules:
+      - redact-payment-secrets
+      - tag-channel-default
+    labels: { channel: direct }
+
+- name: a header criterion tags the plan tier
+  request:
+    method: POST
+    path: /api/v1/payments/charge
+    headers: { X-Plan: platinum }
+    body: { source: direct, amount: 100 }
+    response: { status: captured }
+  expect:
+    labels: { tier: premium }
+
+- name: an off-criteria plan gets no tier tag
+  request:
+    method: POST
+    path: /api/v1/payments/charge
+    headers: { X-Plan: silver }
+    body: { source: direct, amount: 100 }
+    response: { status: captured }
+  expect:
+    # The pattern is anchored, so "silver" must not match ^(gold|platinum)$.
+    matched_rules:
+      - redact-payment-secrets
+      - tag-channel-default
+
+- name: a label read from the response
+  request:
+    method: POST
+    path: /api/v1/payments/charge
+    body: { source: direct, amount: 100 }
+    response: { status: declined }
+  expect:
+    labels: { outcome: declined }

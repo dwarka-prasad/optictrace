@@ -62,6 +62,56 @@ def redact_path(node: Any, path: list[str]) -> Any:
     return node
 
 
+def _parse_meters(spec: dict, rule_name: str) -> dict:
+    """`meter: {name: "$.usage.total_tokens"}` -> {name: [["usage","total_tokens"]]}.
+
+    A list of paths sums them, matching the Go engine.
+    """
+    out: dict[str, list[list[str]]] = {}
+    for name, paths in spec.items():
+        if isinstance(paths, str):
+            paths = [paths]
+        parsed = []
+        for path in paths:
+            if not str(path).startswith("$."):
+                raise ValueError(f"optic.yaml rule {rule_name}: meter {name} path {path!r} must start with '$.'")
+            parsed.append(str(path)[2:].split("."))
+        out[name] = parsed
+    return out
+
+
+def sum_numeric(node: Any, path: list, acc: list) -> None:
+    """Walk a dotted path summing numbers, supporting `*` and `**`.
+
+    Mirrors internal/engine.sumNumeric — the two engines must agree, or the
+    same optic.yaml bills differently depending on which one ran.
+    """
+    if not path:
+        if isinstance(node, bool):
+            return  # bool is an int in Python; a flag is not a quantity
+        if isinstance(node, (int, float)):
+            acc[0] += float(node)
+            acc[1] = True
+        return
+    if isinstance(node, dict):
+        seg, rest = path[0], path[1:]
+        if seg == "**":
+            if rest:
+                sum_numeric(node, rest, acc)
+            for child in node.values():
+                sum_numeric(child, path, acc)
+            return
+        if seg == "*":
+            for child in node.values():
+                sum_numeric(child, rest, acc)
+            return
+        if seg in node:
+            sum_numeric(node[seg], rest, acc)
+    elif isinstance(node, list):
+        for child in node:
+            sum_numeric(child, path, acc)
+
+
 @dataclass
 class Policy:
     capture_request_body: bool = True
@@ -74,6 +124,30 @@ class Policy:
     matched_rules: list[str] = field(default_factory=list)
     route_pattern: str = ""
     sample_rate: float = 1.0
+    meters: dict = field(default_factory=dict)  # name -> [path segments]
+
+    def extract_meters(self, raw: bytes) -> dict:
+        """Pull numeric usage out of a response body.
+
+        Deliberately reads the RAW bytes, not the stored body: metering is
+        independent of capture, so a route that records no response body can
+        still be billed. That independence is the whole reason a rule can say
+        "keep the prompt private, still count the tokens".
+        """
+        if not self.meters or not raw:
+            return {}
+        try:
+            doc = json.loads(raw)
+        except Exception:  # noqa: BLE001 — a non-JSON body simply has no meters
+            return {}
+        out = {}
+        for name, paths in self.meters.items():
+            acc = [0.0, False]
+            for path in paths:
+                sum_numeric(doc, path, acc)
+            if acc[1]:
+                out[name] = acc[0]
+        return out
 
     def sanitize_headers(self, headers: dict[str, str]) -> dict[str, str]:
         return {
@@ -106,6 +180,7 @@ class _Rule:
     redact_paths: list[list[str]]
     labels: dict[str, str]
     sample: Optional[float]
+    meters: dict[str, list[list[str]]]
 
 
 class Engine:
@@ -144,6 +219,7 @@ class Engine:
                     redact_paths=paths,
                     labels=r.get("labels") or {},
                     sample=r.get("sample"),
+                    meters=_parse_meters(r.get("meter") or {}, r.get("name") or f"#{i}"),
                 )
             )
 
@@ -173,4 +249,5 @@ class Engine:
             policy.redact_headers.update(r.redact_headers)
             policy.redact_paths.extend(r.redact_paths)
             policy.labels.update(r.labels)
+            policy.meters.update(r.meters)
         return policy

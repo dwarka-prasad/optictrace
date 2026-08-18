@@ -11,13 +11,19 @@
 //	POST /api/config/validate  lint a candidate optic.yaml (dashboard editor)
 //	POST /api/reload           re-read optic.yaml from disk, hot-swap engine
 //	POST /api/ingest           telemetry records from framework SDKs
+//	POST /api/applogs/ingest   application log lines, correlated by span id
+//	GET  /api/applogs          log lines a request wrote (?trace= / ?span=)
 //	GET  /                     embedded developer dashboard
 package admin
 
 import (
+	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/csv"
 	"encoding/json"
+	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
@@ -28,6 +34,7 @@ import (
 	"time"
 
 	"github.com/dwarka-prasad/optictrace/ext"
+	"github.com/dwarka-prasad/optictrace/internal/applog"
 	"github.com/dwarka-prasad/optictrace/internal/config"
 	"github.com/dwarka-prasad/optictrace/internal/export"
 	"github.com/dwarka-prasad/optictrace/internal/metrics"
@@ -39,15 +46,21 @@ import (
 // Server wires the admin endpoints to their backing components. Any field
 // may be nil; the corresponding endpoints then return 404/501.
 type Server struct {
-	Logger     *slog.Logger
-	Collector  *metrics.Collector
-	Reader     store.LogStore     // queries (may be nil when driver=none)
-	Writer     *store.AsyncWriter // ingest path
-	Dispatcher *export.Dispatcher // output plugins (may be nil)
-	ConfigPath string
-	Reload     func() error // hot-reload hook installed by main
-	UIDir      string       // static dashboard directory (optional)
-	Version    string
+	Logger    *slog.Logger
+	Collector *metrics.Collector
+	Reader    store.LogStore // queries (may be nil when driver=none)
+	// AppLogs governs application log lines; nil or disabled means the ingest
+	// endpoint refuses with a clear reason rather than silently accepting and
+	// discarding. AppLogStore is the optional store side — a driver without
+	// it is a valid driver, so this may be nil while Reader is not.
+	AppLogs     *applog.Governor
+	AppLogStore store.AppLogStore
+	Writer      *store.AsyncWriter // ingest path
+	Dispatcher  *export.Dispatcher // output plugins (may be nil)
+	ConfigPath  string
+	Reload      func() error // hot-reload hook installed by main
+	UIDir       string       // static dashboard directory (optional)
+	Version     string
 	// AuthToken protects every endpoint when non-empty. HealthOpen keeps
 	// /healthz reachable for orchestrator probes.
 	AuthToken  string
@@ -128,6 +141,15 @@ func (s *Server) Handler() http.Handler {
 	routeFunc("POST /api/config/validate", ext.CapReadConfig, s.validateConfig)
 	routeFunc("POST /api/reload", ext.CapAdmin, s.reload)
 	routeFunc("POST /api/ingest", ext.CapIngest, s.ingest)
+	// Application log lines. Ingest is a machine-to-machine write, so it
+	// shares CapIngest with record ingest; reading them returns application
+	// payload text, which is CapReadPayload — the same grant as reading a
+	// captured body, because that is exactly what a log line can contain.
+	routeFunc("POST /api/applogs/ingest", ext.CapIngest, s.ingestAppLogs)
+	routeFunc("GET /api/applogs", ext.CapReadPayload, s.queryAppLogs)
+	// Counts only — no message text — so it sits behind the stats grant
+	// rather than the payload one.
+	routeFunc("GET /api/applogs/stats", ext.CapReadStats, s.appLogStats)
 	routeFunc("/", ext.CapUI, s.ui)
 
 	// Routes contributed by extensions — a login callback, a role API, an
@@ -749,7 +771,11 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	if s.Collector != nil {
 		s.Collector.SDKIngested()
 		s.Collector.Observe(metrics.Observation{
-			Method: rec.Method, Route: rec.Route, Status: rec.Status,
+			// Carry the RECORD's service, not the agent's: several SDK
+			// services report into one agent, and attributing their traffic to
+			// the collector would merge a fleet into a single series.
+			Service: rec.Service,
+			Method:  rec.Method, Route: rec.Route, Status: rec.Status,
 			Duration: time.Duration(rec.DurationMS * float64(time.Millisecond)),
 			ReqBytes: rec.ReqBytes, RespBytes: rec.RespBytes,
 			Labels: rec.Labels,
@@ -777,12 +803,27 @@ func (s *Server) ui(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// Say WHERE it looked and how to fix it. "Not found" on its own sends
+	// people to read the source; the usual cause is simply that the agent was
+	// started from a different working directory than the one -ui is relative
+	// to, which the path makes obvious at a glance.
+	where := s.UIDir
+	if where == "" {
+		where = "(no -ui directory set)"
+	} else if abs, err := filepath.Abs(where); err == nil {
+		where = abs
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = io.WriteString(w, `<!doctype html><title>OpticTrace</title>
 <body style="font-family:system-ui;background:#0b1220;color:#e2e8f0;display:grid;place-items:center;height:100vh;margin:0">
-<div style="text-align:center"><h1 style="letter-spacing:.05em">OpticTrace</h1>
-<p>agent running — dashboard build not found</p>
-<p><a style="color:#7dd3fc" href="/metrics">/metrics</a> ·
+<div style="text-align:center;max-width:44rem;padding:1rem">
+<h1 style="letter-spacing:.05em">OpticTrace</h1>
+<p>Agent running. The API below works — only the dashboard build is missing.</p>
+<p style="color:#7c8cad;font-size:.85rem">Looked in <code style="color:#e2e8f0">`+
+		html.EscapeString(where)+`</code></p>
+<p style="color:#7c8cad;font-size:.85rem">Build it with <code style="color:#e2e8f0">make ui</code>,
+or start the agent with <code style="color:#e2e8f0">-ui /path/to/ui/out</code>.</p>
+<p style="margin-top:1.5rem"><a style="color:#7dd3fc" href="/metrics">/metrics</a> ·
 <a style="color:#7dd3fc" href="/api/stats">/api/stats</a> ·
 <a style="color:#7dd3fc" href="/api/logs">/api/logs</a></p></div></body>`)
 }
@@ -866,4 +907,161 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func httpError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// --- application logs --------------------------------------------------------
+
+// maxAppLogBatch bounds one ingest call. Log shippers batch aggressively and
+// an unbounded body is a trivial way to make the agent the thing that falls
+// over, which the telemetry pipeline must never be.
+const (
+	maxAppLogBatch     = 1000
+	maxAppLogBodyBytes = 4 << 20
+)
+
+// appLogBatch accepts either a single line or an array, because log shippers
+// disagree about which they send and rejecting one of them is a support
+// burden with no upside.
+type appLogBatch struct {
+	lines []store.AppLog
+}
+
+func (b *appLogBatch) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		return json.Unmarshal(trimmed, &b.lines)
+	}
+	var one store.AppLog
+	if err := json.Unmarshal(trimmed, &one); err != nil {
+		return err
+	}
+	b.lines = []store.AppLog{one}
+	return nil
+}
+
+// ingestAppLogs accepts application log lines and stores the ones that belong
+// to a span. Governance runs here, before persistence: a log line carries
+// whatever someone pasted into it, so it is redacted and capped on the way in
+// rather than stored raw and cleaned up later.
+func (s *Server) ingestAppLogs(w http.ResponseWriter, r *http.Request) {
+	if s.AppLogs == nil || !s.AppLogs.Enabled() {
+		httpError(w, http.StatusNotImplemented,
+			"application logs are off — set telemetry.app_logs.enabled: true")
+		return
+	}
+	if s.AppLogStore == nil {
+		// The driver has no app-log support. Say which problem it is: this
+		// looks identical to a config mistake from the caller's side.
+		httpError(w, http.StatusNotImplemented,
+			"the configured store driver does not implement app-log storage")
+		return
+	}
+
+	var batch appLogBatch
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxAppLogBodyBytes)).Decode(&batch); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid log batch: "+err.Error())
+		return
+	}
+	if len(batch.lines) > maxAppLogBatch {
+		httpError(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("batch of %d exceeds the %d-line limit", len(batch.lines), maxAppLogBatch))
+		return
+	}
+
+	kept := make([]store.AppLog, 0, len(batch.lines))
+	dropped := map[string]int{}
+	for i := range batch.lines {
+		l := &batch.lines[i]
+		if l.Time.IsZero() {
+			l.Time = time.Now()
+		}
+		if l.Source == "" {
+			l.Source = "ingest"
+		}
+		if ok, reason := s.AppLogs.Admit(l); ok {
+			kept = append(kept, *l)
+		} else {
+			dropped[string(reason)]++
+		}
+	}
+
+	if len(kept) > 0 {
+		// Storing synchronously here is deliberate: this is not the proxied
+		// request's hot path — it is a separate call from a log shipper, and
+		// backpressure on it is the correct signal that the store is behind.
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		if err := s.AppLogStore.SaveAppLogs(ctx, kept); err != nil {
+			if s.Logger != nil {
+				s.Logger.Error("app log save failed", "error", err, "lines", len(kept))
+			}
+			httpError(w, http.StatusServiceUnavailable, "store unavailable")
+			return
+		}
+	}
+
+	if s.Collector != nil {
+		s.Collector.AppLogStored(len(kept))
+		for reason, n := range dropped {
+			s.Collector.AppLogDropped(reason, n)
+		}
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"stored":  len(kept),
+		"dropped": dropped,
+	})
+}
+
+// queryAppLogs returns the lines an application wrote, oldest first — reading
+// what a request did means reading it in the order it happened.
+func (s *Server) queryAppLogs(w http.ResponseWriter, r *http.Request) {
+	if s.AppLogStore == nil {
+		httpError(w, http.StatusNotImplemented, "app-log storage is not configured")
+		return
+	}
+	q := r.URL.Query()
+	f := store.AppLogFilter{
+		TraceID:  q.Get("trace"),
+		SpanID:   q.Get("span"),
+		Service:  q.Get("service"),
+		LevelMin: q.Get("level"),
+		Search:   q.Get("q"),
+	}
+	f.Limit, _ = strconv.Atoi(q.Get("limit"))
+	f.Offset, _ = strconv.Atoi(q.Get("offset"))
+	if f.Limit <= 0 {
+		f.Limit = 200
+	}
+	if window := q.Get("window"); window != "" {
+		f.Since = time.Now().Add(-parseDurationDefault(window, time.Hour))
+	}
+	lines, total, err := s.AppLogStore.QueryAppLogs(r.Context(), f)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if lines == nil {
+		lines = []store.AppLog{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"lines": lines, "total": total})
+}
+
+// appLogStats returns aggregate counts for the dashboard. It exposes no
+// message text, which is why it needs only CapReadStats.
+func (s *Server) appLogStats(w http.ResponseWriter, r *http.Request) {
+	if s.AppLogStore == nil {
+		// Not an error: app logs are optional, and a dashboard asking about a
+		// feature nobody turned on should render an empty panel, not a banner.
+		writeJSON(w, http.StatusOK, &store.AppLogSummary{
+			ByLevel: map[string]int64{}, ByService: map[string]int64{},
+		})
+		return
+	}
+	window := parseDurationDefault(r.URL.Query().Get("window"), time.Hour)
+	sum, err := s.AppLogStore.AppLogStats(r.Context(), time.Now().Add(-window))
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, sum)
 }

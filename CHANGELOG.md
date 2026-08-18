@@ -12,6 +12,46 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 ### Added
 
+- **Application logs, correlated to the span that produced them.** `POST /api/applogs/ingest` accepts the lines your service wrote while serving a request; `GET /api/applogs?span=…` (or `?trace=`, `?level=`, `?q=`) reads them back, and the inspector shows them under the request itself. Correlation is by span id — never by timestamp, which under concurrent traffic files one tenant's line inside another tenant's request.
+
+  Log lines are the **highest-risk surface** in the product: a payload is structured and can be redacted by path, but a log line is free text written by whoever was debugging that day. So `telemetry.app_logs` governs them on the way in rather than storing raw and cleaning up later — a level floor, a per-span line cap, a message byte cap, regex and field redaction, and its own retention horizon. An app that logs its own `Authorization` header is stored as `[REDACTED]`.
+
+  `purge` deletes a tenant's log lines together with their records in one transaction: erasure that removes the requests but leaves the lines those requests wrote is not erasure, and a log is the likelier place for the personal data to be sitting.
+
+  Lines carrying no span (startup, cron, background workers) are dropped by default and **counted** in `optictrace_app_logs_dropped_total{reason="orphan"}` — data discarded silently is data nobody knows they are missing. `drop_orphans: false` keeps them.
+
+  Storage support is optional: `ext.AppLogStore` is a separate interface from `ext.Store`, discovered by type assertion, so a third-party driver without it is still a complete driver. Implemented for SQLite; Postgres and ClickHouse report the feature as unavailable rather than failing.
+
+- **Collector mode.** With no `service.listen` and no `service.upstream`, `optictrace run` starts the admin API without a proxy — the deployment where framework SDKs govern in-process and POST to `/api/ingest`. Previously this required inventing a dummy upstream nobody talks to. A half-configured proxy (one address without the other) is still refused, because that is an omission rather than a mode.
+
+- **A Python example that exercises all of it** (`examples/python-shop`): three FastAPI services making real HTTP calls to each other, governed in-process by the SDK, reporting into one agent, with a 25-assertion verification suite and an optional Prometheus + Grafana stack.
+
+- **`make setup`, `make seed`, `make fixture`, `make test-all`** and `scripts/seed.sh`, which drives traffic covering every mechanism in `optic.yaml` — several tenants across regions and plans, an ungoverned route, errors, slow calls and a correlated trace. `docker compose up` now seeds itself, so the tour lands on a dashboard with something on it instead of an empty shell.
+
+### Fixed
+
+- **The FastAPI SDK had never delivered a single record.** It formatted timestamps with `%z` (`+0530`), which the agent's strict RFC3339 parser rejects with a 400 — and `_ship` swallowed every exception, so the SDK looked healthy while shipping nothing at all. Timestamps are now RFC3339 UTC, delivery failures are counted and the last error kept, and the test suite asserts the wire format rather than only the fields.
+
+- **`optictrace test` never passed the request body**, so no rule using `match.body` or a `json:` label could be tested at all. An untestable governance rule is one nobody can trust. The runner now mirrors the proxy's two passes — redact, then let criteria and labels read the governed body.
+
+- **A fleet of SDK services collapsed into one Prometheus series.** `service` was a const label fixed at agent startup, so several services reporting into one agent were all attributed to the collector; the store kept them apart while every dashboard showed one service. It is now a per-observation label. PromQL cannot distinguish a const label from a variable one, so existing queries and dashboards are unaffected.
+
+- **The Python SDK ignored `meter:` entirely**, so anyone billing from a FastAPI service attributed zero. Meters now match the Go engine, including `*`/`**` paths, and read the raw response bytes so metering stays independent of capture.
+
+- **The FastAPI SDK carried no trace context**, so SDK-instrumented services could not be correlated. It now adopts an inbound `traceparent` or starts a trace, exposes the span through a `ContextVar`, and ships `outbound_headers()` for the calls a service makes downstream. Label sources gained `static:`, `path:<n>` and the `|<regex>` capture suffix, matching the Go engine.
+
+- **The dashboard silently vanished when the agent ran from another directory.** `-ui` defaults to a path relative to the working directory; the agent now also looks beside its own executable, and the fallback page says which path it searched instead of only "not found".
+
+- **The flagship `optic.yaml` recorded a credential in the query string** (`?api_key=…` was not in `redact.query_params`) and **stored unmasked customer emails** returned by the user-read path. Both are closed, with rule tests covering them.
+
+### Changed
+
+- **The dashboard overview leads with governance rather than latency.** A rule that matches nothing is called out by name — the config looks right, the dashboard looks green, and nothing is being enforced — alongside new panels for traffic by tenant, application logs by level, succeeded-vs-failed traffic and a per-service fleet strip. Panels refresh together on one window so they cannot disagree with each other.
+
+- **`examples/traffic-sample.jsonl` is generated, not hand-written** (`make fixture`), from a real run against the same config the PR bot reviews with. A hand-written fixture keeps whatever fields existed the day someone typed it, so the bot quietly stops exercising everything added since; the old one had no trace ids, no streams and two label keys.
+
+### Added
+
 - **The dashboard caught up with the tags and traces work.** The inspector gained a **Tags** column whose chips filter on click (`label.<name>=<value>`, all of them ANDed, removable from the filter bar), a **stream** badge so a 600,000ms row reads as a connection lifetime rather than a catastrophe ([#24](https://github.com/dwarka-prasad/optictrace/issues/24)), and a **request trace** section in the detail panel that fetches every hop of the trace and renders it as a tree with per-hop latency bars — clicking a hop jumps to it. A tag a rule declared but the request never populated shows as `name=∅` rather than being hidden, since a silently absent tag is the usual symptom of a mistyped source. Exports now carry the tag filters, so downloading what the table shows no longer means downloading everything.
 - **Usage can group by any tag**, not only the billing consumer label — partner, channel, product, whatever is in play. The picker is populated from tags present in recent traffic rather than from the config, because a tag that is declared but never populated is a dead option that sends someone to an empty breakdown.
 

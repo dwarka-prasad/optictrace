@@ -399,6 +399,7 @@
     <div class="nav-links">
       <a href="#how">How it works</a>
       <a href="#config">Config</a>
+      <a href="#trace">Traces &amp; logs</a>
       <a href="#tooling">Tooling</a>
       <a href="#performance">Performance</a>
       <a class="btn btn-ghost" href="https://github.com/dwarka-prasad/optictrace">GitHub</a>
@@ -655,6 +656,73 @@
     </div>
   </section>
 
+  <!-- ================== TRACES & APPLICATION LOGS ================== -->
+  <section id="trace" class="wrap">
+    <div class="redact-rule"></div>
+    <div class="eyebrow">What it did, and why</div>
+    <div class="prose">
+      <h2>One request, every hop, and the lines it logged</h2>
+      <p>
+        Every record carries W3C trace context, so services reporting into one store
+        stop being a flat list and become a request tree. The forwarded request
+        carries <em>this</em> hop&rsquo;s span, which is what makes downstream calls
+        nest under it rather than becoming siblings.
+      </p>
+      <p>
+        That span is also handed to your application — so the lines it writes while
+        serving a request can be filed under that exact request. Correlation is a
+        fact, not a guess: nothing is matched by timestamp, which under concurrent
+        traffic would file one tenant&rsquo;s log line inside another tenant&rsquo;s
+        request.
+      </p>
+    </div>
+
+<pre><span class="c">$ curl '.../api/logs?trace=a8f2890a4536810938c4ec89ddd40872'</span>
+
+storefront  POST /api/v1/orders            200  span=83c03ddd parent=-
+  catalog   GET  /api/v1/catalog/SKU-100   200  span=3a2c0d92 parent=83c03ddd
+  payments  POST /api/v1/payments/charge   200  span=e0f134d5 parent=83c03ddd
+      [debug] charging card <span class="s">[REDACTED]</span> for 129.00
+      [info ] charge requested  amount=129.0 order_ref=ord-SKU-100
+      [info ] charge captured   amount=129.0</pre>
+
+    <div class="prose" style="margin-top:1.6rem">
+      <p>
+        That <code>[debug]</code> line is a service logging its own card number while
+        someone was debugging — which is how the leak actually happens. Log lines are
+        the highest-risk surface here: a payload is structured and can be redacted by
+        path, but a log line is free text. So they run through the same policy on the
+        way in rather than being stored raw and cleaned up later.
+      </p>
+    </div>
+
+    <div class="split" style="margin-top:1.6rem">
+      <div>
+        <div class="code-label">optic.yaml</div>
+<pre>telemetry:
+  app_logs:
+    enabled: <span class="k">true</span>
+    level_min: info
+    max_lines_per_span: <span class="k">200</span>
+    retention_max_age: 168h
+    drop_orphans: <span class="k">true</span>
+    redact:
+      patterns:
+        - <span class="s">'Bearer\s+\S+'</span>
+        - <span class="s">'\b\d{13,19}\b'</span>
+      fields: [authorization, password]</pre>
+      </div>
+      <div>
+        <ul class="ticks">
+          <li><strong>Erasure covers logs.</strong> <code>purge</code> deletes a tenant&rsquo;s log lines with their records in one transaction — removing the requests but keeping the lines they wrote is not erasure</li>
+          <li><strong>Drops are counted, never silent.</strong> Lines with no request behind them are discarded by default and reported in <code>optictrace_app_logs_dropped_total</code></li>
+          <li><strong>Bounded by design.</strong> A level floor, a per-span line cap and a byte cap, so one retry loop cannot swamp the store</li>
+          <li><strong>Storage is optional.</strong> <code>ext.AppLogStore</code> is separate from <code>ext.Store</code>, so a third-party driver without it is still a complete driver</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
   <!-- ======================= TOOLING ======================= -->
   <section id="tooling" class="band">
     <div class="wrap">
@@ -841,9 +909,14 @@ http.ListenAndServe(<span class="s">":8080"</span>, agent.<span class="k">Middle
     OpticTraceMiddleware,
     config_path=<span class="s">"optic.yaml"</span>,
     agent_url=<span class="s">"http://localhost:9095"</span>,
-)</pre>
+)
+
+<span class="c"># your ordinary logging, filed under the request that wrote it</span>
+logging.getLogger().addHandler(
+    <span class="k">OpticTraceLogHandler</span>(<span class="s">"http://localhost:9095"</span>))</pre>
         <ul class="ticks">
           <li>SDKs apply governance <strong>in-process</strong> — raw payloads never cross a process boundary</li>
+          <li>With no <code>listen</code> and no <code>upstream</code> the agent runs in <strong>collector mode</strong>: store, metrics and dashboard, no proxy in the request path</li>
           <li>SQLite for a sidecar, Postgres when several agents share history</li>
           <li>Export to files, webhooks, OpenTelemetry, or your own executable</li>
         </ul>
@@ -868,6 +941,12 @@ docker compose up --build
 <span class="c"># http://localhost:3000  Grafana</span>
 <span class="c"># http://localhost:9090  Prometheus</span></pre>
       <p class="prose" style="margin-top:1.4rem;font-size:0.93rem;color:var(--ink-3)">
+        Want to see the SDK, traces and application logs working together?
+        <code>examples/python-shop</code> is three FastAPI services making real calls to
+        each other, with a 25-assertion suite that checks the claims on this page
+        against a live stack.
+      </p>
+      <p class="prose" style="margin-top:1rem;font-size:0.93rem;color:var(--ink-3)">
         Prefer just the binary? <code>brew install dwarka-prasad/tap/optictrace</code> covers
         macOS and Linux on Intel and ARM, <code>go install</code> builds from source, and every
         release ships checksummed, cosign-signed archives with an SBOM.
