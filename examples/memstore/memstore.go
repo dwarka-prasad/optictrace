@@ -85,6 +85,15 @@ func matches(r *ext.Record, f ext.Filter) bool {
 	if !f.Until.IsZero() && r.Time.After(f.Until) {
 		return false
 	}
+	// Every listed label must match, compared literally — a tenant named
+	// "acme_1" must never select "acmeX1". The conformance suite checks this
+	// specifically, because getting it wrong shows one tenant another
+	// tenant's traffic rather than returning an error anyone would notice.
+	for k, v := range f.Labels {
+		if r.Labels[k] != v {
+			return false
+		}
+	}
 	return true
 }
 
