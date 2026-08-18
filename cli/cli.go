@@ -36,6 +36,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -46,6 +47,7 @@ import (
 
 	"github.com/dwarka-prasad/optictrace/ext"
 	"github.com/dwarka-prasad/optictrace/internal/admin"
+	"github.com/dwarka-prasad/optictrace/internal/applog"
 	"github.com/dwarka-prasad/optictrace/internal/config"
 	"github.com/dwarka-prasad/optictrace/internal/engine"
 	"github.com/dwarka-prasad/optictrace/internal/export"
@@ -667,20 +669,71 @@ func validate(path string) {
 	}
 }
 
+// resolveUIDir finds the dashboard build.
+//
+// The -ui default is relative to the WORKING DIRECTORY, so running the agent
+// from anywhere but the repo root used to serve the "dashboard build not
+// found" page with no hint about where it had looked. A released binary sits
+// beside its assets, so fall back to paths relative to the executable before
+// giving up — and when giving up, say which paths were tried.
+func resolveUIDir(flagValue string, logger *slog.Logger) string {
+	tried := []string{}
+	check := func(p string) bool {
+		if p == "" {
+			return false
+		}
+		tried = append(tried, p)
+		st, err := os.Stat(p)
+		return err == nil && st.IsDir()
+	}
+	if check(flagValue) {
+		return flagValue
+	}
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		// bin/optictrace -> ../ui/out is the source layout; ./ui/out is how a
+		// release tarball is laid out.
+		for _, cand := range []string{
+			filepath.Join(dir, "ui", "out"),
+			filepath.Join(dir, "..", "ui", "out"),
+		} {
+			if check(cand) {
+				abs, _ := filepath.Abs(cand)
+				logger.Info("dashboard build found next to the binary", "ui_dir", abs)
+				return cand
+			}
+		}
+	}
+	logger.Warn("no dashboard build found — the admin API still works, "+
+		"but / will serve a status page instead of the dashboard "+
+		"(build it with `make ui`, or pass -ui <dir>)",
+		"tried", strings.Join(tried, ", "))
+	return ""
+}
+
 func run(configPath, uiDir string) {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	uiDir = resolveUIDir(uiDir, logger)
 
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		logger.Error("invalid configuration", "error", err)
 		os.Exit(1)
 	}
-	// `run` is the only path that opens a listener, so it is where the
-	// sidecar's address requirements are enforced. Without this an omitted
-	// service.listen reaches net/http as Addr:"" and binds port 80.
-	if err := cfg.RequireProxyAddrs(); err != nil {
-		logger.Error("invalid configuration", "error", err)
-		os.Exit(1)
+	// Two ways to run. As a SIDECAR the agent proxies traffic, and both
+	// addresses are required — without this an omitted service.listen reaches
+	// net/http as Addr:"" and binds port 80.
+	//
+	// As a COLLECTOR it proxies nothing: framework SDKs govern in-process and
+	// POST governed records to /api/ingest, so there is no upstream to name.
+	// Requiring a listen/upstream there would mean inventing a dummy proxy
+	// nobody talks to, which is a workaround, not a configuration.
+	collectorOnly := cfg.Service.Listen == "" && cfg.Service.Upstream == ""
+	if !collectorOnly {
+		if err := cfg.RequireProxyAddrs(); err != nil {
+			logger.Error("invalid configuration", "error", err)
+			os.Exit(1)
+		}
 	}
 	eng := engine.New(cfg)
 
@@ -707,8 +760,35 @@ func run(configPath, uiDir string) {
 		}
 		asyncOpts = append(asyncOpts, store.WithRetention(cfg.Telemetry.Store.RetentionMaxRows),
 			store.WithMaxAge(cfg.Telemetry.Store.MaxAge()))
+		if al := cfg.Telemetry.AppLogs; al != nil && al.RetentionMaxAge > 0 {
+			asyncOpts = append(asyncOpts, store.WithAppLogMaxAge(al.RetentionMaxAge))
+		}
 		writer = store.NewAsyncWriter(sqlStore, cfg.Telemetry.Store.QueueSize, logger, asyncOpts...)
 		logger.Info("payload store ready", "driver", cfg.Telemetry.Store.Driver)
+	}
+
+	// --- application logs -------------------------------------------------
+	// Two independent things have to be true for this to work: the policy has
+	// to be on, and the driver has to support it. They fail differently, so
+	// they are reported differently — "your config is off" and "your driver
+	// cannot do this" look identical from the endpoint otherwise.
+	appLogs, err := applog.New(cfg.Telemetry.AppLogs)
+	if err != nil {
+		logger.Error("invalid app-log policy", "error", err)
+		os.Exit(1)
+	}
+	var appLogStore store.AppLogStore
+	if appLogs.Enabled() {
+		if als, ok := reader.(store.AppLogStore); ok {
+			appLogStore = als
+			logger.Info("application logs enabled",
+				"level_min", cfg.Telemetry.AppLogs.LevelMin,
+				"drop_orphans", cfg.Telemetry.AppLogs.DropOrphanLines())
+		} else {
+			logger.Warn("application logs are enabled but the store driver does not support them — "+
+				"lines will be refused",
+				"driver", cfg.Telemetry.Store.Driver)
+		}
 	}
 
 	// --- output exporters (custom plugins) --------------------------------
@@ -798,6 +878,8 @@ func run(configPath, uiDir string) {
 			CORSOrigins:     cfg.Telemetry.CORSOrigins,
 			AnalysisMaxRows: cfg.Telemetry.Store.AnalysisMaxRows,
 			Detectors:       scanDetectors(cfg, logger),
+			AppLogs:         appLogs,
+			AppLogStore:     appLogStore,
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -837,24 +919,33 @@ func run(configPath, uiDir string) {
 		// WebSocket upgrades still reach the handler below.
 		proxyHandler = h2c.NewHandler(handler, &http2.Server{})
 	}
-	proxySrv := &http.Server{
-		Addr:              cfg.Service.Listen,
-		Handler:           proxyHandler,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	go func() {
-		logger.Info("optictrace listening",
-			"h2c", cfg.Service.HTTP2,
+	var proxySrv *http.Server
+	if collectorOnly {
+		logger.Info("optictrace collector mode — no proxy listener",
 			"service", cfg.Service.Name,
-			"listen", cfg.Service.Listen,
-			"upstream", cfg.Service.Upstream,
+			"ingest", cfg.Telemetry.AdminListen+"/api/ingest",
 			"rules", len(cfg.Rules),
 			"version", version)
-		if err := proxySrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("proxy server failed", "error", err)
-			os.Exit(1)
+	} else {
+		proxySrv = &http.Server{
+			Addr:              cfg.Service.Listen,
+			Handler:           proxyHandler,
+			ReadHeaderTimeout: 10 * time.Second,
 		}
-	}()
+		go func() {
+			logger.Info("optictrace listening",
+				"h2c", cfg.Service.HTTP2,
+				"service", cfg.Service.Name,
+				"listen", cfg.Service.Listen,
+				"upstream", cfg.Service.Upstream,
+				"rules", len(cfg.Rules),
+				"version", version)
+			if err := proxySrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("proxy server failed", "error", err)
+				os.Exit(1)
+			}
+		}()
+	}
 
 	// --- signals ----------------------------------------------------------
 	hup := make(chan os.Signal, 1)
@@ -871,7 +962,9 @@ func run(configPath, uiDir string) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = proxySrv.Shutdown(ctx)
+	if proxySrv != nil {
+		_ = proxySrv.Shutdown(ctx)
+	}
 	_ = adminSrv.Shutdown(ctx)
 	if writer != nil {
 		_ = writer.Close() // drains the telemetry queue

@@ -95,3 +95,29 @@ func TestEmptyLabelValuesDoNotConsumeBudget(t *testing.T) {
 		}
 	}
 }
+
+// Several SDK services reporting into one agent must stay separable in
+// Prometheus. `service` used to be a const label fixed at agent startup, so a
+// fleet collapsed into the collector's own name — the store kept them apart
+// and the dashboards did not.
+func TestObservationServiceOverridesAgentName(t *testing.T) {
+	c := New("collector-agent", nil, []string{"tenant"}, 0)
+	c.Observe(Observation{Service: "storefront", Method: "POST", Route: "/orders", Status: 200,
+		Labels: map[string]string{"tenant": "acme"}})
+	c.Observe(Observation{Service: "payments", Method: "POST", Route: "/charge", Status: 200,
+		Labels: map[string]string{"tenant": "acme"}})
+	// An observation with no service of its own is the sidecar case and
+	// belongs to the agent.
+	c.Observe(Observation{Method: "GET", Route: "/health", Status: 200,
+		Labels: map[string]string{"tenant": "acme"}})
+
+	rec := httptest.NewRecorder()
+	c.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+
+	for _, want := range []string{"storefront", "payments", "collector-agent"} {
+		if !strings.Contains(body, `service="`+want+`"`) {
+			t.Errorf("optictrace_requests_total is missing service=%q", want)
+		}
+	}
+}

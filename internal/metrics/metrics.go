@@ -32,6 +32,11 @@ import (
 
 // Observation is one completed HTTP exchange, as seen by the collector.
 type Observation struct {
+	// Service names the application the exchange belongs to. Empty means the
+	// agent's own service — the sidecar case, where they are the same thing.
+	// An SDK reporting into a shared agent sets it, which is what keeps a
+	// fleet from collapsing into one series.
+	Service   string
 	Method    string
 	Route     string // low-cardinality route pattern, not the raw path
 	Status    int
@@ -81,6 +86,9 @@ type Collector struct {
 	// buckets and constLabels are kept so the vectors can be rebuilt.
 	buckets     []float64
 	constLabels prometheus.Labels
+	// service is this agent's own name, used when an observation does not
+	// carry one of its own.
+	service string
 
 	reqSize  *prometheus.HistogramVec
 	respSize *prometheus.HistogramVec
@@ -92,6 +100,8 @@ type Collector struct {
 	inflight       prometheus.Gauge
 	dropped        prometheus.Counter
 	ingested       prometheus.Counter
+	appLogsStored  prometheus.Counter
+	appLogsDropped *prometheus.CounterVec
 
 	exported     *prometheus.CounterVec
 	exportFailed *prometheus.CounterVec
@@ -110,18 +120,27 @@ type dimensions struct {
 }
 
 // newDimensions builds the config-dependent vectors for one label schema.
+//
+// `service` is a VARIABLE label here, not a const one, even though the agent
+// has a service name of its own. When framework SDKs report into a shared
+// agent — the documented fleet deployment — the records carry several service
+// names and a const label would collapse them all into the collector's own.
+// The store kept them apart while Prometheus did not, so a fleet looked like
+// one service on every dashboard.
+//
+// PromQL cannot tell a const label from a variable one, so existing queries
+// and dashboards are unaffected.
 func newDimensions(keys []string, buckets []float64, constLabels prometheus.Labels) *dimensions {
-	base := []string{"method", "route", "status", "status_class"}
+	base := []string{"service", "method", "route", "status", "status_class"}
 	return &dimensions{
 		keys: keys,
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "optictrace_requests_total", Help: "Total HTTP requests observed.",
-			ConstLabels: constLabels,
 		}, append(append([]string{}, base...), keys...)),
 		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "optictrace_request_duration_seconds", Help: "Request latency.",
-			Buckets: buckets, ConstLabels: constLabels,
-		}, append([]string{"method", "route"}, keys...)),
+			Buckets: buckets,
+		}, append([]string{"service", "method", "route"}, keys...)),
 	}
 }
 
@@ -136,6 +155,7 @@ func New(service string, buckets []float64, customKeys []string, maxLabelValues 
 
 	c := &Collector{
 		stable:         reg,
+		service:        service,
 		maxLabelValues: maxLabelValues,
 		buckets:        buckets,
 		constLabels:    constLabels,
@@ -176,6 +196,18 @@ func New(service string, buckets []float64, customKeys []string, maxLabelValues 
 			Name: "optictrace_sdk_ingested_total", Help: "Records received from framework SDKs via /api/ingest.",
 			ConstLabels: constLabels,
 		}),
+		appLogsStored: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "optictrace_app_logs_stored_total", Help: "Application log lines stored against a span.",
+			ConstLabels: constLabels,
+		}),
+		// Every discarded line is counted with its reason. A drop you cannot
+		// see is indistinguishable from an application that stopped logging,
+		// which is the wrong thing to be guessing about at 3am.
+		appLogsDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "optictrace_app_logs_dropped_total",
+			Help:        "Application log lines discarded, by reason (orphan, level, span_cap, disabled, empty).",
+			ConstLabels: constLabels,
+		}, []string{"reason"}),
 		exported: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "optictrace_exported_total", Help: "Records delivered by output exporters.",
 			ConstLabels: constLabels,
@@ -204,6 +236,7 @@ func New(service string, buckets []float64, customKeys []string, maxLabelValues 
 		c.reqSize, c.respSize,
 		c.streams, c.streamDuration, c.streamsOpen,
 		c.inflight, c.dropped, c.ingested,
+		c.appLogsStored, c.appLogsDropped,
 		c.exported, c.exportFailed, c.exportDrops,
 		c.labelCapped, c.labelDistinct,
 		collectors.NewGoCollector(),
@@ -221,10 +254,14 @@ func (c *Collector) Observe(o Observation) {
 	// values from one schema and the histogram's from another.
 	d := c.dims.Load()
 
-	counterVals := make([]string, 0, 4+len(d.keys))
-	counterVals = append(counterVals, o.Method, o.Route, status, class)
-	durationVals := make([]string, 0, 2+len(d.keys))
-	durationVals = append(durationVals, o.Method, o.Route)
+	svc := o.Service
+	if svc == "" {
+		svc = c.service
+	}
+	counterVals := make([]string, 0, 5+len(d.keys))
+	counterVals = append(counterVals, svc, o.Method, o.Route, status, class)
+	durationVals := make([]string, 0, 3+len(d.keys))
+	durationVals = append(durationVals, svc, o.Method, o.Route)
 	for _, k := range d.keys {
 		v := c.guard(k, o.Labels[k])
 		counterVals = append(counterVals, v)
@@ -341,6 +378,20 @@ func (c *Collector) StoreDropped() { c.dropped.Inc() }
 
 // SDKIngested counts a record received from a framework SDK.
 func (c *Collector) SDKIngested() { c.ingested.Inc() }
+
+// AppLogStored counts lines persisted against a span.
+func (c *Collector) AppLogStored(n int) {
+	if n > 0 {
+		c.appLogsStored.Add(float64(n))
+	}
+}
+
+// AppLogDropped counts a discarded line under the reason it was discarded.
+func (c *Collector) AppLogDropped(reason string, n int) {
+	if n > 0 {
+		c.appLogsDropped.WithLabelValues(reason).Add(float64(n))
+	}
+}
 
 // Exporter accounting — satisfies export.Metrics.
 func (c *Collector) ExportDelivered(exporter string, n int) {
