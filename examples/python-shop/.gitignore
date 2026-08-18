@@ -1,0 +1,6 @@
+.venv/
+.run/
+shop.db
+shop.db-wal
+shop.db-shm
+__pycache__/

@@ -1,0 +1,13 @@
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    # localhost, not a compose service name: both containers run on the host
+    # network so Prometheus can scrape an agent bound to 127.0.0.1. Keeping
+    # the admin port on loopback is the whole point — it serves every captured
+    # payload, and publishing it to reach it from a container would be trading
+    # the security posture for a convenience.
+    url: http://localhost:9090
+    isDefault: true
