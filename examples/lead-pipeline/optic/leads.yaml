@@ -1,0 +1,60 @@
+# Edge sidecar. This is where partner attribution and PII redaction happen,
+# because it is the only hop that sees the original payload.
+version: 1
+service:
+  name: leads
+  listen: "127.0.0.1:8001"
+  upstream: "http://127.0.0.1:7001"
+  # Default, shown explicitly: the forwarded request carries this hop's span so
+  # scoring and bureau become its children rather than its siblings.
+  trace:
+    propagate_upstream: true
+    response_header: X-Trace-Id
+
+telemetry:
+  admin_listen: "127.0.0.1:9001"
+  console_log: false
+  store:
+    driver: sqlite
+    dsn: ./pipeline.db          # shared by all three sidecars; WAL handles it
+    retention_max_rows: 50000
+  billing:
+    consumer_label: partner
+    currency: INR
+    prices:
+      per_request: 0.05
+
+rules:
+  # Mask PII in BOTH directions. The lead service echoes the applicant back, so
+  # a request-only rule would leak it on the way out.
+  - name: redact-applicant-pii
+    match: { path: "/api/v1/leads" }
+    redact:
+      headers: [Authorization, Cookie]
+      json_fields:
+        - "$.**.pan"
+        - "$.**.phone"
+        - "$.**.email"
+
+  # Attribution. Flipkart and Samsung call the same endpoint with the same
+  # tenant and product — the only thing separating them is a body field.
+  - name: attribute-lead
+    match: { path: "/api/v1/leads" }
+    labels:
+      tenant:  "header:X-Tenant-ID"
+      partner: "json:$.**.source"
+      product: "json:$.**.product"
+      decision: "json_response:$.decision"
+
+  # Criteria on the body: classify the channel without a second concept.
+  - name: marketplace-partners
+    match:
+      path: "/api/v1/leads"
+      body: { "$.**.source": "^(flipkart|amazon)$" }
+    labels: { channel: "static:marketplace" }
+
+  - name: oem-partners
+    match:
+      path: "/api/v1/leads"
+      body: { "$.**.source": "^(samsung|xiaomi)$" }
+    labels: { channel: "static:oem" }

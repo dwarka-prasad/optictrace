@@ -1,0 +1,25 @@
+# Internal sidecar. Samples aggressively — an internal hop does not need every
+# body kept — but rescues failures, which are the ones worth having.
+version: 1
+service:
+  name: scoring
+  listen: "127.0.0.1:8002"
+  upstream: "http://127.0.0.1:7002"
+telemetry:
+  admin_listen: "127.0.0.1:9002"
+  console_log: false
+  store: { driver: sqlite, dsn: ./pipeline.db }
+
+rules:
+  - name: score-metering
+    match: { path: "/api/v1/score" }
+    labels:
+      tenant: "header:X-Tenant-ID"
+    # Usage extracted from the response, priced per tenant at the edge.
+    meter:
+      tokens: "$.usage.total_tokens"
+    # Keep one body in four, but never throw away a failure.
+    sample: 0.25
+    keep_errors: true
+    redact:
+      json_fields: ["$.**.pan", "$.**.phone", "$.**.email"]

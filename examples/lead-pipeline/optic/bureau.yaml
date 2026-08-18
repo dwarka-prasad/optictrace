@@ -1,0 +1,26 @@
+# Third-party sidecar, deliberately UNDER-GOVERNED: no rule covers the card
+# number or Aadhaar in the bureau response. `optictrace scan` should find both,
+# which is the point — this is the gap the tool exists to surface.
+version: 1
+service:
+  name: bureau
+  listen: "127.0.0.1:8003"
+  upstream: "http://127.0.0.1:7003"
+telemetry:
+  admin_listen: "127.0.0.1:9003"
+  console_log: false
+  store: { driver: sqlite, dsn: ./pipeline.db }
+
+scan:
+  detectors:
+    - kind: aadhaar
+      severity: high
+      why: "an Aadhaar number — regulated under India's DPDP Act"
+      pattern: '\b\d{4}\s?\d{4}\s?\d{4}\b'
+      verify: verhoeff
+
+rules:
+  - name: observe-bureau
+    match: { path: "/api/v1/history" }
+    labels:
+      tenant: "header:X-Tenant-ID"

@@ -38,6 +38,17 @@ jobs:
       - name: Governance rule assertions
         # Fails the build if a change stops a rule from redacting/restricting.
         run: go run ./cmd/optictrace test -config optic.yaml -tests optic.test.yaml
+      - name: Build the lead-pipeline demo
+        # The demo services live in the root module, so a change that breaks
+        # them fails here rather than the next time someone runs the demo.
+        run: go build ./examples/lead-pipeline/... && go vet ./examples/lead-pipeline/...
+
+      - name: Validate the demo configs
+        run: |
+          for c in examples/lead-pipeline/optic/*.yaml; do
+            go run ./cmd/optictrace validate -config "$c"
+          done
+
       - name: Test the admin-extension example
         working-directory: examples/adminauth
         # SSO + RBAC + audit against the real admin server, from a module that

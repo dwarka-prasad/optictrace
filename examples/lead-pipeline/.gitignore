@@ -1,0 +1,4 @@
+.run/
+pipeline.db
+pipeline.db-wal
+pipeline.db-shm
