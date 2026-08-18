@@ -47,10 +47,17 @@ CREATE TABLE IF NOT EXISTS logs (
 	labels        JSONB NOT NULL DEFAULT '{}'::jsonb,
 	matched_rules JSONB NOT NULL DEFAULT '[]'::jsonb,
 	meters        JSONB NOT NULL DEFAULT '{}'::jsonb,
-	stream        BOOLEAN NOT NULL DEFAULT false
+	stream        BOOLEAN NOT NULL DEFAULT false,
+	trace_id      TEXT NOT NULL DEFAULT '',
+	span_id       TEXT NOT NULL DEFAULT '',
+	parent_span   TEXT NOT NULL DEFAULT ''
 );
 -- Added after the initial release; harmless when the column already exists.
 ALTER TABLE logs ADD COLUMN IF NOT EXISTS stream BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE logs ADD COLUMN IF NOT EXISTS trace_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE logs ADD COLUMN IF NOT EXISTS span_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE logs ADD COLUMN IF NOT EXISTS parent_span TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_logs_trace ON logs(trace_id);
 CREATE INDEX IF NOT EXISTS idx_logs_ts      ON logs(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_logs_status  ON logs(status);
 CREATE INDEX IF NOT EXISTS idx_logs_route   ON logs(route, method);
@@ -94,22 +101,22 @@ func (s *PostgresStore) Save(ctx context.Context, r *Record) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO logs (ts, service, method, path, query, route, status, duration_ms,
 			remote, source, req_headers, resp_headers, req_body, resp_body,
-			req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters, stream)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
+			req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters, stream, trace_id, span_id, parent_span)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
 		r.Time.UnixMilli(), r.Service, r.Method, r.Path, r.Query, r.Route, r.Status,
 		r.DurationMS, r.Remote, r.Source,
 		jsonbOr(r.RequestHeaders, "{}"), jsonbOr(r.ResponseHeaders, "{}"),
 		r.RequestBody, r.ResponseBody, r.ReqTruncated, r.RespTruncated,
 		r.ReqBytes, r.RespBytes,
 		jsonbOr(r.Labels, "{}"), jsonbOr(r.MatchedRules, "[]"), jsonbOr(r.Meters, "{}"),
-		r.Stream,
+		r.Stream, r.TraceID, r.SpanID, r.ParentSpanID,
 	)
 	return err
 }
 
 const pgColumns = `id, ts, service, method, path, query, route, status, duration_ms,
 	remote, source, req_headers, resp_headers, req_body, resp_body,
-	req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters, stream`
+	req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters, stream, trace_id, span_id, parent_span`
 
 func (s *PostgresStore) Query(ctx context.Context, f Filter) ([]Record, int64, error) {
 	where, args := pgBuildWhere(f)
@@ -482,6 +489,9 @@ func pgBuildWhere(f Filter) (string, []any) {
 	// Before the empty check, or a labels-only filter would produce no WHERE
 	// clause and silently return every record. Uses bind() like every other
 	// condition rather than hand-numbering placeholders.
+	if f.TraceID != "" {
+		conds = append(conds, "trace_id = "+bind(f.TraceID))
+	}
 	for _, k := range sortedKeys(f.Labels) {
 		conds = append(conds, fmt.Sprintf("labels->>%s = %s", bind(k), bind(f.Labels[k])))
 	}
@@ -498,7 +508,8 @@ func pgScan(row scannable) (*Record, error) {
 	err := row.Scan(&r.ID, &ts, &r.Service, &r.Method, &r.Path, &r.Query, &r.Route,
 		&r.Status, &r.DurationMS, &r.Remote, &r.Source, &reqH, &respH,
 		&r.RequestBody, &r.ResponseBody, &r.ReqTruncated, &r.RespTruncated,
-		&r.ReqBytes, &r.RespBytes, &labels, &rules, &meters, &r.Stream)
+		&r.ReqBytes, &r.RespBytes, &labels, &rules, &meters, &r.Stream,
+		&r.TraceID, &r.SpanID, &r.ParentSpanID)
 	if err != nil {
 		return nil, err
 	}

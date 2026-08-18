@@ -62,6 +62,7 @@ func RunStoreSuite(t *testing.T, open OpenFunc) {
 	t.Run("usage", func(t *testing.T) { testUsage(t, open) })
 	t.Run("rule_match_counts", func(t *testing.T) { testRuleMatchCounts(t, open) })
 	t.Run("label_filter", func(t *testing.T) { testLabelFilter(t, open) })
+	t.Run("trace_correlation", func(t *testing.T) { testTraceCorrelation(t, open) })
 	t.Run("purge", func(t *testing.T) { testPurge(t, open) })
 	t.Run("purge_is_literal", func(t *testing.T) { testPurgeIsLiteral(t, open) })
 	t.Run("stats", func(t *testing.T) { testStats(t, open) })
@@ -281,6 +282,87 @@ func testLabelFilter(t *testing.T, open OpenFunc) {
 		}
 		if recs[0].Labels["tenant"] != "acme_1" {
 			t.Errorf("returned the wrong tenant: %q", recs[0].Labels["tenant"])
+		}
+	})
+}
+
+// testTraceCorrelation covers the question that makes several services worth
+// pointing at one store: "what did this request actually do". The ids must
+// survive storage and be selectable, or the records stay a flat list.
+func testTraceCorrelation(t *testing.T, open OpenFunc) {
+	ctx := context.Background()
+	s := open(t)
+
+	const traceA, traceB = "4bf92f3577b34da6a3ce929d0e0e4736", "0af7651916cd43dd8448eb211c80319c"
+	// One request fanning out across three services, plus an unrelated one.
+	hops := []struct{ trace, span, parent, service string }{
+		{traceA, "aaaa000000000001", "", "gateway"}, // root
+		{traceA, "aaaa000000000002", "aaaa000000000001", "leads"},
+		{traceA, "aaaa000000000003", "aaaa000000000002", "scoring"},
+		{traceB, "bbbb000000000001", "", "gateway"},
+	}
+	for _, h := range hops {
+		r := Record(200, 5, "/api/x", "acme")
+		r.Service, r.TraceID, r.SpanID, r.ParentSpanID = h.service, h.trace, h.span, h.parent
+		mustSave(t, s, r)
+	}
+
+	recs, total, err := s.Query(ctx, ext.Filter{TraceID: traceA})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if total != 3 || len(recs) != 3 {
+		t.Fatalf("trace A returned total=%d len=%d, want 3", total, len(recs))
+	}
+
+	// The tree has to be reconstructible, which needs the parent links intact.
+	bySpan := map[string]ext.Record{}
+	for _, r := range recs {
+		if r.TraceID != traceA {
+			t.Errorf("returned a record from another trace: %s", r.TraceID)
+		}
+		bySpan[r.SpanID] = r
+	}
+	roots := 0
+	for _, r := range recs {
+		if r.ParentSpanID == "" {
+			roots++
+			continue
+		}
+		if _, ok := bySpan[r.ParentSpanID]; !ok {
+			t.Errorf("span %s has parent %s, which is not in the trace",
+				r.SpanID, r.ParentSpanID)
+		}
+	}
+	if roots != 1 {
+		t.Errorf("found %d roots, want exactly 1", roots)
+	}
+
+	t.Run("other traces are excluded", func(t *testing.T) {
+		_, n, err := s.Query(ctx, ext.Filter{TraceID: traceB})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 {
+			t.Errorf("trace B returned %d, want 1", n)
+		}
+	})
+	t.Run("unknown trace returns nothing", func(t *testing.T) {
+		_, n, err := s.Query(ctx, ext.Filter{TraceID: "deadbeef"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Errorf("unknown trace returned %d records", n)
+		}
+	})
+	t.Run("combines with other constraints", func(t *testing.T) {
+		_, n, err := s.Query(ctx, ext.Filter{TraceID: traceA, Labels: map[string]string{"tenant": "acme"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != 3 {
+			t.Errorf("trace + label returned %d, want 3", n)
 		}
 	})
 }

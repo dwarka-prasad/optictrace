@@ -37,6 +37,7 @@ import (
 	"github.com/dwarka-prasad/optictrace/internal/export"
 	"github.com/dwarka-prasad/optictrace/internal/metrics"
 	"github.com/dwarka-prasad/optictrace/internal/store"
+	"github.com/dwarka-prasad/optictrace/internal/tracectx"
 )
 
 // Interceptor evaluates governance rules around an inner handler and emits
@@ -59,6 +60,11 @@ type Interceptor struct {
 	// routes buffer, and a config without body rules pays nothing.
 	bodyPaths atomic.Pointer[[][]string]
 	needsResp atomic.Bool
+
+	// trace controls whether a traceparent is written anywhere. Recording ids
+	// is unconditional; writing a header is not.
+	propagate      bool
+	responseHeader string
 }
 
 // Option configures optional telemetry sinks.
@@ -88,6 +94,8 @@ func NewInterceptor(cfg *config.Config, eng *engine.Engine, logger *slog.Logger,
 	for _, g := range cfg.Service.GraphQLPaths {
 		ic.gqlPaths = append(ic.gqlPaths, engine.SplitPath(g))
 	}
+	ic.propagate = cfg.Service.Trace.Propagate()
+	ic.responseHeader = cfg.Service.Trace.ResponseHeader
 	ic.engine.Store(eng)
 	ic.refreshBodyNeeds(eng)
 	for _, o := range opts {
@@ -147,6 +155,28 @@ func NewReverseProxy(cfg *config.Config, eng *engine.Engine, logger *slog.Logger
 func (ic *Interceptor) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+
+		// Resolve trace context first: every record carries it, so a request
+		// that fans out across services can be reassembled afterwards.
+		tc := tracectx.FromHeader(r.Header.Get(tracectx.Header))
+		if ic.propagate {
+			// The forwarded request carries THIS hop's traceparent — same
+			// trace, our span id as the parent for whatever comes next.
+			//
+			// Always, not only when the caller sent nothing. Forwarding the
+			// caller's header unchanged makes every downstream hop a sibling
+			// of this one instead of a child, so the tree comes out flat and
+			// the fan-out is unreadable. Rewriting it is what a tracing
+			// sidecar is for, and an application doing its own tracing simply
+			// nests under this span rather than being contradicted by it.
+			//
+			// Scoped deliberately: the forwarded copy only. The response and
+			// the client's own request are untouched.
+			r.Header.Set(tracectx.Header, tc.Header())
+		}
+		if ic.responseHeader != "" {
+			w.Header().Set(ic.responseHeader, tc.TraceID)
+		}
 		// Full attrs, not just the request line: match.headers and match.query
 		// rules can only be decided with them, and a rule that cannot be
 		// decided does not apply.
@@ -233,7 +263,7 @@ func (ic *Interceptor) Wrap(next http.Handler) http.Handler {
 			policy = ic.engine.Load().EvaluateAttrs(a)
 		}
 		keep := policy.KeepBody(drew, rw.status, elapsed)
-		ic.emit(r, rw, reqBuf, &policy, keep, elapsed, operation, governedBody)
+		ic.emit(r, rw, reqBuf, &policy, keep, elapsed, operation, governedBody, tc)
 	})
 }
 
@@ -311,7 +341,7 @@ func governedJSON(buf *limitedBuffer, contentType string, p *engine.Policy) (any
 	return doc, true
 }
 
-func (ic *Interceptor) emit(r *http.Request, rw *recordingWriter, reqBuf *limitedBuffer, p *engine.Policy, keep bool, elapsed time.Duration, operation string, reqBody any) {
+func (ic *Interceptor) emit(r *http.Request, rw *recordingWriter, reqBuf *limitedBuffer, p *engine.Policy, keep bool, elapsed time.Duration, operation string, reqBody any, tc tracectx.Context) {
 	route := p.RoutePattern
 	if route == "" {
 		route = engine.NormalizeRoute(r.URL.Path)
@@ -339,6 +369,9 @@ func (ic *Interceptor) emit(r *http.Request, rw *recordingWriter, reqBuf *limite
 		RespBytes:    rw.written,
 		MatchedRules: p.MatchedRules,
 		Stream:       stream,
+		TraceID:      tc.TraceID,
+		SpanID:       tc.SpanID,
+		ParentSpanID: tc.ParentSpanID,
 	}
 
 	if p.CaptureHeaders {

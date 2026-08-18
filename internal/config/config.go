@@ -432,6 +432,8 @@ type Service struct {
 	// — makes latency percentiles, per-operation rules and spec inference
 	// meaningless for a GraphQL service.
 	GraphQLPaths []string `yaml:"graphql_paths"`
+	// Trace controls W3C Trace Context handling.
+	Trace TraceCfg `yaml:"trace"`
 	// HTTP2 serves cleartext HTTP/2 (h2c) on the proxy listener in addition
 	// to HTTP/1.1. Off by default: it changes protocol negotiation for every
 	// client, and HTTP/1.1 is what most upstreams speak.
@@ -442,6 +444,43 @@ type Service struct {
 	// fields, redact them, or meter them; you would get method names and byte
 	// counts. Use the SDK middleware for gRPC services.
 	HTTP2 bool `yaml:"http2"`
+}
+
+// TraceCfg controls correlation across services.
+//
+// OpticTrace always RECORDS trace ids — that costs nothing and is what turns
+// records from several services into one request. What is configurable is
+// whether it writes a header anywhere, because writing one modifies traffic
+// and this product's central promise is that it does not.
+type TraceCfg struct {
+	// PropagateUpstream sets traceparent on the request FORWARDED to your
+	// service, carrying this hop's span id so downstream calls become its
+	// children.
+	//
+	// Default true. This is the one deliberate exception to "live traffic is
+	// never modified", and it is narrow: the forwarded copy only — never the
+	// response, never what the client sent.
+	//
+	// It rewrites an inbound traceparent rather than only filling in a
+	// missing one. Passing the caller's header through unchanged would make
+	// every downstream hop a sibling of this one rather than a child, so the
+	// fan-out flattens into a list and the tree is lost. An application doing
+	// its own tracing nests under this span, which is correct.
+	//
+	// Set false to keep the forwarded request byte-identical; correlation
+	// then stops at whatever the application itself propagates.
+	PropagateUpstream *bool `yaml:"propagate_upstream"`
+
+	// ResponseHeader, when set, returns the trace id to the CALLER under this
+	// header name — "X-Trace-Id" is conventional. Off by default because it
+	// modifies the response, which nothing else here does. Worth turning on
+	// if you want support tickets to arrive with a trace id in them.
+	ResponseHeader string `yaml:"response_header"`
+}
+
+// Propagate reports whether to add traceparent to the forwarded request.
+func (t *TraceCfg) Propagate() bool {
+	return t == nil || t.PropagateUpstream == nil || *t.PropagateUpstream
 }
 
 // Defaults holds the global capture posture applied before any rule.

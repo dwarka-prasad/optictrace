@@ -42,7 +42,10 @@ CREATE TABLE IF NOT EXISTS logs (
 	labels        TEXT NOT NULL DEFAULT '',
 	matched_rules TEXT NOT NULL DEFAULT '',
 	meters        TEXT NOT NULL DEFAULT '',
-	stream        INTEGER NOT NULL DEFAULT 0
+	stream        INTEGER NOT NULL DEFAULT 0,
+	trace_id      TEXT NOT NULL DEFAULT '',
+	span_id       TEXT NOT NULL DEFAULT '',
+	parent_span   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_logs_ts     ON logs(ts);
 CREATE INDEX IF NOT EXISTS idx_logs_status ON logs(status);
@@ -52,6 +55,9 @@ CREATE INDEX IF NOT EXISTS idx_logs_route  ON logs(route);
 -- forces a sort of every matching row; carrying duration_ms in the index lets
 -- those subqueries walk it in order instead.
 CREATE INDEX IF NOT EXISTS idx_logs_route_duration ON logs(route, method, duration_ms);
+-- "show me every hop of this request" is the whole point of storing a trace
+-- id, and it is a point lookup over a growing table.
+CREATE INDEX IF NOT EXISTS idx_logs_trace ON logs(trace_id);
 `
 
 func NewSQLite(dsn string) (*SQLiteStore, error) {
@@ -73,6 +79,9 @@ func NewSQLite(dsn string) (*SQLiteStore, error) {
 		{"meters", `TEXT NOT NULL DEFAULT ''`},
 		{"query", `TEXT NOT NULL DEFAULT ''`},
 		{"stream", `INTEGER NOT NULL DEFAULT 0`},
+		{"trace_id", `TEXT NOT NULL DEFAULT ''`},
+		{"span_id", `TEXT NOT NULL DEFAULT ''`},
+		{"parent_span", `TEXT NOT NULL DEFAULT ''`},
 	} {
 		_, err := db.Exec(`ALTER TABLE logs ADD COLUMN ` + m.col + ` ` + m.decl)
 		if err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -87,8 +96,8 @@ func (s *SQLiteStore) Save(ctx context.Context, r *Record) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO logs (ts, service, method, path, query, route, status, duration_ms,
 			remote, source, req_headers, resp_headers, req_body, resp_body,
-			req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters, stream)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters, stream, trace_id, span_id, parent_span)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.Time.UnixMilli(), r.Service, r.Method, r.Path, r.Query, r.Route, r.Status,
 		r.DurationMS,
 		r.Remote, r.Source,
@@ -97,7 +106,7 @@ func (s *SQLiteStore) Save(ctx context.Context, r *Record) error {
 		boolInt(r.ReqTruncated), boolInt(r.RespTruncated),
 		r.ReqBytes, r.RespBytes,
 		mustJSON(r.Labels), mustJSON(r.MatchedRules), mustJSON(r.Meters),
-		boolInt(r.Stream),
+		boolInt(r.Stream), r.TraceID, r.SpanID, r.ParentSpanID,
 	)
 	return err
 }
@@ -116,7 +125,7 @@ func (s *SQLiteStore) Query(ctx context.Context, f Filter) ([]Record, int64, err
 	}
 	q := "SELECT id, ts, service, method, path, query, route, status, duration_ms, remote, source, " +
 		"req_headers, resp_headers, req_body, resp_body, req_trunc, resp_trunc, " +
-		"req_bytes, resp_bytes, labels, matched_rules, meters, stream FROM logs" + where +
+		"req_bytes, resp_bytes, labels, matched_rules, meters, stream, trace_id, span_id, parent_span FROM logs" + where +
 		" ORDER BY id DESC LIMIT ? OFFSET ?"
 	rows, err := s.db.QueryContext(ctx, q, append(args, limit, f.Offset)...)
 	if err != nil {
@@ -138,7 +147,7 @@ func (s *SQLiteStore) Query(ctx context.Context, f Filter) ([]Record, int64, err
 func (s *SQLiteStore) Get(ctx context.Context, id int64) (*Record, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, ts, service, method, path, query, route,
 		status, duration_ms, remote, source, req_headers, resp_headers, req_body,
-		resp_body, req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters, stream
+		resp_body, req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters, stream, trace_id, span_id, parent_span
 		FROM logs WHERE id = ?`, id)
 	return scanRecord(row)
 }
@@ -347,7 +356,7 @@ func (s *SQLiteStore) RecentFunc(ctx context.Context, since time.Time, limit int
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, ts, service, method, path, query, route, status, duration_ms, remote, source,
 		        req_headers, resp_headers, req_body, resp_body, req_trunc, resp_trunc,
-		        req_bytes, resp_bytes, labels, matched_rules, meters, stream
+		        req_bytes, resp_bytes, labels, matched_rules, meters, stream, trace_id, span_id, parent_span
 		 FROM logs WHERE ts >= ? ORDER BY id DESC LIMIT ?`,
 		since.UnixMilli(), AnalysisLimit(limit))
 	if err != nil {
@@ -590,6 +599,10 @@ func buildWhere(f Filter) (string, []any) {
 	// Labels are stored as a JSON object. json_extract compares the value
 	// literally — deliberately not LIKE, which is how purge once matched a
 	// neighbouring tenant.
+	if f.TraceID != "" {
+		conds = append(conds, "trace_id = ?")
+		args = append(args, f.TraceID)
+	}
 	for _, k := range sortedKeys(f.Labels) {
 		conds = append(conds, "json_extract(labels, '$.' || ?) = ?")
 		args = append(args, k, f.Labels[k])
@@ -610,7 +623,8 @@ func scanRecord(row scannable) (*Record, error) {
 	err := row.Scan(&r.ID, &ts, &r.Service, &r.Method, &r.Path, &r.Query, &r.Route,
 		&r.Status, &r.DurationMS, &r.Remote, &r.Source, &reqH, &respH,
 		&r.RequestBody, &r.ResponseBody, &reqT, &respT,
-		&r.ReqBytes, &r.RespBytes, &labels, &rules, &meters, &stream)
+		&r.ReqBytes, &r.RespBytes, &labels, &rules, &meters, &stream,
+		&r.TraceID, &r.SpanID, &r.ParentSpanID)
 	if err != nil {
 		return nil, err
 	}

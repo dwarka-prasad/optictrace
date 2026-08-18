@@ -38,6 +38,16 @@ type Record struct {
 	DurationMS float64 `json:"duration_ms"`
 	Remote     string  `json:"remote"`
 	Source     string  `json:"source"` // "proxy" or an SDK name
+
+	// TraceID ties every hop of one request together across services, so a
+	// flat log becomes a tree. Taken from the inbound W3C traceparent when
+	// the caller sent one, generated when it did not.
+	TraceID string `json:"trace_id,omitempty"`
+	// SpanID identifies this hop; ParentSpanID is the caller's span, empty at
+	// the root. Together these are what makes the tree reconstructible rather
+	// than just a filtered list.
+	SpanID       string `json:"span_id,omitempty"`
+	ParentSpanID string `json:"parent_span_id,omitempty"`
 	// Stream marks a long-lived streaming response (SSE or chunked). Its
 	// DurationMS is a connection lifetime, not a latency, so percentile
 	// aggregations exclude it — one 10-minute stream would otherwise define
@@ -69,6 +79,9 @@ type Filter struct {
 	StatusMax  int
 	Since      time.Time
 	Until      time.Time
+	// TraceID selects every hop of one request — the question "what did this
+	// call actually do" once several services report into one store.
+	TraceID string
 	// Labels selects records carrying ALL of these label values exactly —
 	// the multi-tenant question, "show me only this tenant's calls".
 	//

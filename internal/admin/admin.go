@@ -826,6 +826,10 @@ func filterFromQuery(r *http.Request) store.Filter {
 			f.Since = t
 		}
 	}
+	// trace=<id> selects every hop of one request across services.
+	if tid := r.URL.Query().Get("trace"); tid != "" {
+		f.TraceID = tid
+	}
 	// label.<name>=<value> selects by tag: the multi-tenant question, "show me
 	// only this tenant's calls". Values are matched literally by every driver.
 	for key, vals := range r.URL.Query() {

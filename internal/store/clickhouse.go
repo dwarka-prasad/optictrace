@@ -59,7 +59,10 @@ CREATE TABLE IF NOT EXISTS logs (
 	labels        String,
 	matched_rules String,
 	meters        String,
-	stream        UInt8
+	stream        UInt8,
+	trace_id      String,
+	span_id       String,
+	parent_span   String
 )
 ENGINE = MergeTree
 -- ts leads because every dashboard query is windowed by time; id breaks ties
@@ -95,6 +98,9 @@ func NewClickHouse(dsn string) (*ClickHouseStore, error) {
 	// for this, so no error-string matching is needed.
 	for _, decl := range []string{
 		`ALTER TABLE logs ADD COLUMN IF NOT EXISTS stream UInt8 DEFAULT 0`,
+		`ALTER TABLE logs ADD COLUMN IF NOT EXISTS trace_id String DEFAULT ''`,
+		`ALTER TABLE logs ADD COLUMN IF NOT EXISTS span_id String DEFAULT ''`,
+		`ALTER TABLE logs ADD COLUMN IF NOT EXISTS parent_span String DEFAULT ''`,
 	} {
 		if _, err := db.ExecContext(ctx, decl); err != nil {
 			db.Close()
@@ -133,8 +139,8 @@ func (s *ClickHouseStore) Save(ctx context.Context, r *Record) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO logs (id, ts, service, method, path, query, route, status, duration_ms,
 			remote, source, req_headers, resp_headers, req_body, resp_body,
-			req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters, stream)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters, stream, trace_id, span_id, parent_span)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		s.nextID(r.Time), r.Time.UnixMilli(), r.Service, r.Method, r.Path, r.Query,
 		r.Route, int32(r.Status), r.DurationMS, r.Remote, r.Source,
 		mustJSON(r.RequestHeaders), mustJSON(r.ResponseHeaders),
@@ -142,14 +148,14 @@ func (s *ClickHouseStore) Save(ctx context.Context, r *Record) error {
 		uint8(boolInt(r.ReqTruncated)), uint8(boolInt(r.RespTruncated)),
 		r.ReqBytes, r.RespBytes,
 		mustJSON(r.Labels), mustJSON(r.MatchedRules), mustJSON(r.Meters),
-		uint8(boolInt(r.Stream)),
+		uint8(boolInt(r.Stream)), r.TraceID, r.SpanID, r.ParentSpanID,
 	)
 	return err
 }
 
 const chColumns = `id, ts, service, method, path, query, route, status, duration_ms,
 	remote, source, req_headers, resp_headers, req_body, resp_body,
-	req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters, stream`
+	req_trunc, resp_trunc, req_bytes, resp_bytes, labels, matched_rules, meters, stream, trace_id, span_id, parent_span`
 
 // chBuildWhere mirrors buildWhere for ClickHouse's ? placeholders.
 func chBuildWhere(f Filter) (string, []any) {
@@ -184,6 +190,10 @@ func chBuildWhere(f Filter) (string, []any) {
 	if !f.Until.IsZero() {
 		conds = append(conds, "ts <= ?")
 		args = append(args, f.Until.UnixMilli())
+	}
+	if f.TraceID != "" {
+		conds = append(conds, "trace_id = ?")
+		args = append(args, f.TraceID)
 	}
 	for _, k := range sortedKeys(f.Labels) {
 		conds = append(conds, "JSONExtractString(assumeNotNull(labels), ?) = ?")
@@ -239,7 +249,8 @@ func chScan(row scannable) (*Record, error) {
 	err := row.Scan(&r.ID, &ts, &r.Service, &r.Method, &r.Path, &r.Query, &r.Route,
 		&status, &r.DurationMS, &r.Remote, &r.Source, &reqH, &respH,
 		&r.RequestBody, &r.ResponseBody, &reqT, &respT,
-		&r.ReqBytes, &r.RespBytes, &labels, &rules, &meters, &stream)
+		&r.ReqBytes, &r.RespBytes, &labels, &rules, &meters, &stream,
+		&r.TraceID, &r.SpanID, &r.ParentSpanID)
 	if err != nil {
 		return nil, err
 	}

@@ -12,6 +12,14 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 ### Added
 
+- **Trace correlation across services.** Every record now carries `trace_id`, `span_id` and `parent_span_id`, taken from an inbound W3C `traceparent` or generated when the caller sends none. `/api/logs?trace=<id>` returns every hop of one request, so several services reporting into one store become a request tree rather than a flat list. Indexed in all three drivers, covered by the shared conformance suite.
+
+  The forwarded request carries **this hop's** span so downstream calls nest under it — passing the caller's header through unchanged would make every downstream hop a sibling and flatten the tree. This is the one place OpticTrace writes to traffic and it is deliberately narrow: the forwarded copy only, never the response, never what the client sent. `service.trace.propagate_upstream: false` disables it; `service.trace.response_header` optionally returns the id to the caller and is off by default.
+
+  The OTLP exporter now emits the record's stored ids rather than re-parsing headers, so a span and the record it came from cannot disagree about which trace they belong to. The `traceparent` parser moved to `internal/tracectx`, shared by the proxy, the exporter and the ingest path.
+
+### Added
+
 - **Multi-tenant tagging.** `match.headers` and `match.query` take regular expressions, so a rule can apply only to requests meeting a condition; and label sources gained `static:<value>` (the way to tag a class of traffic), `path:<n>` for a tenant carried in the URL, and an optional `|<regex>` capture-group suffix on any source (`header:X-Region|^([a-z]{2})-` turns `eu-west-1` into `eu`). Together these let one endpoint serving many tenants be segregated, metered and billed by tenant, plan tier, region or anything else in the request.
 
   There is deliberately **no separate `tags:` block**: rules already merge top to bottom with later ones winning, so a broad default plus a narrow override expresses conditional tagging using machinery that already governs redaction, sampling and metering.

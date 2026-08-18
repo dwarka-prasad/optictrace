@@ -922,6 +922,49 @@ requests.
 
 ---
 
+## Following one request across services
+
+Every record carries W3C trace context, so records from several services stop
+being a flat list and become a request tree.
+
+```
+$ curl '.../api/logs?trace=4bf92f3577b34da6a3ce929d0e0e4736'
+
+  leads    POST /api/v1/leads   200  5.5ms   span=512227e3  <- child of the caller
+  scoring  POST /api/score      200  1.8ms   span=2985d314  <- child of leads
+```
+
+Point each service's sidecar at one store and you get this with no extra
+configuration. OpticTrace adopts an inbound `traceparent` when the caller sends
+one and starts a fresh trace when they do not, so it works whether or not the
+edge is instrumented.
+
+The forwarded request carries **this hop's** span, which is what makes
+downstream calls nest under it rather than becoming siblings. That is the one
+place OpticTrace writes to traffic, and it is narrow — the forwarded copy only,
+never the response, never what the client sent:
+
+```yaml
+service:
+  trace:
+    propagate_upstream: true      # default; false keeps the forwarded request byte-identical
+    response_header: X-Trace-Id   # off by default — returns the id to the caller
+```
+
+A malformed `traceparent` starts a fresh trace rather than failing anything:
+losing correlation is a nuisance, failing a request over a bad header would be
+a fault.
+
+**What this does and does not give you.** Each hop is one span covering the
+whole exchange OpticTrace saw. It is not a substitute for in-process tracing —
+there are no spans for a database call or a function inside your service. Point
+the OTLP exporter at Jaeger or Tempo for that, and it will use these same ids
+so the two views line up. What OpticTrace adds is the **governed payload at
+every hop**: an APM shows you timings, this shows you the redacted request body
+you are actually allowed to look at.
+
+---
+
 ## Multi-tenant tagging
 
 One API, many tenants, the same path for all of them. Tags turn that into

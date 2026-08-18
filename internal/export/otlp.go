@@ -137,10 +137,21 @@ func (e *otlpExporter) span(rec *store.Record) map[string]any {
 	// exported span is a separate single-span trace, and you cannot click from
 	// a slow OpticTrace span into the request it describes — which is most of
 	// the reason to export to OTLP at all.
-	traceID, parentID, sampled := traceContext(rec.RequestHeaders)
+	// Prefer the ids already on the record: the proxy resolved them at request
+	// time, so the exported span and the stored record cannot disagree about
+	// which trace they belong to. Fall back to parsing headers for records
+	// that predate the fields, or arrive from an SDK that does not set them.
+	traceID, parentID, sampled := rec.TraceID, rec.ParentSpanID, true
+	if traceID == "" {
+		traceID, parentID, sampled = traceContext(rec.RequestHeaders)
+	}
+	spanID := rec.SpanID
+	if spanID == "" {
+		spanID = randomHex(8)
+	}
 	span := map[string]any{
 		"traceId":           traceID,
-		"spanId":            randomHex(8),
+		"spanId":            spanID,
 		"name":              rec.Method + " " + rec.Route,
 		"kind":              2, // SPAN_KIND_SERVER
 		"startTimeUnixNano": fmt.Sprint(start),
