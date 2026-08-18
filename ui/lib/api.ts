@@ -231,3 +231,69 @@ export function exportUrl(format: 'csv' | 'jsonl', query: LogQuery) {
   params.set('format', format);
   return `${API_BASE}/api/export?${params}`;
 }
+
+/** One line the application logged while serving a request. */
+export interface AppLogLine {
+  id: number;
+  time: string;
+  service: string;
+  trace_id: string;
+  span_id: string;
+  level: string;
+  message: string;
+  fields?: Record<string, string>;
+  source?: string;
+  truncated?: boolean;
+}
+
+/** Lines a single request wrote.
+ *
+ *  Keyed by span, not by time window: the span is what ties a line to a
+ *  request as a fact. Matching on timestamps would show one tenant's logs
+ *  inside another tenant's request whenever two are served at once.
+ *
+ *  Returns an empty list rather than throwing when the feature is off or the
+ *  store driver has no app-log support (both answer 501) — an inspector panel
+ *  that explodes because an optional feature is disabled is worse than one
+ *  that quietly has nothing to show. */
+export async function fetchSpanLogs(spanId: string, limit = 200): Promise<AppLogLine[]> {
+  if (!spanId) return [];
+  const res = await fetch(
+    `${API_BASE}/api/applogs?span=${encodeURIComponent(spanId)}&limit=${limit}`,
+  );
+  if (res.status === 501 || res.status === 404) return [];
+  if (!res.ok) throw new Error(`applogs: ${res.status}`);
+  const body = (await res.json()) as { lines: AppLogLine[] | null };
+  return body.lines ?? [];
+}
+
+/** Per-service rollup — the fleet view, once several SDK services report into
+ *  one agent. */
+export interface ServiceStat {
+  service: string;
+  requests: number;
+  errors: number;
+  error_rate: number;
+  avg_latency_ms: number;
+  p95_latency_ms: number;
+  routes: number;
+  sources: string;
+  last_seen: string;
+}
+
+export const fetchServices = (window: string) =>
+  get<{ services: ServiceStat[] }>(`/api/services?window=${window}`);
+
+/** Aggregate counts for application log lines.
+ *
+ *  Computed in the store, not by counting a page here: a summary of the first
+ *  200 rows is wrong at exactly the volumes where a summary starts to matter. */
+export interface AppLogSummary {
+  total: number;
+  by_level: Record<string, number>;
+  by_service: Record<string, number>;
+  spans_with_logs: number;
+}
+
+export const fetchAppLogStats = (window: string) =>
+  get<AppLogSummary>(`/api/applogs/stats?window=${window}`);

@@ -1,8 +1,16 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import { ChevronLeft, ChevronRight, Download, GitBranch, RefreshCw, Search, ShieldCheck, Tag, X } from 'lucide-react';
-import { exportUrl, fetchLogs, fetchTrace, type LogQuery, type LogRecord } from '@/lib/api';
+import { ChevronLeft, ChevronRight, Download, GitBranch, RefreshCw, Search, ShieldCheck, Tag, Terminal, X } from 'lucide-react';
+import {
+  exportUrl,
+  fetchLogs,
+  fetchSpanLogs,
+  fetchTrace,
+  type AppLogLine,
+  type LogQuery,
+  type LogRecord,
+} from '@/lib/api';
 import { MethodBadge, StatusBadge, StreamBadge } from '@/components/badges';
 
 const PAGE_SIZE = 25;
@@ -447,6 +455,7 @@ function DetailPanel({
           </div>
         )}
         <TraceTree record={r} onSelectRecord={onSelectRecord} />
+        <AppLogs spanId={r.span_id} />
         {r.request_headers && <KV title="Request headers" data={r.request_headers} />}
         {r.request_body && <Body title="Request body" body={r.request_body} truncated={r.req_truncated} />}
         {r.response_headers && <KV title="Response headers" data={r.response_headers} />}
@@ -454,6 +463,76 @@ function DetailPanel({
       </div>
     </div>
   );
+}
+
+/** What the application logged while serving this request.
+ *
+ *  Correlated by span id, which OpticTrace put in the traceparent it forwarded
+ *  — so these lines belong to this request as a fact rather than because their
+ *  timestamps were close. Renders nothing at all when the feature is off, so a
+ *  disabled optional feature is not a permanently empty box in the UI. */
+function AppLogs({ spanId }: { spanId?: string }) {
+  const [lines, setLines] = useState<AppLogLine[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    if (!spanId) {
+      setLines([]);
+      return;
+    }
+    setLines(null);
+    setError(null);
+    fetchSpanLogs(spanId)
+      .then((l) => live && setLines(l))
+      .catch((e) => live && setError(String(e)));
+    return () => {
+      live = false;
+    };
+  }, [spanId]);
+
+  if (!spanId) return null;
+  if (lines !== null && lines.length === 0 && !error) return null;
+
+  return (
+    <Section icon={<Terminal className="h-3.5 w-3.5" />} title="Application logs">
+      {error && <div className="text-[var(--bad)]">{error}</div>}
+      {lines === null && <div className="text-[var(--muted)]">Loading…</div>}
+      <div className="space-y-1 font-mono text-[11px] leading-relaxed">
+        {lines?.map((l) => (
+          <div key={l.id} className="flex gap-2 border-b border-[var(--border)]/30 pb-1">
+            <span className="shrink-0 text-[var(--muted)]">
+              {new Date(l.time).toLocaleTimeString(undefined, { hour12: false })}
+            </span>
+            <LevelBadge level={l.level} />
+            <span className="min-w-0 break-words">
+              {l.message}
+              {l.truncated && <span className="text-[var(--muted)]"> …(truncated)</span>}
+              {l.fields && Object.keys(l.fields).length > 0 && (
+                <span className="ml-2 text-[var(--muted)]">
+                  {Object.entries(l.fields).map(([k, v]) => `${k}=${v}`).join(' ')}
+                </span>
+              )}
+            </span>
+          </div>
+        ))}
+      </div>
+    </Section>
+  );
+}
+
+/** Severity as colour as well as text: an error should be findable by
+ *  scanning, not by reading every line. */
+function LevelBadge({ level }: { level: string }) {
+  const tone =
+    level === 'error' || level === 'fatal'
+      ? 'text-[var(--bad)]'
+      : level === 'warn'
+        ? 'text-[var(--warn)]'
+        : level === 'debug' || level === 'trace'
+          ? 'text-[var(--muted)]'
+          : 'text-[var(--good)]';
+  return <span className={`w-10 shrink-0 uppercase ${tone}`}>{level}</span>;
 }
 
 function MetaGrid({ r }: { r: LogRecord }) {
