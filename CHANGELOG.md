@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 `0.7.0` is the first public release and contains all of that work.
 
-## [Unreleased]
+## [0.9.0] — 2026-08-19
 
 ### Added
 
@@ -28,6 +28,31 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 - **`make setup`, `make seed`, `make fixture`, `make test-all`** and `scripts/seed.sh`, which drives traffic covering every mechanism in `optic.yaml` — several tenants across regions and plans, an ungoverned route, errors, slow calls and a correlated trace. `docker compose up` now seeds itself, so the tour lands on a dashboard with something on it instead of an empty shell.
 
+- **The dashboard caught up with the tags and traces work.** The inspector gained a **Tags** column whose chips filter on click (`label.<name>=<value>`, all of them ANDed, removable from the filter bar), a **stream** badge so a 600,000ms row reads as a connection lifetime rather than a catastrophe ([#24](https://github.com/dwarka-prasad/optictrace/issues/24)), and a **request trace** section in the detail panel that fetches every hop of the trace and renders it as a tree with per-hop latency bars — clicking a hop jumps to it. A tag a rule declared but the request never populated shows as `name=∅` rather than being hidden, since a silently absent tag is the usual symptom of a mistyped source. Exports now carry the tag filters, so downloading what the table shows no longer means downloading everything.
+- **Usage can group by any tag**, not only the billing consumer label — partner, channel, product, whatever is in play. The picker is populated from tags present in recent traffic rather than from the config, because a tag that is declared but never populated is a dead option that sends someone to an empty breakdown.
+
+- **Trace correlation across services.** Every record now carries `trace_id`, `span_id` and `parent_span_id`, taken from an inbound W3C `traceparent` or generated when the caller sends none. `/api/logs?trace=<id>` returns every hop of one request, so several services reporting into one store become a request tree rather than a flat list. Indexed in all three drivers, covered by the shared conformance suite.
+
+  The forwarded request carries **this hop's** span so downstream calls nest under it — passing the caller's header through unchanged would make every downstream hop a sibling and flatten the tree. This is the one place OpticTrace writes to traffic and it is deliberately narrow: the forwarded copy only, never the response, never what the client sent. `service.trace.propagate_upstream: false` disables it; `service.trace.response_header` optionally returns the id to the caller and is off by default.
+
+  The OTLP exporter now emits the record's stored ids rather than re-parsing headers, so a span and the record it came from cannot disagree about which trace they belong to. The `traceparent` parser moved to `internal/tracectx`, shared by the proxy, the exporter and the ingest path.
+
+- **Multi-tenant tagging.** `match.headers` and `match.query` take regular expressions, so a rule can apply only to requests meeting a condition; and label sources gained `static:<value>` (the way to tag a class of traffic), `path:<n>` for a tenant carried in the URL, and an optional `|<regex>` capture-group suffix on any source (`header:X-Region|^([a-z]{2})-` turns `eu-west-1` into `eu`). Together these let one endpoint serving many tenants be segregated, metered and billed by tenant, plan tier, region or anything else in the request.
+
+  There is deliberately **no separate `tags:` block**: rules already merge top to bottom with later ones winning, so a broad default plus a narrow override expresses conditional tagging using machinery that already governs redaction, sampling and metering.
+
+  When the discriminator lives in the **payload** — two partners calling one lead endpoint with the same tenant and product, differing only in `$.lead.source` — `json:` and `json_response:` label sources and `match.body` criteria reach it, using the same path grammar as redaction including `**` recursive descent. Body values are extracted **after** redaction, so a label can never copy a masked field into a Prometheus dimension; validation refuses that overlap outright rather than leaving a label reading `[REDACTED]`. Only routes carrying a body rule buffer a body, and the set is recomputed on reload.
+
+  Records can also be **filtered by tag**: `/api/logs?label.tenant=acme&label.tier=premium` (and the same on `/api/export`). Multiple labels are an AND, and values are matched literally by all three drivers — a tenant named `acme_1` must never select `acmeX1`, the same mistake that once let `purge` destroy a neighbour's data and just as wrong when it widens what someone is shown. Covered by the shared conformance suite, including the labels-only case where a driver that orders its WHERE clause wrongly returns everything.
+
+  Criteria are decided from request context, so a rule using them does not match when that context is unavailable — the same fail-safe stance `graphql_operation` takes, because treating "cannot decide" as "matches" would silently apply a narrowly-scoped rule to everything. `review`, `suggest` and `optictrace test` all reconstruct that context, so a tagging rule is visible to the PR bot and testable before it ships.
+
+### Changed
+
+- **The dashboard overview leads with governance rather than latency.** A rule that matches nothing is called out by name — the config looks right, the dashboard looks green, and nothing is being enforced — alongside new panels for traffic by tenant, application logs by level, succeeded-vs-failed traffic and a per-service fleet strip. Panels refresh together on one window so they cannot disagree with each other.
+
+- **`examples/traffic-sample.jsonl` is generated, not hand-written** (`make fixture`), from a real run against the same config the PR bot reviews with. A hand-written fixture keeps whatever fields existed the day someone typed it, so the bot quietly stops exercising everything added since; the old one had no trace ids, no streams and two label keys.
+
 ### Fixed
 
 - **The FastAPI SDK had never delivered a single record.** It formatted timestamps with `%z` (`+0530`), which the agent's strict RFC3339 parser rejects with a 400 — and `_ship` swallowed every exception, so the SDK looked healthy while shipping nothing at all. Timestamps are now RFC3339 UTC, delivery failures are counted and the last error kept, and the test suite asserts the wire format rather than only the fields.
@@ -43,37 +68,6 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 - **The dashboard silently vanished when the agent ran from another directory.** `-ui` defaults to a path relative to the working directory; the agent now also looks beside its own executable, and the fallback page says which path it searched instead of only "not found".
 
 - **The flagship `optic.yaml` recorded a credential in the query string** (`?api_key=…` was not in `redact.query_params`) and **stored unmasked customer emails** returned by the user-read path. Both are closed, with rule tests covering them.
-
-### Changed
-
-- **The dashboard overview leads with governance rather than latency.** A rule that matches nothing is called out by name — the config looks right, the dashboard looks green, and nothing is being enforced — alongside new panels for traffic by tenant, application logs by level, succeeded-vs-failed traffic and a per-service fleet strip. Panels refresh together on one window so they cannot disagree with each other.
-
-- **`examples/traffic-sample.jsonl` is generated, not hand-written** (`make fixture`), from a real run against the same config the PR bot reviews with. A hand-written fixture keeps whatever fields existed the day someone typed it, so the bot quietly stops exercising everything added since; the old one had no trace ids, no streams and two label keys.
-
-### Added
-
-- **The dashboard caught up with the tags and traces work.** The inspector gained a **Tags** column whose chips filter on click (`label.<name>=<value>`, all of them ANDed, removable from the filter bar), a **stream** badge so a 600,000ms row reads as a connection lifetime rather than a catastrophe ([#24](https://github.com/dwarka-prasad/optictrace/issues/24)), and a **request trace** section in the detail panel that fetches every hop of the trace and renders it as a tree with per-hop latency bars — clicking a hop jumps to it. A tag a rule declared but the request never populated shows as `name=∅` rather than being hidden, since a silently absent tag is the usual symptom of a mistyped source. Exports now carry the tag filters, so downloading what the table shows no longer means downloading everything.
-- **Usage can group by any tag**, not only the billing consumer label — partner, channel, product, whatever is in play. The picker is populated from tags present in recent traffic rather than from the config, because a tag that is declared but never populated is a dead option that sends someone to an empty breakdown.
-
-### Added
-
-- **Trace correlation across services.** Every record now carries `trace_id`, `span_id` and `parent_span_id`, taken from an inbound W3C `traceparent` or generated when the caller sends none. `/api/logs?trace=<id>` returns every hop of one request, so several services reporting into one store become a request tree rather than a flat list. Indexed in all three drivers, covered by the shared conformance suite.
-
-  The forwarded request carries **this hop's** span so downstream calls nest under it — passing the caller's header through unchanged would make every downstream hop a sibling and flatten the tree. This is the one place OpticTrace writes to traffic and it is deliberately narrow: the forwarded copy only, never the response, never what the client sent. `service.trace.propagate_upstream: false` disables it; `service.trace.response_header` optionally returns the id to the caller and is off by default.
-
-  The OTLP exporter now emits the record's stored ids rather than re-parsing headers, so a span and the record it came from cannot disagree about which trace they belong to. The `traceparent` parser moved to `internal/tracectx`, shared by the proxy, the exporter and the ingest path.
-
-### Added
-
-- **Multi-tenant tagging.** `match.headers` and `match.query` take regular expressions, so a rule can apply only to requests meeting a condition; and label sources gained `static:<value>` (the way to tag a class of traffic), `path:<n>` for a tenant carried in the URL, and an optional `|<regex>` capture-group suffix on any source (`header:X-Region|^([a-z]{2})-` turns `eu-west-1` into `eu`). Together these let one endpoint serving many tenants be segregated, metered and billed by tenant, plan tier, region or anything else in the request.
-
-  There is deliberately **no separate `tags:` block**: rules already merge top to bottom with later ones winning, so a broad default plus a narrow override expresses conditional tagging using machinery that already governs redaction, sampling and metering.
-
-  When the discriminator lives in the **payload** — two partners calling one lead endpoint with the same tenant and product, differing only in `$.lead.source` — `json:` and `json_response:` label sources and `match.body` criteria reach it, using the same path grammar as redaction including `**` recursive descent. Body values are extracted **after** redaction, so a label can never copy a masked field into a Prometheus dimension; validation refuses that overlap outright rather than leaving a label reading `[REDACTED]`. Only routes carrying a body rule buffer a body, and the set is recomputed on reload.
-
-  Records can also be **filtered by tag**: `/api/logs?label.tenant=acme&label.tier=premium` (and the same on `/api/export`). Multiple labels are an AND, and values are matched literally by all three drivers — a tenant named `acme_1` must never select `acmeX1`, the same mistake that once let `purge` destroy a neighbour's data and just as wrong when it widens what someone is shown. Covered by the shared conformance suite, including the labels-only case where a driver that orders its WHERE clause wrongly returns everything.
-
-  Criteria are decided from request context, so a rule using them does not match when that context is unavailable — the same fail-safe stance `graphql_operation` takes, because treating "cannot decide" as "matches" would silently apply a narrowly-scoped rule to everything. `review`, `suggest` and `optictrace test` all reconstruct that context, so a tagging rule is visible to the PR bot and testable before it ships.
 
 ## [0.8.2] — 2026-08-16
 
@@ -247,7 +241,8 @@ Measured with `make bench` (12th Gen Intel i5-1235U, Go 1.25):
 - Control-plane authentication is available but **off by default**.
 - Homebrew publishing is configured but disabled until a `homebrew-tap` repository exists.
 
-[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.8.2...v0.9.0
 [0.8.2]: https://github.com/dwarka-prasad/optictrace/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/dwarka-prasad/optictrace/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.7.0...v0.8.0
