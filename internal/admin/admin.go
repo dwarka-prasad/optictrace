@@ -826,6 +826,18 @@ func filterFromQuery(r *http.Request) store.Filter {
 			f.Since = t
 		}
 	}
+	// label.<name>=<value> selects by tag: the multi-tenant question, "show me
+	// only this tenant's calls". Values are matched literally by every driver.
+	for key, vals := range r.URL.Query() {
+		name, ok := strings.CutPrefix(key, "label.")
+		if !ok || name == "" || len(vals) == 0 || vals[0] == "" {
+			continue
+		}
+		if f.Labels == nil {
+			f.Labels = map[string]string{}
+		}
+		f.Labels[name] = vals[0]
+	}
 	return f
 }
 

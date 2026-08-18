@@ -550,6 +550,17 @@ func (s *SQLiteStore) Close() error { return s.db.Close() }
 
 // --- helpers ----------------------------------------------------------------
 
+// sortedKeys gives label filters a deterministic order, so the generated SQL
+// is stable and a prepared-statement cache is not defeated by map iteration.
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func buildWhere(f Filter) (string, []any) {
 	var conds []string
 	var args []any
@@ -575,6 +586,13 @@ func buildWhere(f Filter) (string, []any) {
 	}
 	if !f.Until.IsZero() {
 		conds, args = append(conds, "ts <= ?"), append(args, f.Until.UnixMilli())
+	}
+	// Labels are stored as a JSON object. json_extract compares the value
+	// literally — deliberately not LIKE, which is how purge once matched a
+	// neighbouring tenant.
+	for _, k := range sortedKeys(f.Labels) {
+		conds = append(conds, "json_extract(labels, '$.' || ?) = ?")
+		args = append(args, k, f.Labels[k])
 	}
 	if len(conds) == 0 {
 		return "", nil

@@ -16,6 +16,8 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
   There is deliberately **no separate `tags:` block**: rules already merge top to bottom with later ones winning, so a broad default plus a narrow override expresses conditional tagging using machinery that already governs redaction, sampling and metering.
 
+  Records can also be **filtered by tag**: `/api/logs?label.tenant=acme&label.tier=premium` (and the same on `/api/export`). Multiple labels are an AND, and values are matched literally by all three drivers — a tenant named `acme_1` must never select `acmeX1`, the same mistake that once let `purge` destroy a neighbour's data and just as wrong when it widens what someone is shown. Covered by the shared conformance suite, including the labels-only case where a driver that orders its WHERE clause wrongly returns everything.
+
   Criteria are decided from request context, so a rule using them does not match when that context is unavailable — the same fail-safe stance `graphql_operation` takes, because treating "cannot decide" as "matches" would silently apply a narrowly-scoped rule to everything. `review`, `suggest` and `optictrace test` all reconstruct that context, so a tagging rule is visible to the PR bot and testable before it ships.
 
 ## [0.8.2] — 2026-08-16

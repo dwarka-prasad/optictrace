@@ -185,6 +185,10 @@ func chBuildWhere(f Filter) (string, []any) {
 		conds = append(conds, "ts <= ?")
 		args = append(args, f.Until.UnixMilli())
 	}
+	for _, k := range sortedKeys(f.Labels) {
+		conds = append(conds, "JSONExtractString(assumeNotNull(labels), ?) = ?")
+		args = append(args, k, f.Labels[k])
+	}
 	if len(conds) == 0 {
 		return "", nil
 	}

@@ -990,6 +990,9 @@ redaction, sampling and metering rather than adding a second thing to learn.
 
 ### What tags do for you
 
+- **Filter the inspector** — `?label.tenant=acme&label.tier=premium` on
+  `/api/logs` and `/api/export`. Multiple labels are an AND, and values match
+  literally, so a tenant named `acme_1` never selects `acmeX1`.
 - **Prometheus dimensions** — `optictrace_requests_total{tenant="acme",tier="premium"}`
 - **Cost attribution** — `/api/usage?label=tier` groups by any tag, not just tenant
 - **Erasure requests** — `optictrace purge -label tenant -value acme`

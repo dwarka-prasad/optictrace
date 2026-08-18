@@ -61,6 +61,7 @@ func RunStoreSuite(t *testing.T, open OpenFunc) {
 	t.Run("filters", func(t *testing.T) { testFilters(t, open) })
 	t.Run("usage", func(t *testing.T) { testUsage(t, open) })
 	t.Run("rule_match_counts", func(t *testing.T) { testRuleMatchCounts(t, open) })
+	t.Run("label_filter", func(t *testing.T) { testLabelFilter(t, open) })
 	t.Run("purge", func(t *testing.T) { testPurge(t, open) })
 	t.Run("purge_is_literal", func(t *testing.T) { testPurgeIsLiteral(t, open) })
 	t.Run("stats", func(t *testing.T) { testStats(t, open) })
@@ -197,6 +198,91 @@ func testRuleMatchCounts(t *testing.T, open OpenFunc) {
 	if len(got) != 3 {
 		t.Errorf("every requested rule should be reported, got %d", len(got))
 	}
+}
+
+// testLabelFilter covers the multi-tenant question: one endpoint, many
+// tenants, show me only one of them. The labels-ONLY case matters most —
+// a driver that builds its WHERE clause in the wrong order can return every
+// record when labels are the sole constraint, which shows a user another
+// tenant's traffic rather than erroring.
+func testLabelFilter(t *testing.T, open OpenFunc) {
+	ctx := context.Background()
+	s := open(t)
+	for _, tc := range []struct{ tenant, tier string }{
+		{"acme", "premium"}, {"acme", "premium"}, {"acme", "standard"},
+		{"globex", "standard"}, {"initech", "premium"},
+	} {
+		r := Record(200, 1, "/api/orders", tc.tenant)
+		r.Labels = map[string]string{"tenant": tc.tenant, "tier": tc.tier}
+		mustSave(t, s, r)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		labels map[string]string
+		want   int
+	}{
+		{"single label", map[string]string{"tenant": "acme"}, 3},
+		{"other tenant", map[string]string{"tenant": "globex"}, 1},
+		{"by tier across tenants", map[string]string{"tier": "premium"}, 3},
+		// Multiple labels are an AND.
+		{"two labels", map[string]string{"tenant": "acme", "tier": "premium"}, 2},
+		{"no match", map[string]string{"tenant": "nobody"}, 0},
+		{"contradictory", map[string]string{"tenant": "globex", "tier": "premium"}, 0},
+		{"unknown label name", map[string]string{"nosuch": "x"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recs, total, err := s.Query(ctx, ext.Filter{Labels: tc.labels})
+			if err != nil {
+				t.Fatalf("query: %v", err)
+			}
+			if int(total) != tc.want || len(recs) != tc.want {
+				t.Fatalf("total=%d len=%d, want %d", total, len(recs), tc.want)
+			}
+			// Every returned record must actually carry the filter values.
+			for _, r := range recs {
+				for k, v := range tc.labels {
+					if r.Labels[k] != v {
+						t.Errorf("returned a record with %s=%q, wanted %q", k, r.Labels[k], v)
+					}
+				}
+			}
+		})
+	}
+
+	t.Run("combines with other constraints", func(t *testing.T) {
+		_, total, err := s.Query(ctx, ext.Filter{
+			Labels: map[string]string{"tenant": "acme"}, Method: "post",
+		})
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		if total != 3 {
+			t.Errorf("total = %d, want 3", total)
+		}
+	})
+
+	// Matched literally, never as a pattern — the mistake that once let purge
+	// destroy a neighbouring tenant's data, and just as wrong when it widens
+	// what someone is shown.
+	t.Run("values match literally", func(t *testing.T) {
+		s2 := open(t)
+		for _, tenant := range []string{"acme_1", "acmeX1"} {
+			r := Record(200, 1, "/api/x", tenant)
+			r.Labels = map[string]string{"tenant": tenant}
+			mustSave(t, s2, r)
+		}
+		recs, total, err := s2.Query(ctx, ext.Filter{Labels: map[string]string{"tenant": "acme_1"}})
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		if total != 1 {
+			t.Fatalf("filtering tenant=acme_1 returned %d records — _ was treated as a wildcard", total)
+		}
+		if recs[0].Labels["tenant"] != "acme_1" {
+			t.Errorf("returned the wrong tenant: %q", recs[0].Labels["tenant"])
+		}
+	})
 }
 
 func testPurge(t *testing.T, open OpenFunc) {

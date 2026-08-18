@@ -69,8 +69,16 @@ type Filter struct {
 	StatusMax  int
 	Since      time.Time
 	Until      time.Time
-	Limit      int
-	Offset     int
+	// Labels selects records carrying ALL of these label values exactly —
+	// the multi-tenant question, "show me only this tenant's calls".
+	//
+	// Matched literally, never as a pattern. A tenant named "acme_1" must not
+	// select "acmeX1": the same mistake that once made `purge` destroy a
+	// neighbour's data, and just as wrong when it silently widens what someone
+	// is shown.
+	Labels map[string]string
+	Limit  int
+	Offset int
 }
 
 // TimeBucket is one point in an aggregated traffic series.

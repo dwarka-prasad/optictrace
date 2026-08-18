@@ -479,6 +479,12 @@ func pgBuildWhere(f Filter) (string, []any) {
 	if !f.Until.IsZero() {
 		conds = append(conds, "ts <= "+bind(f.Until.UnixMilli()))
 	}
+	// Before the empty check, or a labels-only filter would produce no WHERE
+	// clause and silently return every record. Uses bind() like every other
+	// condition rather than hand-numbering placeholders.
+	for _, k := range sortedKeys(f.Labels) {
+		conds = append(conds, fmt.Sprintf("labels->>%s = %s", bind(k), bind(f.Labels[k])))
+	}
 	if len(conds) == 0 {
 		return "", nil
 	}
