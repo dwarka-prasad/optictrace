@@ -85,6 +85,9 @@ func matches(r *ext.Record, f ext.Filter) bool {
 	if !f.Until.IsZero() && r.Time.After(f.Until) {
 		return false
 	}
+	if f.TraceID != "" && r.TraceID != f.TraceID {
+		return false
+	}
 	// Every listed label must match, compared literally — a tenant named
 	// "acme_1" must never select "acmeX1". The conformance suite checks this
 	// specifically, because getting it wrong shows one tenant another
