@@ -97,6 +97,27 @@ func Load(path string) ([]Case, error) {
 	return wrapper.Cases, nil
 }
 
+// governedDoc marshals a case's body, redacts it under the policy, and parses
+// the result — the same order the interceptor uses, so a test asserts what
+// production would actually record.
+func governedDoc(body any, p *engine.Policy) (any, bool) {
+	if body == nil {
+		return nil, false
+	}
+	raw, err := json.Marshal(normalizeYAML(body))
+	if err != nil {
+		return nil, false
+	}
+	if red, ok := p.RedactJSONBody(raw); ok {
+		raw = red
+	}
+	var doc any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, false
+	}
+	return doc, true
+}
+
 // Run evaluates every case against the engine.
 func Run(eng *engine.Engine, cases []Case) *Result {
 	res := &Result{Total: len(cases)}
@@ -137,9 +158,21 @@ func runCase(eng *engine.Engine, name string, c Case) []Failure {
 	// `optictrace test` case can assert that a tagging rule fires — which is
 	// the whole point of being able to test rules before shipping them.
 	q, _ := url.ParseQuery(query)
-	policy := eng.EvaluateAttrs(engine.Attrs{
-		Method: method, Path: path, Headers: hdr, Query: q,
-	})
+	attrs := engine.Attrs{Method: method, Path: path, Headers: hdr, Query: q}
+	policy := eng.EvaluateAttrs(attrs)
+
+	// Two passes, mirroring the proxy: rules keyed on the body cannot be
+	// decided until the body is available, and the body is redacted before
+	// anything reads it so a criterion or label can never see a masked field.
+	//
+	// Without this a rule using match.body or a json: label could not be
+	// tested at all — and an untestable governance rule is one nobody can
+	// trust, which defeats the point of this file existing.
+	reqBody, reqKnown := governedDoc(c.Request.Body, &policy)
+	if reqKnown {
+		attrs.Body, attrs.BodyKnown = reqBody, true
+		policy = eng.EvaluateAttrs(attrs)
+	}
 
 	// --- matched rules ---------------------------------------------------
 	if c.Expect.MatchedRules != nil {
@@ -211,7 +244,15 @@ func runCase(eng *engine.Engine, name string, c Case) []Failure {
 				fail("labels."+name, want, "(label not defined by any matching rule)")
 				continue
 			}
-			if got := src.Value(req); got != want {
+			got := src.Value(req)
+			// json / json_response sources read a body, not the request line.
+			if src.Kind == "json" {
+				got = src.ValueFromBody(reqBody)
+			} else if src.Kind == "json_response" {
+				resDoc, _ := governedDoc(c.Request.Response, &policy)
+				got = src.ValueFromBody(resDoc)
+			}
+			if got != want {
 				fail("labels."+name, want, got)
 			}
 		}
