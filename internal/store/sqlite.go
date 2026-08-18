@@ -58,6 +58,27 @@ CREATE INDEX IF NOT EXISTS idx_logs_route_duration ON logs(route, method, durati
 -- "show me every hop of this request" is the whole point of storing a trace
 -- id, and it is a point lookup over a growing table.
 CREATE INDEX IF NOT EXISTS idx_logs_trace ON logs(trace_id);
+
+-- Application log lines, correlated to a span. Separate table, not more
+-- columns on the logs table: a different cardinality entirely (many lines
+-- per exchange) and want their own retention horizon.
+CREATE TABLE IF NOT EXISTS app_logs (
+	id        INTEGER PRIMARY KEY AUTOINCREMENT,
+	ts        INTEGER NOT NULL,   -- unix milliseconds
+	service   TEXT NOT NULL DEFAULT '',
+	trace_id  TEXT NOT NULL DEFAULT '',
+	span_id   TEXT NOT NULL DEFAULT '',
+	level     TEXT NOT NULL DEFAULT '',
+	message   TEXT NOT NULL DEFAULT '',
+	fields    TEXT NOT NULL DEFAULT '',
+	source    TEXT NOT NULL DEFAULT '',
+	truncated INTEGER NOT NULL DEFAULT 0
+);
+-- "what did this request log" is the entire point, and it is a point lookup
+-- over the fastest-growing table in the store.
+CREATE INDEX IF NOT EXISTS idx_app_logs_span  ON app_logs(span_id, ts);
+CREATE INDEX IF NOT EXISTS idx_app_logs_trace ON app_logs(trace_id, ts);
+CREATE INDEX IF NOT EXISTS idx_app_logs_ts    ON app_logs(ts);
 `
 
 func NewSQLite(dsn string) (*SQLiteStore, error) {
@@ -540,11 +561,45 @@ func (s *SQLiteStore) Purge(ctx context.Context, label, value string, before tim
 		query += ` AND ts < ?`
 		args = append(args, before.UnixMilli())
 	}
-	res, err := s.db.ExecContext(ctx, query, args...)
+	// Erasure has to take the application log lines with it. A tenant's
+	// requests deleted while the lines those requests wrote survive is not
+	// erasure — and an app log is the likelier place for the personal data to
+	// be sitting, because nobody redacts a log line as carefully as a payload.
+	//
+	// One transaction: a partial erasure that reports success is worse than a
+	// failed one, because nobody comes back to it.
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	defer tx.Rollback()
+
+	logQuery := `DELETE FROM app_logs WHERE trace_id IN (SELECT trace_id FROM logs WHERE ` +
+		`labels LIKE ? ESCAPE '\' AND trace_id != ''`
+	logArgs := []any{needle}
+	if !before.IsZero() {
+		logQuery += ` AND ts < ?`
+		logArgs = append(logArgs, before.UnixMilli())
+	}
+	logQuery += `)`
+	if _, err := tx.ExecContext(ctx, logQuery, logArgs...); err != nil {
+		return 0, fmt.Errorf("purge app logs: %w", err)
+	}
+
+	res, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	// Deliberately the RECORD count: the caller asked how many requests were
+	// erased, and inflating it with log lines would misreport the answer.
+	return n, nil
 }
 
 // likeEscape neutralizes LIKE metacharacters so a value is matched literally.

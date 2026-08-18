@@ -11,14 +11,18 @@ import (
 // LogStore. Under backpressure records are DROPPED (and counted) — an
 // observability tool must never become the bottleneck it measures.
 type AsyncWriter struct {
-	store     LogStore
-	queue     chan *Record
-	done      chan struct{}
-	logger    *slog.Logger
-	onDrop    func()
-	maxRows   int64
-	maxAge    time.Duration
-	pruneTick time.Duration
+	store   LogStore
+	queue   chan *Record
+	done    chan struct{}
+	logger  *slog.Logger
+	onDrop  func()
+	maxRows int64
+	maxAge  time.Duration
+	// appLogMaxAge expires application log lines on their own horizon. They
+	// arrive at many lines per request, so keeping them as long as records
+	// usually means keeping far more data than anyone intended.
+	appLogMaxAge time.Duration
+	pruneTick    time.Duration
 }
 
 type AsyncOption func(*AsyncWriter)
@@ -37,6 +41,12 @@ func WithRetention(maxRows int64) AsyncOption {
 // age limits compose: whichever removes a record first wins.
 func WithMaxAge(d time.Duration) AsyncOption {
 	return func(w *AsyncWriter) { w.maxAge = d }
+}
+
+// WithAppLogMaxAge sets the retention horizon for application log lines. It is
+// a no-op unless the store implements ext.AppLogStore.
+func WithAppLogMaxAge(d time.Duration) AsyncOption {
+	return func(w *AsyncWriter) { w.appLogMaxAge = d }
 }
 
 func NewAsyncWriter(s LogStore, queueSize int, logger *slog.Logger, opts ...AsyncOption) *AsyncWriter {
@@ -99,6 +109,18 @@ func (w *AsyncWriter) run() {
 					w.logger.Info("pruned old telemetry", "rows", n, "reason", "max_age", "older_than", cutoff)
 				}
 				cancel()
+			}
+			if w.appLogMaxAge > 0 {
+				if als, ok := w.store.(AppLogStore); ok {
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					cutoff := time.Now().Add(-w.appLogMaxAge)
+					if n, err := als.PruneAppLogsBefore(ctx, cutoff); err != nil {
+						w.logger.Warn("app log prune failed", "error", err)
+					} else if n > 0 {
+						w.logger.Info("pruned application logs", "lines", n, "older_than", cutoff)
+					}
+					cancel()
+				}
 			}
 		}
 	}

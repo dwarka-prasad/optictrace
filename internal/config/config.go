@@ -264,8 +264,11 @@ type Telemetry struct {
 	Store       StoreCfg      `yaml:"store"`
 	Exporters   []ExporterCfg `yaml:"exporters"`
 	Billing     *Billing      `yaml:"billing"`
-	Auth        *AdminAuth    `yaml:"auth"`
-	TLS         *AdminTLS     `yaml:"tls"`
+	// AppLogs governs application log lines correlated to spans. Nil means
+	// the feature is off and the ingest endpoint refuses politely.
+	AppLogs *AppLogsCfg `yaml:"app_logs"`
+	Auth    *AdminAuth  `yaml:"auth"`
+	TLS     *AdminTLS   `yaml:"tls"`
 }
 
 // AdminReachable reports whether AdminListen accepts connections from beyond
@@ -481,6 +484,105 @@ type TraceCfg struct {
 // Propagate reports whether to add traceparent to the forwarded request.
 func (t *TraceCfg) Propagate() bool {
 	return t == nil || t.PropagateUpstream == nil || *t.PropagateUpstream
+}
+
+// AppLogsCfg governs application log lines — the highest-risk surface in the
+// product. An app log routinely contains bearer tokens, email addresses and
+// whole payloads inside stack traces, so lines are redacted and capped on the
+// way in rather than stored raw and cleaned up later.
+type AppLogsCfg struct {
+	Enabled bool `yaml:"enabled"`
+	// LevelMin drops anything less severe before it is stored. Most of the
+	// volume — and almost none of the value — is debug lines.
+	LevelMin string `yaml:"level_min"`
+	// MaxLinesPerSpan caps one request's contribution. A retry loop logging
+	// inside a hot path can otherwise write millions of lines against a
+	// single span. 0 uses the default; -1 means no cap.
+	MaxLinesPerSpan int `yaml:"max_lines_per_span"`
+	// MaxMessageBytes truncates an individual line. Stack traces are large
+	// and the first lines are the ones that matter.
+	MaxMessageBytes int `yaml:"max_message_bytes"`
+	// DropOrphans discards lines that carry no span id — startup, cron jobs,
+	// background workers. Default true: they cannot be attributed to a
+	// request, and attaching them to whichever request happened to be in
+	// flight would cross-attribute tenants.
+	//
+	// Whatever this is set to, drops are counted in
+	// optictrace_app_logs_dropped_total — data thrown away silently is data
+	// nobody knows they are missing.
+	DropOrphans *bool `yaml:"drop_orphans"`
+	// RetentionMaxAge expires lines independently of records. App logs run
+	// orders of magnitude above request volume and are rarely wanted for as
+	// long.
+	RetentionMaxAge time.Duration `yaml:"retention_max_age"`
+	// Redact scrubs lines before they are stored. Patterns are regexes
+	// applied to the message and to every structured field value; each match
+	// is replaced with [REDACTED].
+	Redact AppLogRedact `yaml:"redact"`
+}
+
+// AppLogRedact is the log-line equivalent of a rule's redact block.
+type AppLogRedact struct {
+	// Patterns are regexes. A pattern that fails to compile is a config
+	// error, not a silently-skipped rule.
+	Patterns []string `yaml:"patterns"`
+	// Fields are structured-field keys whose values are replaced wholesale.
+	Fields []string `yaml:"fields"`
+}
+
+// validate checks the app-log block at load time. A redaction pattern that
+// does not compile must be a startup failure: the alternative is an agent that
+// runs happily while the rule meant to mask credentials never applies.
+func (a *AppLogsCfg) validate() error {
+	if a == nil {
+		return nil
+	}
+	for i, pat := range a.Redact.Patterns {
+		if _, err := regexp.Compile(pat); err != nil {
+			return fmt.Errorf("telemetry.app_logs.redact.patterns[%d] (%q): %w", i, pat, err)
+		}
+	}
+	if a.LevelMin != "" && LevelRankKnown(a.LevelMin) < 0 {
+		return fmt.Errorf("telemetry.app_logs.level_min %q is not a level "+
+			"(debug, info, warn, error, fatal)", a.LevelMin)
+	}
+	if a.MaxLinesPerSpan < -1 {
+		return fmt.Errorf("telemetry.app_logs.max_lines_per_span %d must be >= -1 "+
+			"(-1 means no cap)", a.MaxLinesPerSpan)
+	}
+	if a.MaxMessageBytes < 0 {
+		return fmt.Errorf("telemetry.app_logs.max_message_bytes %d must be >= 0", a.MaxMessageBytes)
+	}
+	if a.RetentionMaxAge < 0 {
+		return fmt.Errorf("telemetry.app_logs.retention_max_age %s must not be negative", a.RetentionMaxAge)
+	}
+	return nil
+}
+
+// LevelRankKnown returns the severity rank of a level, or -1 if it is not one
+// of the recognised names. Used to reject a typo in level_min at load time —
+// "warining" would otherwise silently keep everything.
+func LevelRankKnown(level string) int {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "trace":
+		return 0
+	case "debug":
+		return 1
+	case "info", "information", "notice":
+		return 2
+	case "warn", "warning":
+		return 3
+	case "error", "err":
+		return 4
+	case "fatal", "critical", "crit", "panic":
+		return 5
+	}
+	return -1
+}
+
+// DropOrphanLines reports whether uncorrelated lines are discarded.
+func (a *AppLogsCfg) DropOrphanLines() bool {
+	return a == nil || a.DropOrphans == nil || *a.DropOrphans
 }
 
 // Defaults holds the global capture posture applied before any rule.
@@ -806,6 +908,9 @@ func (c *Config) Validate() error {
 		}
 	}
 	if err := validateHostPort("telemetry.admin_listen", c.Telemetry.AdminListen); err != nil {
+		return err
+	}
+	if err := c.Telemetry.AppLogs.validate(); err != nil {
 		return err
 	}
 	for _, o := range c.Telemetry.CORSOrigins {
