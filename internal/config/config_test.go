@@ -400,3 +400,100 @@ func TestScanDetectorValidation(t *testing.T) {
 		}
 	})
 }
+
+// A json label reading a field another rule redacts would copy the value into
+// a Prometheus dimension and the stored labels map — routing around the very
+// rule protecting it. Extraction happens post-redaction so it cannot actually
+// leak, but a silently useless label is its own bug.
+func TestJSONLabelOnARedactedFieldIsRefused(t *testing.T) {
+	_, err := Parse([]byte(base + `
+rules:
+  - name: leak-attempt
+    match: {path: "/api/**"}
+    redact:
+      json_fields: ["$.**.email"]
+    labels:
+      who: "json:$.**.email"
+`))
+	if err == nil {
+		t.Fatal("a label reading a redacted field must be refused")
+	}
+	if !strings.Contains(err.Error(), "which another rule redacts") {
+		t.Errorf("message %q should explain the conflict", err)
+	}
+}
+
+func TestBodyCriterionOnARedactedFieldIsRefused(t *testing.T) {
+	_, err := Parse([]byte(base + `
+rules:
+  - name: r
+    match:
+      path: "/api/**"
+      body: {"$.**.email": "^a@"}
+    redact:
+      json_fields: ["$.**.email"]
+`))
+	if err == nil {
+		t.Fatal("a criterion on a redacted field must be refused")
+	}
+}
+
+// The redaction can live on a DIFFERENT rule and still conflict — this is a
+// cross-rule property, which is why it is checked after all rules are parsed.
+func TestRedactionConflictIsDetectedAcrossRules(t *testing.T) {
+	_, err := Parse([]byte(base + `
+rules:
+  - name: mask-pii
+    match: {path: "/**"}
+    redact:
+      json_fields: ["$.**.phone"]
+  - name: tag-by-phone
+    match: {path: "/api/**"}
+    labels:
+      p: "json:$.**.phone"
+`))
+	if err == nil {
+		t.Fatal("a conflict across two rules must still be caught")
+	}
+}
+
+func TestBodyTaggingAccepted(t *testing.T) {
+	cfg, err := Parse([]byte(base + `
+rules:
+  - name: lead-attribution
+    match: {path: "/api/v1/leads"}
+    redact:
+      json_fields: ["$.**.phone"]
+    labels:
+      partner: "json:$.**.source"
+      lead_id: "json_response:$.lead_id"
+  - name: marketplace
+    match:
+      path: "/api/v1/leads"
+      body: {"$.**.source": "^(flipkart|amazon)$"}
+    labels:
+      channel_type: "static:marketplace"
+`))
+	if err != nil {
+		t.Fatalf("should be valid: %v", err)
+	}
+	if len(cfg.Rules) != 2 {
+		t.Fatalf("parsed %d rules", len(cfg.Rules))
+	}
+	if cfg.Rules[1].Match.Body["$.**.source"] == "" {
+		t.Error("body criteria did not survive parsing")
+	}
+}
+
+func TestBodyCriterionKeyMustBeAPath(t *testing.T) {
+	_, err := Parse([]byte(base + `
+rules:
+  - name: r
+    match:
+      path: "/**"
+      body: {"source": "^x$"}
+`))
+	if err == nil || !strings.Contains(err.Error(), "dotted path") {
+		t.Errorf("a bare key should be rejected, got %v", err)
+	}
+}

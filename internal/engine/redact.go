@@ -6,9 +6,11 @@ package engine
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -218,4 +220,87 @@ func redactPath(node any, path []string) any {
 	default:
 		return node
 	}
+}
+
+// FirstString finds the first string-ish value at a JSON path, using the same
+// path grammar as redaction and metering — including "**" recursive descent, so
+// `$.**.source` finds the field wherever a wrapper puts it.
+//
+// Numbers and booleans are rendered rather than skipped: a partner id is as
+// likely to arrive as 4471 as "4471", and a label that silently vanished
+// because the payload used a number would be a confusing thing to debug.
+func FirstString(node any, path []string) (string, bool) {
+	if len(path) == 0 {
+		switch v := node.(type) {
+		case string:
+			return v, true
+		case float64:
+			// Render integers without a trailing ".0" — label values are
+			// compared and grouped as strings.
+			if v == math.Trunc(v) && math.Abs(v) < 1e15 {
+				return strconv.FormatInt(int64(v), 10), true
+			}
+			return strconv.FormatFloat(v, 'f', -1, 64), true
+		case bool:
+			return strconv.FormatBool(v), true
+		}
+		return "", false
+	}
+	switch v := node.(type) {
+	case map[string]any:
+		seg, rest := path[0], path[1:]
+		if seg == "**" {
+			// Match here, or anywhere deeper.
+			if len(rest) > 0 {
+				if s, ok := FirstString(v, rest); ok {
+					return s, true
+				}
+			}
+			for _, child := range v {
+				if s, ok := FirstString(child, path); ok {
+					return s, true
+				}
+			}
+			return "", false
+		}
+		if seg == "*" {
+			for _, child := range v {
+				if s, ok := FirstString(child, rest); ok {
+					return s, true
+				}
+			}
+			return "", false
+		}
+		child, ok := v[seg]
+		if !ok {
+			return "", false
+		}
+		return FirstString(child, rest)
+	case []any:
+		// An array is transparent: `$.items.sku` looks inside each element,
+		// which is what a caller means far more often than an index.
+		for _, child := range v {
+			if s, ok := FirstString(child, path); ok {
+				return s, true
+			}
+		}
+	}
+	return "", false
+}
+
+// ValueAtJSONPath parses a raw body once and pulls one path out of it.
+func ValueAtJSONPath(body []byte, path []string) (string, bool) {
+	if len(body) == 0 {
+		return "", false
+	}
+	var doc any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return "", false
+	}
+	return FirstString(doc, path)
+}
+
+// SplitJSONPath turns "$.lead.source" into ["lead","source"].
+func SplitJSONPath(p string) []string {
+	return strings.Split(strings.TrimPrefix(p, "$."), ".")
 }

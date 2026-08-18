@@ -962,6 +962,55 @@ Same endpoint, segregated:
 /api/v1/tenants/umbrella/orders tenant=umbrella tier=standard  region=eu
 ```
 
+### When the discriminator is in the payload
+
+The hard case is two callers that are identical from the outside: same
+endpoint, same tenant, same product, differing only in a field of the body —
+a lead API called by several partners, for instance.
+
+```yaml
+rules:
+  - name: lead-attribution
+    match: { path: "/api/v1/leads" }
+    redact:
+      json_fields: ["$.**.phone", "$.**.email"]
+    labels:
+      partner: "json:$.**.source"            # flipkart | samsung | direct
+      channel: "json:$.**.channel"
+      lead_id: "json_response:$.lead_id"     # from the RESPONSE
+
+  - name: marketplace-callers
+    match:
+      path: "/api/v1/leads"
+      body: { "$.**.source": "^(flipkart|amazon)$" }
+    labels:
+      channel_type: "static:marketplace"
+```
+
+```
+partner=flipkart channel=app    type=marketplace product=personal-loan lead=LD-111
+partner=samsung  channel=retail type=oem         product=personal-loan lead=LD-113
+partner=direct   channel=web    type=-           product=personal-loan lead=LD-109
+```
+
+Then `/api/logs?label.partner=samsung&label.product=credit-card`, or
+`/api/usage?label=partner` to bill each one.
+
+**Body labels are extracted after redaction, never before.** Otherwise
+`labels: {email: "json:$.**.email"}` would copy a redacted value straight into
+a Prometheus dimension and the stored labels map, routing around the rule next
+to it. Config validation refuses the overlap outright rather than leaving you
+with a label that reads `[REDACTED]`:
+
+```
+✗ rule leak-attempt: labels.who reads $.**.email, which another rule redacts —
+  the label would be "[REDACTED]", and using redacted data as a dimension is
+  what redaction exists to prevent
+```
+
+Only routes carrying a body rule buffer a body, so a config without one pays
+nothing.
+
 ### Label sources
 
 | Source | Example | Value |
@@ -970,6 +1019,8 @@ Same endpoint, segregated:
 | `query:<name>` | `query:tenant` | a query parameter |
 | `path:<n>` | `path:4` | the 4th path segment, 1-indexed |
 | `static:<value>` | `static:premium` | a constant — this is how you **tag** |
+| `json:<path>` | `json:$.**.source` | a field of the governed request body |
+| `json_response:<path>` | `json_response:$.lead_id` | a field of the governed response body |
 
 Any source takes an optional `|<regex>` suffix with exactly one capture group,
 and that group becomes the label. A non-match yields an empty label rather than
@@ -978,7 +1029,8 @@ misleading one.
 
 ### Criteria
 
-`match.headers` and `match.query` take regular expressions. All listed
+`match.headers`, `match.query` and `match.body` take regular expressions
+(`match.body` keys are JSON paths). All listed
 conditions must hold, so adding one narrows the rule. Patterns are unanchored
 like Go's `regexp` — write `^` and `$` for a whole-value match, and `"."` for
 "present and non-empty".

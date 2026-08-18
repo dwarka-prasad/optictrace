@@ -54,6 +54,11 @@ type Interceptor struct {
 	// gqlPaths are the path globs whose request bodies carry a GraphQL
 	// operation name. Empty means the GraphQL path is never taken.
 	gqlPaths [][]string
+	// bodyPaths are the path globs of rules that read the request body — a
+	// body criterion or a json: label. Computed from the engine so only those
+	// routes buffer, and a config without body rules pays nothing.
+	bodyPaths atomic.Pointer[[][]string]
+	needsResp atomic.Bool
 }
 
 // Option configures optional telemetry sinks.
@@ -84,15 +89,43 @@ func NewInterceptor(cfg *config.Config, eng *engine.Engine, logger *slog.Logger,
 		ic.gqlPaths = append(ic.gqlPaths, engine.SplitPath(g))
 	}
 	ic.engine.Store(eng)
+	ic.refreshBodyNeeds(eng)
 	for _, o := range opts {
 		o(ic)
 	}
 	return ic
 }
 
+// refreshBodyNeeds recomputes which routes must buffer a body. Called on
+// construction and on every engine swap, so adding a body rule and reloading
+// takes effect — the failure that #20 records for graphql_paths.
+func (ic *Interceptor) refreshBodyNeeds(eng *engine.Engine) {
+	paths := eng.BodyRulePaths()
+	ic.bodyPaths.Store(&paths)
+	ic.needsResp.Store(eng.NeedsResponseBody())
+}
+
+// needsRequestBody reports whether any rule reads the body on this path.
+func (ic *Interceptor) needsRequestBody(urlPath string) bool {
+	p := ic.bodyPaths.Load()
+	if p == nil || len(*p) == 0 {
+		return false
+	}
+	segs := engine.SplitPath(urlPath)
+	for _, g := range *p {
+		if engine.MatchSegments(g, segs) {
+			return true
+		}
+	}
+	return false
+}
+
 // SwapEngine atomically replaces the rule engine — the heart of config hot
 // reload. In-flight requests finish under the policy they started with.
-func (ic *Interceptor) SwapEngine(eng *engine.Engine) { ic.engine.Store(eng) }
+func (ic *Interceptor) SwapEngine(eng *engine.Engine) {
+	ic.engine.Store(eng)
+	ic.refreshBodyNeeds(eng)
+}
 
 // NewReverseProxy builds the standalone sidecar handler: interception wrapped
 // around a single-host reverse proxy pointed at service.upstream.
@@ -134,7 +167,12 @@ func (ic *Interceptor) Wrap(next http.Handler) http.Handler {
 		// decided by policy below, so this changes what we can see, not what
 		// we keep.
 		gql := ic.isGraphQL(r.URL.Path)
-		if gql {
+		// Same reasoning for body-tagged routes: the discriminator lives in
+		// the payload, so it has to be read even when the sampling draw or a
+		// restriction would skip capture. What gets STORED is still decided by
+		// policy — this changes what we can see, not what we keep.
+		needBody := gql || ic.needsRequestBody(r.URL.Path)
+		if needBody {
 			buffer = true
 		}
 
@@ -145,7 +183,7 @@ func (ic *Interceptor) Wrap(next http.Handler) http.Handler {
 
 		// --- Request-side capture (tee, never consume) -------------------
 		var reqBuf *limitedBuffer
-		if buffer && (policy.CaptureRequestBody || gql) && r.Body != nil {
+		if buffer && (policy.CaptureRequestBody || needBody) && r.Body != nil {
 			reqBuf = &limitedBuffer{limit: policy.CaptureLimitBytes}
 			r.Body = &teeReadCloser{rc: r.Body, tee: reqBuf}
 		}
@@ -157,7 +195,7 @@ func (ic *Interceptor) Wrap(next http.Handler) http.Handler {
 		if ic.collector != nil {
 			rw.onStream = ic.collector.StreamOpened
 		}
-		if (buffer && policy.CaptureResponseBody) || len(policy.Meters) > 0 {
+		if (buffer && policy.CaptureResponseBody) || len(policy.Meters) > 0 || ic.needsResp.Load() {
 			rw.buf = &limitedBuffer{limit: policy.CaptureLimitBytes}
 		}
 
@@ -177,15 +215,25 @@ func (ic *Interceptor) Wrap(next http.Handler) http.Handler {
 		// governance applies to telemetry, not to the traffic itself — the
 		// response has already gone to the client untouched either way.
 		operation := ""
-		if gql && reqBuf != nil {
-			if operation = graphQLOperation(reqBuf.Bytes()); operation != "" {
-				a := engine.AttrsOf(r)
-				a.Operation = operation
-				policy = ic.engine.Load().EvaluateAttrs(a)
+		var governedBody any
+		bodyKnown := false
+		if needBody && reqBuf != nil {
+			if gql {
+				operation = graphQLOperation(reqBuf.Bytes())
 			}
+			// Redact FIRST, then decide. A criterion or label reading a
+			// redacted field would otherwise route straight around the rule
+			// redacting it — the body is governed before anything looks at it.
+			governedBody, bodyKnown = governedJSON(reqBuf, r.Header.Get("Content-Type"), &policy)
+		}
+		if operation != "" || bodyKnown {
+			a := engine.AttrsOf(r)
+			a.Operation = operation
+			a.Body, a.BodyKnown = governedBody, bodyKnown
+			policy = ic.engine.Load().EvaluateAttrs(a)
 		}
 		keep := policy.KeepBody(drew, rw.status, elapsed)
-		ic.emit(r, rw, reqBuf, &policy, keep, elapsed, operation)
+		ic.emit(r, rw, reqBuf, &policy, keep, elapsed, operation, governedBody)
 	})
 }
 
@@ -244,7 +292,26 @@ func (ic *Interceptor) isGraphQL(urlPath string) bool {
 	return false
 }
 
-func (ic *Interceptor) emit(r *http.Request, rw *recordingWriter, reqBuf *limitedBuffer, p *engine.Policy, keep bool, elapsed time.Duration, operation string) {
+// governedJSON redacts a buffered JSON body under the policy and parses the
+// result, so criteria and labels only ever see what governance permits.
+func governedJSON(buf *limitedBuffer, contentType string, p *engine.Policy) (any, bool) {
+	if buf == nil || !strings.Contains(strings.ToLower(contentType), "json") {
+		return nil, false
+	}
+	raw := buf.Bytes()
+	if red, ok := p.RedactJSONBody(raw); ok {
+		raw = red
+	}
+	var doc any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		// A truncated or non-JSON payload is not an error worth failing over;
+		// body rules simply do not match it.
+		return nil, false
+	}
+	return doc, true
+}
+
+func (ic *Interceptor) emit(r *http.Request, rw *recordingWriter, reqBuf *limitedBuffer, p *engine.Policy, keep bool, elapsed time.Duration, operation string, reqBody any) {
 	route := p.RoutePattern
 	if route == "" {
 		route = engine.NormalizeRoute(r.URL.Path)
@@ -293,9 +360,24 @@ func (ic *Interceptor) emit(r *http.Request, rw *recordingWriter, reqBuf *limite
 		}
 	}
 	if len(p.Labels) > 0 {
+		// Response-body labels are parsed lazily and once, only if some label
+		// actually asks for one.
+		var respBody any
+		respParsed := false
 		rec.Labels = make(map[string]string, len(p.Labels))
 		for name, src := range p.Labels {
-			rec.Labels[name] = src.Value(r)
+			switch {
+			case src.Kind == "json":
+				rec.Labels[name] = src.ValueFromBody(reqBody)
+			case src.Kind == "json_response":
+				if !respParsed {
+					respBody, _ = governedJSON(rw.buf, rw.Header().Get("Content-Type"), p)
+					respParsed = true
+				}
+				rec.Labels[name] = src.ValueFromBody(respBody)
+			default:
+				rec.Labels[name] = src.Value(r)
+			}
 		}
 	}
 

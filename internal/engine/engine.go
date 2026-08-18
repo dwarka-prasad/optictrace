@@ -19,6 +19,12 @@ import (
 	"github.com/dwarka-prasad/optictrace/internal/config"
 )
 
+func init() {
+	// config owns the schema and its parser; engine owns the JSON walker.
+	// Injecting it here keeps the dependency one-directional.
+	config.FirstStringFunc = FirstString
+}
+
 // LabelSource is re-exported from config: this grammar is part of the schema,
 // and one parser means validation and runtime cannot disagree about it — a
 // rule that validates but never fires is the worst failure mode for a
@@ -119,12 +125,17 @@ type compiledRule struct {
 	// graphql_operation.
 	hdrCriteria map[string]*regexp.Regexp
 	qryCriteria map[string]*regexp.Regexp
-	restrict    []config.CaptureField
-	redactHdrs  []string
-	redactQuery []string
-	redactPaths [][]string
-	labels      map[string]LabelSource
-	meters      map[string][]string
+	// bodyCriteria are JSON-path conditions on the request body. Deciding
+	// them needs the body, so a rule carrying them is skipped until it is
+	// available — the same fail-safe stance as the header criteria.
+	bodyCriteria map[string]*regexp.Regexp
+	bodyPaths    map[string][]string
+	restrict     []config.CaptureField
+	redactHdrs   []string
+	redactQuery  []string
+	redactPaths  [][]string
+	labels       map[string]LabelSource
+	meters       map[string][]string
 }
 
 // Engine is safe for concurrent use after New returns.
@@ -169,6 +180,16 @@ func New(cfg *config.Config) *Engine {
 			for name, pat := range r.Match.Query {
 				if re, err := regexp.Compile(pat); err == nil {
 					cr.qryCriteria[name] = re
+				}
+			}
+		}
+		if len(r.Match.Body) > 0 {
+			cr.bodyCriteria = make(map[string]*regexp.Regexp, len(r.Match.Body))
+			cr.bodyPaths = make(map[string][]string, len(r.Match.Body))
+			for jp, pat := range r.Match.Body {
+				if re, err := regexp.Compile(pat); err == nil {
+					cr.bodyCriteria[jp] = re
+					cr.bodyPaths[jp] = SplitJSONPath(jp)
 				}
 			}
 		}
@@ -229,6 +250,16 @@ type Attrs struct {
 	Query   url.Values
 	// Operation is the GraphQL operation name, when known.
 	Operation string
+	// Body is the GOVERNED request body, already parsed. Supplied only once
+	// it is available; a rule with body criteria does not match until then.
+	//
+	// Governed, not raw, on purpose: a criterion or label reading a redacted
+	// field would otherwise route straight around the rule redacting it.
+	Body any
+	// BodyKnown distinguishes "parsed, and it had no such field" from
+	// "not read yet". Without it a rule could match on absence before the
+	// body had even been looked at.
+	BodyKnown bool
 }
 
 // AttrsOf builds Attrs from a live request.
@@ -258,6 +289,41 @@ func (e *Engine) EvaluateAttrs(a Attrs) Policy { return e.evaluate(a) }
 // any of them.
 func (e *Engine) EvaluateOp(method, urlPath, operation string) Policy {
 	return e.evaluate(Attrs{Method: method, Path: urlPath, Operation: operation})
+}
+
+// BodyRulePaths returns the path globs of rules that need a request body —
+// either a body criterion or a json label source. The interceptor buffers only
+// these routes, so a config without body rules pays nothing.
+//
+// Response-body labels are reported separately by NeedsResponseBody, since the
+// response buffer already exists whenever metering or capture is on.
+func (e *Engine) BodyRulePaths() [][]string {
+	var out [][]string
+	for i := range e.rules {
+		r := &e.rules[i]
+		need := len(r.bodyCriteria) > 0
+		for _, ls := range r.labels {
+			if ls.Kind == "json" {
+				need = true
+			}
+		}
+		if need {
+			out = append(out, r.pathSegs)
+		}
+	}
+	return out
+}
+
+// NeedsResponseBody reports whether any rule labels from a response body.
+func (e *Engine) NeedsResponseBody() bool {
+	for i := range e.rules {
+		for _, ls := range e.rules[i].labels {
+			if ls.NeedsResponseBody() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // HasCriteriaRules reports whether any rule matches on headers or query
@@ -432,6 +498,15 @@ func (r *compiledRule) criteriaMatch(a Attrs) bool {
 			return false
 		}
 		if !re.MatchString(a.Query.Get(name)) {
+			return false
+		}
+	}
+	for jp, re := range r.bodyCriteria {
+		if !a.BodyKnown {
+			return false // not read yet; decide once it is
+		}
+		v, _ := FirstString(a.Body, r.bodyPaths[jp])
+		if !re.MatchString(v) {
 			return false
 		}
 	}

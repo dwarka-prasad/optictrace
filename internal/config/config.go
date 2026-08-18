@@ -34,9 +34,11 @@ import (
 // Compiled once at load time: the hot path does no parsing, and a malformed
 // source or regex fails `optictrace validate` rather than at request time.
 type LabelSource struct {
-	Kind string // "header" | "query" | "path" | "static"
+	Kind string // "header" | "query" | "path" | "static" | "json" | "json_response"
 	Key  string // header/query name, the literal value for static
 	Seg  int    // 1-indexed path segment when Kind == "path"
+	// JSONPath is the split body path for the json kinds.
+	JSONPath []string
 	// Extract, when set, pulls a capture group out of the raw value. Exactly
 	// one group; a non-match yields "" rather than the whole value, so a
 	// mismatched pattern produces a missing label instead of a surprising one.
@@ -62,8 +64,46 @@ func (s LabelSource) Value(r *http.Request) string {
 		// with match criteria and rule merge order, this is how conditional
 		// tags are expressed without a second concept.
 		return s.Key
+	case "json", "json_response":
+		// Resolved by ValueFromBody — the body is not on the request struct.
+		return ""
 	}
 	return s.apply(raw)
+}
+
+// NeedsBody reports whether this source reads a request or response body.
+func (s LabelSource) NeedsBody() bool {
+	return s.Kind == "json" || s.Kind == "json_response"
+}
+
+// NeedsResponseBody reports whether this source reads the RESPONSE body, which
+// is only available after the handler has run.
+func (s LabelSource) NeedsResponseBody() bool { return s.Kind == "json_response" }
+
+// ValueFromBody resolves a json source against an already-parsed body.
+//
+// The body handed here is the GOVERNED one — post-redaction. That is
+// deliberate and load-bearing: extracting from the raw payload would let
+// `labels: {email: "json:$.customer.email"}` copy a redacted value into a
+// Prometheus label and the stored labels map, quietly routing around the
+// governance the rule next to it is enforcing. Extracting after redaction
+// means such a label reads "[REDACTED]" — visibly wrong rather than silently
+// leaking. Validate also refuses the overlap outright.
+func (s LabelSource) ValueFromBody(doc any) string {
+	if !s.NeedsBody() || doc == nil {
+		return ""
+	}
+	raw, ok := FirstStringFunc(doc, s.JSONPath)
+	if !ok {
+		return ""
+	}
+	return s.apply(raw)
+}
+
+// FirstStringFunc is wired to engine.FirstString at init to avoid an import
+// cycle: config owns the schema, engine owns the JSON walker.
+var FirstStringFunc func(node any, path []string) (string, bool) = func(any, []string) (string, bool) {
+	return "", false
 }
 
 // apply runs the optional capture-group extraction.
@@ -95,7 +135,8 @@ func ParseLabelSource(src string) (LabelSource, error) {
 	kind, key, ok := strings.Cut(expr, ":")
 	if !ok {
 		return LabelSource{}, fmt.Errorf("source %q must be "+
-			"'header:<Name>', 'query:<name>', 'path:<n>' or 'static:<value>'", src)
+			"'header:<Name>', 'query:<name>', 'path:<n>', 'static:<value>', "+
+			"'json:$.a.b' or 'json_response:$.a.b'", src)
 	}
 	ls := LabelSource{Kind: kind, Key: key}
 	switch kind {
@@ -107,6 +148,12 @@ func ParseLabelSource(src string) (LabelSource, error) {
 		if key == "" {
 			return LabelSource{}, fmt.Errorf("source %q needs a value after 'static:'", src)
 		}
+	case "json", "json_response":
+		if !strings.HasPrefix(key, "$.") || len(key) <= 2 {
+			return LabelSource{}, fmt.Errorf("source %q: %s needs a dotted path "+
+				"starting with '$.', e.g. 'json:$.lead.source'", src, kind)
+		}
+		ls.JSONPath = strings.Split(strings.TrimPrefix(key, "$."), ".")
 	case "path":
 		n, err := strconv.Atoi(key)
 		if err != nil || n < 1 {
@@ -116,7 +163,7 @@ func ParseLabelSource(src string) (LabelSource, error) {
 		ls.Seg = n
 	default:
 		return LabelSource{}, fmt.Errorf("source %q: unknown kind %q "+
-			"(header, query, path, static)", src, kind)
+			"(header, query, path, static, json, json_response)", src, kind)
 	}
 	if hasRegex {
 		if kind == "static" {
@@ -487,6 +534,24 @@ type Match struct {
 
 	// Query matches query parameters the same way.
 	Query map[string]string `yaml:"query"`
+
+	// Body matches values inside the JSON request body by path, again as
+	// regular expressions:
+	//
+	//	match:
+	//	  path: "/api/v1/leads"
+	//	  body:
+	//	    "$.**.source": "^flipkart$"
+	//
+	// This is what distinguishes callers that are otherwise identical — the
+	// same endpoint, the same tenant, the same product, differing only in a
+	// field of the payload.
+	//
+	// It costs a buffered request body on the matching routes, which is why
+	// it is per-rule rather than global: only paths with a body rule pay.
+	// Matched against the GOVERNED body, so a redacted field cannot be used
+	// as a criterion — see the note on json label sources.
+	Body map[string]string `yaml:"body"`
 }
 
 // Redact lists what to mask in *captured* telemetry. The proxied traffic
@@ -665,6 +730,21 @@ var validMethods = map[string]bool{
 }
 
 // Validate enforces schema invariants so the runtime engine can trust the config.
+// redactedJSONPaths collects every path any rule redacts, for the overlap
+// check below.
+func (c *Config) redactedJSONPaths() map[string]bool {
+	out := map[string]bool{}
+	for i := range c.Rules {
+		if c.Rules[i].Redact == nil {
+			continue
+		}
+		for _, jp := range c.Rules[i].Redact.JSONFields {
+			out[jp] = true
+		}
+	}
+	return out
+}
+
 func (c *Config) Validate() error {
 	if c.Version != 1 {
 		return fmt.Errorf("unsupported config version %d (expected 1)", c.Version)
@@ -792,6 +872,31 @@ func (c *Config) Validate() error {
 		}
 		seenKind[d.Kind] = true
 	}
+	// Cross-rule check: a json label or body criterion aimed at something
+	// another rule redacts.
+	redacted := c.redactedJSONPaths()
+	for i := range c.Rules {
+		r := &c.Rules[i]
+		for key, src := range r.Labels {
+			ls, err := ParseLabelSource(src)
+			if err != nil || !ls.NeedsBody() {
+				continue
+			}
+			jp := "$." + strings.Join(ls.JSONPath, ".")
+			if redacted[jp] {
+				return fmt.Errorf("rule %s: labels.%s reads %s, which another rule redacts — "+
+					"the label would be \"[REDACTED]\", and using redacted data as a "+
+					"dimension is what redaction exists to prevent", r.Name, key, jp)
+			}
+		}
+		for jp := range r.Match.Body {
+			if redacted[jp] {
+				return fmt.Errorf("rule %s: match.body cannot key on %s, which another "+
+					"rule redacts — the criterion would only ever see \"[REDACTED]\"",
+					r.Name, jp)
+			}
+		}
+	}
 	for i := range c.Rules {
 		if err := c.Rules[i].validate(); err != nil {
 			name := c.Rules[i].Name
@@ -893,6 +998,19 @@ func (r *Rule) validate() error {
 		// is the worst failure mode for a config-driven product.
 		if _, err := ParseLabelSource(src); err != nil {
 			return fmt.Errorf("labels.%s: %w", key, err)
+		}
+	}
+	// A json label reading a field that some rule redacts would copy the value
+	// into a Prometheus label and the stored labels map — routing around the
+	// very rule protecting it. Extraction happens post-redaction so the label
+	// would read "[REDACTED]" rather than leak, but silently producing a
+	// useless label is its own bug, so say so at load time.
+	for name, pat := range r.Match.Body {
+		if _, err := regexp.Compile(pat); err != nil {
+			return fmt.Errorf("match.body[%s]: %w", name, err)
+		}
+		if !strings.HasPrefix(name, "$.") {
+			return fmt.Errorf("match.body: key %q must be a dotted path starting with '$.'", name)
 		}
 	}
 	for name, pat := range r.Match.Headers {
