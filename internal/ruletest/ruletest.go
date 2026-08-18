@@ -129,7 +129,17 @@ func runCase(eng *engine.Engine, name string, c Case) []Failure {
 	if i := strings.IndexByte(path, '?'); i >= 0 {
 		path, query = path[:i], path[i+1:]
 	}
-	policy := eng.Evaluate(method, path)
+	hdr := http.Header{}
+	for k, v := range c.Request.Headers {
+		hdr.Set(k, v)
+	}
+	// The test case's headers and query are part of the match context, so a
+	// `optictrace test` case can assert that a tagging rule fires — which is
+	// the whole point of being able to test rules before shipping them.
+	q, _ := url.ParseQuery(query)
+	policy := eng.EvaluateAttrs(engine.Attrs{
+		Method: method, Path: path, Headers: hdr, Query: q,
+	})
 
 	// --- matched rules ---------------------------------------------------
 	if c.Expect.MatchedRules != nil {
@@ -173,10 +183,6 @@ func runCase(eng *engine.Engine, name string, c Case) []Failure {
 	}
 
 	// --- headers -----------------------------------------------------------
-	hdr := http.Header{}
-	for k, v := range c.Request.Headers {
-		hdr.Set(k, v)
-	}
 	var sanitized map[string]string
 	if policy.CaptureHeaders {
 		sanitized = policy.SanitizeHeaders(hdr)
@@ -205,7 +211,7 @@ func runCase(eng *engine.Engine, name string, c Case) []Failure {
 				fail("labels."+name, want, "(label not defined by any matching rule)")
 				continue
 			}
-			if got := src.Extract(req); got != want {
+			if got := src.Value(req); got != want {
 				fail("labels."+name, want, got)
 			}
 		}

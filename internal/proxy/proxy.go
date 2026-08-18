@@ -114,7 +114,10 @@ func NewReverseProxy(cfg *config.Config, eng *engine.Engine, logger *slog.Logger
 func (ic *Interceptor) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		policy := ic.engine.Load().Evaluate(r.Method, r.URL.Path)
+		// Full attrs, not just the request line: match.headers and match.query
+		// rules can only be decided with them, and a rule that cannot be
+		// decided does not apply.
+		policy := ic.engine.Load().EvaluateAttrs(engine.AttrsOf(r))
 
 		// Uniform sampling draw, made up front. Tail-based rules can rescue
 		// a request this draw discarded, but only once the outcome is known
@@ -176,7 +179,9 @@ func (ic *Interceptor) Wrap(next http.Handler) http.Handler {
 		operation := ""
 		if gql && reqBuf != nil {
 			if operation = graphQLOperation(reqBuf.Bytes()); operation != "" {
-				policy = ic.engine.Load().EvaluateOp(r.Method, r.URL.Path, operation)
+				a := engine.AttrsOf(r)
+				a.Operation = operation
+				policy = ic.engine.Load().EvaluateAttrs(a)
 			}
 		}
 		keep := policy.KeepBody(drew, rw.status, elapsed)
@@ -290,7 +295,7 @@ func (ic *Interceptor) emit(r *http.Request, rw *recordingWriter, reqBuf *limite
 	if len(p.Labels) > 0 {
 		rec.Labels = make(map[string]string, len(p.Labels))
 		for name, src := range p.Labels {
-			rec.Labels[name] = src.Extract(r)
+			rec.Labels[name] = src.Value(r)
 		}
 	}
 

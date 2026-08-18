@@ -10,6 +10,14 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 ## [Unreleased]
 
+### Added
+
+- **Multi-tenant tagging.** `match.headers` and `match.query` take regular expressions, so a rule can apply only to requests meeting a condition; and label sources gained `static:<value>` (the way to tag a class of traffic), `path:<n>` for a tenant carried in the URL, and an optional `|<regex>` capture-group suffix on any source (`header:X-Region|^([a-z]{2})-` turns `eu-west-1` into `eu`). Together these let one endpoint serving many tenants be segregated, metered and billed by tenant, plan tier, region or anything else in the request.
+
+  There is deliberately **no separate `tags:` block**: rules already merge top to bottom with later ones winning, so a broad default plus a narrow override expresses conditional tagging using machinery that already governs redaction, sampling and metering.
+
+  Criteria are decided from request context, so a rule using them does not match when that context is unavailable — the same fail-safe stance `graphql_operation` takes, because treating "cannot decide" as "matches" would silently apply a narrowly-scoped rule to everything. `review`, `suggest` and `optictrace test` all reconstruct that context, so a tagging rule is visible to the PR bot and testable before it ships.
+
 ## [0.8.2] — 2026-08-16
 
 ### Security

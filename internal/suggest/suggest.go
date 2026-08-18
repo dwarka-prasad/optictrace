@@ -16,6 +16,8 @@ package suggest
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -161,7 +163,7 @@ func Records(records []store.Record, eng *engine.Engine) *Report {
 
 	for i := range records {
 		rec := &records[i]
-		policy := eng.Evaluate(rec.Method, rec.Path)
+		policy := eng.EvaluateAttrs(attrsOfRecord(rec))
 
 		// --- body fields -------------------------------------------------
 		for _, body := range []string{rec.RequestBody, rec.ResponseBody} {
@@ -383,4 +385,23 @@ func slug(route string) string {
 		s = "route"
 	}
 	return s
+}
+
+// attrsOfRecord rebuilds match context from a stored record, so rules using
+// match.headers or match.query are evaluated the same way here as they were
+// live. Without this the PR bot would report a tagging rule as inert.
+func attrsOfRecord(rec *store.Record) engine.Attrs {
+	a := engine.Attrs{Method: rec.Method, Path: rec.Path}
+	if len(rec.RequestHeaders) > 0 {
+		a.Headers = make(http.Header, len(rec.RequestHeaders))
+		for k, v := range rec.RequestHeaders {
+			a.Headers.Set(k, v)
+		}
+	}
+	if rec.Query != "" {
+		if q, err := url.ParseQuery(rec.Query); err == nil {
+			a.Query = q
+		}
+	}
+	return a
 }

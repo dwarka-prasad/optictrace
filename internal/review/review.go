@@ -18,6 +18,8 @@ package review
 
 import (
 	"fmt"
+	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -208,7 +210,7 @@ func coverage(records []store.Record, eng *engine.Engine) Coverage {
 			continue
 		}
 		c.Requests++
-		p := eng.Evaluate(rec.Method, rec.Path)
+		p := eng.EvaluateAttrs(attrsOfRecord(rec))
 		governed := len(p.MatchedRules) > 0
 		if governed {
 			c.GovernedRequests++
@@ -275,8 +277,8 @@ func diffPolicies(records []store.Record, base, head *engine.Engine) []PolicyCha
 
 	for i := range records {
 		rec := &records[i]
-		bp := base.Evaluate(rec.Method, rec.Path)
-		hp := head.Evaluate(rec.Method, rec.Path)
+		bp := base.EvaluateAttrs(attrsOfRecord(rec))
+		hp := head.EvaluateAttrs(attrsOfRecord(rec))
 		route := routeOf(rec, &hp)
 
 		// --- capture flags -------------------------------------------------
@@ -360,4 +362,23 @@ func pathSet(paths [][]string) map[string]bool {
 		out[strings.Join(p, ".")] = true
 	}
 	return out
+}
+
+// attrsOfRecord rebuilds match context from a stored record, so rules using
+// match.headers or match.query are evaluated the same way here as they were
+// live. Without this the PR bot would report a tagging rule as inert.
+func attrsOfRecord(rec *store.Record) engine.Attrs {
+	a := engine.Attrs{Method: rec.Method, Path: rec.Path}
+	if len(rec.RequestHeaders) > 0 {
+		a.Headers = make(http.Header, len(rec.RequestHeaders))
+		for k, v := range rec.RequestHeaders {
+			a.Headers.Set(k, v)
+		}
+	}
+	if rec.Query != "" {
+		if q, err := url.ParseQuery(rec.Query); err == nil {
+			a.Query = q
+		}
+	}
+	return a
 }

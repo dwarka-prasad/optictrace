@@ -13,10 +13,13 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"reflect"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +28,126 @@ import (
 	"github.com/dwarka-prasad/optictrace/ext"
 	"github.com/dwarka-prasad/optictrace/internal/scan"
 )
+
+// LabelSource describes where a custom label's value comes from.
+//
+// Compiled once at load time: the hot path does no parsing, and a malformed
+// source or regex fails `optictrace validate` rather than at request time.
+type LabelSource struct {
+	Kind string // "header" | "query" | "path" | "static"
+	Key  string // header/query name, the literal value for static
+	Seg  int    // 1-indexed path segment when Kind == "path"
+	// Extract, when set, pulls a capture group out of the raw value. Exactly
+	// one group; a non-match yields "" rather than the whole value, so a
+	// mismatched pattern produces a missing label instead of a surprising one.
+	Extract *regexp.Regexp
+}
+
+// Extract pulls the label value out of a request. Missing values return "".
+// Value resolves this source against a request.
+func (s LabelSource) Value(r *http.Request) string {
+	var raw string
+	switch s.Kind {
+	case "header":
+		raw = r.Header.Get(s.Key)
+	case "query":
+		raw = r.URL.Query().Get(s.Key)
+	case "path":
+		segs := pathSegments(r.URL.Path)
+		if s.Seg >= 1 && s.Seg <= len(segs) {
+			raw = segs[s.Seg-1]
+		}
+	case "static":
+		// Constant: the mechanism for TAGGING a class of traffic. Combined
+		// with match criteria and rule merge order, this is how conditional
+		// tags are expressed without a second concept.
+		return s.Key
+	}
+	return s.apply(raw)
+}
+
+// apply runs the optional capture-group extraction.
+func (s LabelSource) apply(raw string) string {
+	if s.Extract == nil || raw == "" {
+		return raw
+	}
+	m := s.Extract.FindStringSubmatch(raw)
+	if len(m) < 2 {
+		return "" // no match, or no capture group: a missing label beats a wrong one
+	}
+	return m[1]
+}
+
+// ParseLabelSource compiles a label source expression:
+//
+//	header:X-Tenant-ID
+//	query:tenant
+//	path:4                 1-indexed segment
+//	static:premium
+//
+// optionally followed by |<regex> with exactly one capture group.
+//
+// Exported so config validation and the engine use the same parser — two
+// implementations of a grammar drift, and the drift shows up as a rule that
+// validates but does not fire.
+func ParseLabelSource(src string) (LabelSource, error) {
+	expr, pattern, hasRegex := strings.Cut(src, "|")
+	kind, key, ok := strings.Cut(expr, ":")
+	if !ok {
+		return LabelSource{}, fmt.Errorf("source %q must be "+
+			"'header:<Name>', 'query:<name>', 'path:<n>' or 'static:<value>'", src)
+	}
+	ls := LabelSource{Kind: kind, Key: key}
+	switch kind {
+	case "header", "query":
+		if key == "" {
+			return LabelSource{}, fmt.Errorf("source %q needs a name after the colon", src)
+		}
+	case "static":
+		if key == "" {
+			return LabelSource{}, fmt.Errorf("source %q needs a value after 'static:'", src)
+		}
+	case "path":
+		n, err := strconv.Atoi(key)
+		if err != nil || n < 1 {
+			return LabelSource{}, fmt.Errorf("source %q: path segment must be a "+
+				"positive 1-indexed integer, e.g. 'path:3'", src)
+		}
+		ls.Seg = n
+	default:
+		return LabelSource{}, fmt.Errorf("source %q: unknown kind %q "+
+			"(header, query, path, static)", src, kind)
+	}
+	if hasRegex {
+		if kind == "static" {
+			return LabelSource{}, fmt.Errorf("source %q: a regex on a static "+
+				"value has nothing to extract from", src)
+		}
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return LabelSource{}, fmt.Errorf("source %q: %w", src, err)
+		}
+		if re.NumSubexp() != 1 {
+			return LabelSource{}, fmt.Errorf("source %q: the extraction regex needs "+
+				"exactly one capture group, found %d", src, re.NumSubexp())
+		}
+		ls.Extract = re
+	}
+	return ls, nil
+}
+
+// pathSegments splits a URL path into its non-empty segments, so `path:2` on
+// "/api/v1/x" resolves to "v1".
+func pathSegments(p string) []string {
+	parts := strings.Split(strings.Trim(p, "/"), "/")
+	out := parts[:0]
+	for _, seg := range parts {
+		if seg != "" {
+			out = append(out, seg)
+		}
+	}
+	return out
+}
 
 // CaptureField enumerates the telemetry channels a rule may restrict.
 type CaptureField string
@@ -291,11 +414,33 @@ type CaptureFlags struct {
 
 // Rule couples a traffic matcher with governance actions.
 type Rule struct {
-	Name     string            `yaml:"name"`
-	Match    Match             `yaml:"match"`
-	Restrict []CaptureField    `yaml:"restrict"`
-	Redact   *Redact           `yaml:"redact"`
-	Labels   map[string]string `yaml:"labels"`
+	Name     string         `yaml:"name"`
+	Match    Match          `yaml:"match"`
+	Restrict []CaptureField `yaml:"restrict"`
+	Redact   *Redact        `yaml:"redact"`
+	// Labels attach dimensions to this request's telemetry: Prometheus label
+	// values, stored record fields, and the grouping key for usage and cost
+	// attribution. Each value is a source expression:
+	//
+	//	header:X-Tenant-ID     the request header
+	//	query:tenant           a query parameter
+	//	path:4                 the 4th path segment, 1-indexed
+	//	static:premium         a constant — the way to TAG a class of traffic
+	//
+	// Any source may be followed by |<regex> to extract part of the value.
+	// The regex needs exactly one capture group, and that group becomes the
+	// label; a non-match yields an empty label rather than the whole value.
+	//
+	//	region: "header:X-Region|^([a-z]{2})-"      eu-west-1 -> eu
+	//
+	// Rules merge top to bottom and later rules win, so conditional tagging
+	// needs no separate mechanism: give a broad rule a static default and let
+	// a narrower rule with `match.headers` override it.
+	//
+	// Label values are client-controlled, so they pass through the metrics
+	// cardinality guard (telemetry.metrics.max_label_values) before becoming
+	// Prometheus dimensions.
+	Labels map[string]string `yaml:"labels"`
 	// Sample captures bodies for only this fraction of matched requests
 	// (0..1]. Metrics and metadata are always recorded in full — sampling
 	// only bounds payload volume on hot routes. Later rules override.
@@ -325,6 +470,23 @@ type Match struct {
 	// Requires service.graphql_paths to include the route, since extracting
 	// the name means reading the request body before the response.
 	GraphQLOperation string `yaml:"graphql_operation"`
+
+	// Headers matches request headers by regular expression: the rule applies
+	// only when EVERY listed header matches its pattern. Header names are
+	// case-insensitive, as HTTP requires.
+	//
+	//	match:
+	//	  path: "/api/**"
+	//	  headers:
+	//	    X-Plan: "^(gold|platinum)$"
+	//
+	// Patterns are unanchored by default, exactly like Go's regexp — write ^
+	// and $ when you mean a whole-value match. `"."` therefore means "the
+	// header is present and non-empty", which is a useful idiom.
+	Headers map[string]string `yaml:"headers"`
+
+	// Query matches query parameters the same way.
+	Query map[string]string `yaml:"query"`
 }
 
 // Redact lists what to mask in *captured* telemetry. The proxied traffic
@@ -726,9 +888,21 @@ func (r *Rule) validate() error {
 		}
 	}
 	for key, src := range r.Labels {
-		kind, _, ok := strings.Cut(src, ":")
-		if !ok || (kind != "header" && kind != "query") {
-			return fmt.Errorf("labels.%s: source %q must be 'header:<Name>' or 'query:<name>'", key, src)
+		// Parsed by the engine's own parser so validation and runtime cannot
+		// disagree about the grammar — a rule that validates but never fires
+		// is the worst failure mode for a config-driven product.
+		if _, err := ParseLabelSource(src); err != nil {
+			return fmt.Errorf("labels.%s: %w", key, err)
+		}
+	}
+	for name, pat := range r.Match.Headers {
+		if _, err := regexp.Compile(pat); err != nil {
+			return fmt.Errorf("match.headers.%s: %w", name, err)
+		}
+	}
+	for name, pat := range r.Match.Query {
+		if _, err := regexp.Compile(pat); err != nil {
+			return fmt.Errorf("match.query.%s: %w", name, err)
 		}
 	}
 	if r.Sample != nil && (*r.Sample <= 0 || *r.Sample > 1) {

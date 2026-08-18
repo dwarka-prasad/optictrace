@@ -8,6 +8,8 @@ package engine
 
 import (
 	"net/http"
+	"net/textproto"
+	"net/url"
 	"path"
 	"regexp"
 	"sort"
@@ -17,22 +19,14 @@ import (
 	"github.com/dwarka-prasad/optictrace/internal/config"
 )
 
-// LabelSource describes where a custom metric label's value comes from.
-type LabelSource struct {
-	Kind string // "header" or "query"
-	Key  string // e.g. "X-Tenant-ID"
-}
+// LabelSource is re-exported from config: this grammar is part of the schema,
+// and one parser means validation and runtime cannot disagree about it — a
+// rule that validates but never fires is the worst failure mode for a
+// config-driven product.
+type LabelSource = config.LabelSource
 
-// Extract pulls the label value out of a request. Missing values return "".
-func (s LabelSource) Extract(r *http.Request) string {
-	switch s.Kind {
-	case "header":
-		return r.Header.Get(s.Key)
-	case "query":
-		return r.URL.Query().Get(s.Key)
-	}
-	return ""
-}
+// ParseLabelSource compiles a label source expression. See config.
+func ParseLabelSource(src string) (LabelSource, error) { return config.ParseLabelSource(src) }
 
 // Policy is the fully-resolved governance decision for one request:
 // the merge of the defaults and every matching rule, in order.
@@ -112,12 +106,19 @@ type compiledRule struct {
 	// constrain the operation. A rule that does can only be evaluated once
 	// the request body has been read, so Evaluate skips it and EvaluateOp
 	// applies it.
-	gqlOp       string
-	sample      *float64
-	keepErrors  *bool
-	keepSlower  time.Duration
-	pathSegs    []string
-	methods     map[string]struct{} // nil = all methods
+	gqlOp      string
+	sample     *float64
+	keepErrors *bool
+	keepSlower time.Duration
+	pathSegs   []string
+	methods    map[string]struct{} // nil = all methods
+	// hdrCriteria and qryCriteria are the regex conditions from match.headers
+	// and match.query. ALL must match for the rule to apply. A rule that has
+	// them cannot be decided from the request line alone, so an evaluation
+	// without that context skips it — same fail-safe stance as
+	// graphql_operation.
+	hdrCriteria map[string]*regexp.Regexp
+	qryCriteria map[string]*regexp.Regexp
 	restrict    []config.CaptureField
 	redactHdrs  []string
 	redactQuery []string
@@ -153,6 +154,24 @@ func New(cfg *config.Config) *Engine {
 			gqlOp:      r.Match.GraphQLOperation,
 			restrict:   r.Restrict,
 		}
+		if len(r.Match.Headers) > 0 {
+			cr.hdrCriteria = make(map[string]*regexp.Regexp, len(r.Match.Headers))
+			for name, pat := range r.Match.Headers {
+				// Validate proved these compile; a failure here means the
+				// config was mutated after loading.
+				if re, err := regexp.Compile(pat); err == nil {
+					cr.hdrCriteria[textproto.CanonicalMIMEHeaderKey(name)] = re
+				}
+			}
+		}
+		if len(r.Match.Query) > 0 {
+			cr.qryCriteria = make(map[string]*regexp.Regexp, len(r.Match.Query))
+			for name, pat := range r.Match.Query {
+				if re, err := regexp.Compile(pat); err == nil {
+					cr.qryCriteria[name] = re
+				}
+			}
+		}
 		if len(r.Match.Methods) > 0 {
 			cr.methods = make(map[string]struct{}, len(r.Match.Methods))
 			for _, m := range r.Match.Methods {
@@ -174,8 +193,11 @@ func New(cfg *config.Config) *Engine {
 		if len(r.Labels) > 0 {
 			cr.labels = make(map[string]LabelSource, len(r.Labels))
 			for k, src := range r.Labels {
-				kind, key, _ := strings.Cut(src, ":")
-				cr.labels[k] = LabelSource{Kind: kind, Key: key}
+				ls, err := ParseLabelSource(src)
+				if err != nil {
+					continue // Validate already rejected this
+				}
+				cr.labels[k] = ls
 			}
 		}
 		if len(r.Meter) > 0 {
@@ -192,12 +214,40 @@ func New(cfg *config.Config) *Engine {
 // Evaluate resolves the effective Policy for a method + URL path.
 // Rules merge in declaration order: restrictions only ever narrow capture,
 // redactions and labels accumulate.
-// Evaluate resolves policy from the request line alone — everything the
-// interceptor knows before the body is read. Rules constrained by
-// graphql_operation are skipped here and applied by EvaluateOp.
-func (e *Engine) Evaluate(method, urlPath string) Policy {
-	return e.evaluate(method, urlPath, "")
+// Attrs is everything a rule can match on. Callers pass what they have:
+// the proxy has a full request, `review` and `suggest` have a stored record,
+// `ruletest` has a synthetic case.
+//
+// A rule whose criteria cannot be decided from the supplied Attrs does not
+// match. That is the fail-safe direction — the same stance graphql_operation
+// takes — because the alternative is a redaction rule silently applying to
+// traffic it was never scoped to.
+type Attrs struct {
+	Method  string
+	Path    string
+	Headers http.Header
+	Query   url.Values
+	// Operation is the GraphQL operation name, when known.
+	Operation string
 }
+
+// AttrsOf builds Attrs from a live request.
+func AttrsOf(r *http.Request) Attrs {
+	return Attrs{
+		Method: r.Method, Path: r.URL.Path,
+		Headers: r.Header, Query: r.URL.Query(),
+	}
+}
+
+// Evaluate resolves policy from the request line alone. Rules constrained by
+// graphql_operation, match.headers or match.query are skipped here — there is
+// nothing to decide them against — and applied by EvaluateAttrs.
+func (e *Engine) Evaluate(method, urlPath string) Policy {
+	return e.EvaluateAttrs(Attrs{Method: method, Path: urlPath})
+}
+
+// EvaluateAttrs resolves policy against everything the caller knows.
+func (e *Engine) EvaluateAttrs(a Attrs) Policy { return e.evaluate(a) }
 
 // EvaluateOp resolves policy including rules that target a GraphQL operation.
 // Called after the request body has been parsed.
@@ -207,7 +257,19 @@ func (e *Engine) Evaluate(method, urlPath string) Policy {
 // record is built, so learning the operation mid-request is not too late for
 // any of them.
 func (e *Engine) EvaluateOp(method, urlPath, operation string) Policy {
-	return e.evaluate(method, urlPath, operation)
+	return e.evaluate(Attrs{Method: method, Path: urlPath, Operation: operation})
+}
+
+// HasCriteriaRules reports whether any rule matches on headers or query
+// parameters, so a caller can tell whether passing Attrs would change the
+// answer it already has.
+func (e *Engine) HasCriteriaRules() bool {
+	for i := range e.rules {
+		if len(e.rules[i].hdrCriteria) > 0 || len(e.rules[i].qryCriteria) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // HasGraphQLRules reports whether any rule constrains a GraphQL operation, so
@@ -221,7 +283,8 @@ func (e *Engine) HasGraphQLRules() bool {
 	return false
 }
 
-func (e *Engine) evaluate(method, urlPath, operation string) Policy {
+func (e *Engine) evaluate(a Attrs) Policy {
+	method, urlPath, operation := a.Method, a.Path, a.Operation
 	p := Policy{
 		CaptureRequestBody:  config.Bool(e.defaults.Capture.RequestBody),
 		CaptureResponseBody: config.Bool(e.defaults.Capture.ResponseBody),
@@ -240,6 +303,9 @@ func (e *Engine) evaluate(method, urlPath, operation string) Policy {
 			}
 		}
 		if !matchSegments(r.pathSegs, reqSegs) {
+			continue
+		}
+		if !r.criteriaMatch(a) {
 			continue
 		}
 		if r.gqlOp != "" {
@@ -348,6 +414,30 @@ func NormalizeRoute(urlPath string) string {
 }
 
 // splitPath normalizes "/api/v1/x/" into ["api", "v1", "x"].
+// criteriaMatch reports whether every header and query condition holds.
+//
+// Absent context means no match, never a free pass: a rule scoped to
+// `X-Plan: gold` must not apply to a request whose headers were not supplied.
+func (r *compiledRule) criteriaMatch(a Attrs) bool {
+	for name, re := range r.hdrCriteria {
+		if a.Headers == nil {
+			return false
+		}
+		if !re.MatchString(a.Headers.Get(name)) {
+			return false
+		}
+	}
+	for name, re := range r.qryCriteria {
+		if a.Query == nil {
+			return false
+		}
+		if !re.MatchString(a.Query.Get(name)) {
+			return false
+		}
+	}
+	return true
+}
+
 // SplitPath and MatchSegments expose the glob matcher so other packages —
 // notably the interceptor's GraphQL path check — use the same semantics as
 // rule matching rather than a second, subtly different implementation.

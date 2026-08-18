@@ -922,6 +922,84 @@ requests.
 
 ---
 
+## Multi-tenant tagging
+
+One API, many tenants, the same path for all of them. Tags turn that into
+something you can segregate, meter and bill.
+
+```yaml
+rules:
+  # Baseline: every API call gets a tenant, a region and a default tier.
+  - name: tag-baseline
+    match: { path: "/api/**" }
+    labels:
+      tenant: "header:X-Tenant-ID"
+      region: "header:X-Region|^([a-z]{2})-"   # eu-west-1 -> eu
+      tier:   "static:standard"
+
+  # Criteria: gold and platinum plans are tagged premium instead.
+  - name: tag-premium
+    match:
+      path: "/api/**"
+      headers:
+        X-Plan: "^(gold|platinum)$"            # regex
+    labels:
+      tier: "static:premium"
+
+  # Tenant carried in the URL rather than a header.
+  - name: tag-tenant-from-path
+    match: { path: "/api/v1/tenants/*/**" }
+    labels:
+      tenant: "path:4"                         # 1-indexed segment
+```
+
+Same endpoint, segregated:
+
+```
+/api/orders                     tenant=acme     tier=premium   region=eu
+/api/orders                     tenant=globex   tier=standard  region=us
+/api/orders?mode=sandbox        tenant=acme     tier=standard  env=sandbox
+/api/v1/tenants/umbrella/orders tenant=umbrella tier=standard  region=eu
+```
+
+### Label sources
+
+| Source | Example | Value |
+|---|---|---|
+| `header:<Name>` | `header:X-Tenant-ID` | the request header |
+| `query:<name>` | `query:tenant` | a query parameter |
+| `path:<n>` | `path:4` | the 4th path segment, 1-indexed |
+| `static:<value>` | `static:premium` | a constant — this is how you **tag** |
+
+Any source takes an optional `|<regex>` suffix with exactly one capture group,
+and that group becomes the label. A non-match yields an empty label rather than
+the raw value, so a mistyped pattern produces a missing tag rather than a
+misleading one.
+
+### Criteria
+
+`match.headers` and `match.query` take regular expressions. All listed
+conditions must hold, so adding one narrows the rule. Patterns are unanchored
+like Go's `regexp` — write `^` and `$` for a whole-value match, and `"."` for
+"present and non-empty".
+
+**There is no separate `tags:` block, deliberately.** Rules already merge top to
+bottom with later rules winning, so a broad default plus a narrow override is
+all conditional tagging needs — and it reuses machinery that already governs
+redaction, sampling and metering rather than adding a second thing to learn.
+
+### What tags do for you
+
+- **Prometheus dimensions** — `optictrace_requests_total{tenant="acme",tier="premium"}`
+- **Cost attribution** — `/api/usage?label=tier` groups by any tag, not just tenant
+- **Erasure requests** — `optictrace purge -label tenant -value acme`
+- **Rules** can then target a tagged class for redaction or sampling
+
+Values are client-controlled, so they pass through the cardinality guard
+(`telemetry.metrics.max_label_values`) before becoming Prometheus labels.
+
+---
+
 ## Framework SDKs
 
 SDKs evaluate the same `optic.yaml` in-process and POST governed records to the agent's
