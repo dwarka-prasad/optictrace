@@ -1,0 +1,11 @@
+# Drives traffic through the compose stack once, so `docker compose up` lands
+# on a dashboard with something on it instead of an empty shell.
+FROM alpine:3.20
+RUN apk add --no-cache bash curl coreutils
+WORKDIR /app
+COPY scripts/seed.sh scripts/seed.sh
+RUN chmod +x scripts/seed.sh
+# AUTOSTART=0: there is no Go toolchain here, so a missing agent must fail
+# loudly rather than try to build one.
+ENV AUTOSTART=0 WAIT_SECS=90
+ENTRYPOINT ["bash", "scripts/seed.sh"]

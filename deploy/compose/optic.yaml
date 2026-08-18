@@ -9,6 +9,10 @@ service:
   name: demo-api
   listen: ":8080"
   upstream: "http://demo-upstream:9000"
+  trace:
+    # Correlation is on by default; this also hands the trace id back to the
+    # caller so a support ticket can arrive with one in it.
+    response_header: "X-Trace-Id"
 
 telemetry:
   # Inside the container this must bind all interfaces to be reachable at all;
@@ -22,6 +26,42 @@ telemetry:
   metrics:
     enabled: true
     max_label_values: 500      # cardinality guard on tenant/region
+  # ---------------------------------------------------------------------------
+  # APPLICATION LOGS — the lines your app wrote while serving a request.
+  #
+  # Correlation is a fact, not a guess. OpticTrace rewrites the traceparent on
+  # the request it FORWARDS, so the span-id in the header your app receives is
+  # the span OpticTrace recorded. An app that ships its logs with that span id
+  # gets them filed under the exact request that produced them; nothing is
+  # matched by timestamp, which under concurrency would file one tenant's line
+  # under another tenant's request.
+  #
+  # Post lines to POST /api/applogs/ingest, read them back with
+  # GET /api/applogs?trace=... or ?span=...
+  #
+  # Treat this as the highest-risk surface here. A payload is structured and
+  # can be redacted by path; a log line is free text written by whoever was
+  # debugging that day, and it routinely carries tokens and whole payloads
+  # inside stack traces. Everything below runs BEFORE anything is stored.
+  # ---------------------------------------------------------------------------
+  app_logs:
+    enabled: true
+    level_min: info            # debug is most of the volume and little of the value
+    max_lines_per_span: 200    # one retry loop must not write a million lines
+    max_message_bytes: 8192    # stack traces are long; the head is what matters
+    retention_max_age: 168h    # 7 days — logs outgrow records by orders of magnitude
+    # Lines with no span belong to no request (startup, cron, background jobs).
+    # Dropped by default; every drop is counted in
+    # optictrace_app_logs_dropped_total{reason="orphan"} rather than vanishing.
+    drop_orphans: true
+    redact:
+      # Single-quoted: YAML double quotes reject escapes like \s.
+      patterns:
+        - 'Bearer\s+\S+'          # the header someone logged while debugging
+        - '\b\d{13,19}\b'         # card-shaped digit runs
+        - '[\w.+-]+@[\w-]+\.[\w.]+' # email addresses
+      fields: [authorization, password, token, api_key]
+
   store:
     driver: sqlite
     dsn: /data/optictrace.db
@@ -57,9 +97,16 @@ rules:
     match:
       path: "/api/v1/auth/**"
     restrict: [request_body, response_body, headers]
+    # Capture and attribution are independent: a label is read from the LIVE
+    # request, so this route can be billed to a tenant while none of its
+    # payload is recorded. Without this, every login is revenue you cannot
+    # attribute to a customer.
+    labels:
+      tenant: "header:X-Tenant-ID"
 
   # Mask payment secrets. `$.**` follows the field even when the upstream
   # echoes the payload back inside a wrapper.
+
   - name: redact-payment-secrets
     match:
       path: "/api/v1/payments/**"
@@ -72,7 +119,15 @@ rules:
         - "$.**.customer.email"
     labels:
       tenant: "header:X-Tenant-ID"
-      region: "header:X-Region"
+      # Roll the AZ up to a geography: ap-south-1 and ap-south-2 are one
+      # series, which keeps the cardinality guard from ever being the thing
+      # that decides your dashboard.
+      region: "header:X-Region|^([a-z]{2})-"
+      # The caller is in the payload, not a header — two partners hit this
+      # endpoint as the same tenant, and this is the only field separating
+      # them. Reading it is safe: labels see the body AFTER redaction.
+      partner: "json:$.**.source"
+      outcome: "json_response:$.status"
 
   # Prompts and completions stay private, but tokens are still counted and
   # priced per tenant — metering is independent of capture.
@@ -85,10 +140,23 @@ rules:
     labels:
       tenant: "header:X-Tenant-ID"
 
+  # Criteria narrow a rule past the route. Same path, same tenant, different
+  # channel — so the tag has to come from the request itself.
+  - name: tag-marketplace-callers
+    match:
+      path: "/api/v1/payments/**"
+      body:
+        "$.**.source": "^(flipkart|amazon)$"
+    labels:
+      channel: "static:marketplace"
+
   # Hot routes: sample bodies, but never throw away an error or a slow one.
   - name: sample-user-reads
     match:
       path: "/api/v1/users/**"
+    redact:
+      # Arrives in the response, not the request — the leak nobody sent.
+      json_fields: ["$.**.email"]
     sample: 0.5
     keep_errors: true
     keep_slower_than: 250ms

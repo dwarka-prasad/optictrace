@@ -1,39 +1,44 @@
 #!/usr/bin/env bash
-# Local end-to-end demo: mock upstream + OpticTrace agent + sample traffic.
-# Usage: ./scripts/demo.sh
+# Local end-to-end demo: mock upstream + OpticTrace agent + seeded traffic,
+# left running so you can click around the dashboard.
+#
+#   ./scripts/demo.sh
+#
+# Traffic generation lives in scripts/seed.sh and is NOT duplicated here — two
+# copies drift, and the copy nobody regenerates is the one that stops covering
+# the features that were added since.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export PATH="$HOME/.local/go/bin:$PATH"
+
+CONFIG="${CONFIG:-optic.yaml}"
 
 go build -o bin/ ./cmd/...
 
-./bin/mocktarget -addr :9000 &
+./bin/mocktarget -addr :9000 -applogs "http://localhost:9095" &
 MOCK_PID=$!
-./bin/optictrace run -config optic.yaml &
+./bin/optictrace run -config "$CONFIG" &
 AGENT_PID=$!
-trap 'kill $MOCK_PID $AGENT_PID 2>/dev/null' EXIT
+trap 'kill $MOCK_PID $AGENT_PID 2>/dev/null || true' EXIT
 
-for _ in $(seq 1 30); do
-  curl -s -o /dev/null localhost:9095/healthz && break
+for _ in $(seq 1 50); do
+  curl -sS -o /dev/null --max-time 1 localhost:9095/healthz 2>/dev/null && break
   sleep 0.1
 done
 
 echo
-echo "==> Generating traffic (payments w/ secrets, restricted auth, plain GETs)…"
-for i in $(seq 1 15); do
-  curl -s -o /dev/null -X POST localhost:8080/api/v1/payments/charge \
-    -H 'Content-Type: application/json' \
-    -H 'Authorization: Bearer topsecret123' \
-    -H 'X-Tenant-ID: acme-corp' -H 'X-Region: ap-south-1' \
-    -d '{"amount": 4200, "credit_card": {"number": "4111111111111111", "cvv": "123"}}'
-  curl -s -o /dev/null -X POST localhost:8080/api/v1/auth/login \
-    -H 'Content-Type: application/json' -d '{"username": "ada", "password": "hunter2"}'
-  curl -s -o /dev/null "localhost:8080/api/v1/users/$i"
-done
+echo "==> Seeding traffic (multi-tenant payments, restricted auth, metered AI,"
+echo "    sampled reads, an ungoverned route, errors, slow calls, one trace)…"
+./scripts/seed.sh
 
-echo
-echo "  Dashboard:   http://localhost:9095"
-echo "  Prometheus:  http://localhost:9095/metrics"
-echo "  Logs API:    http://localhost:9095/api/logs?path=/api/v1/payments"
-echo
-echo "Press Ctrl+C to stop."
+cat <<'TXT'
+
+  Dashboard:   http://localhost:9095
+  Prometheus:  http://localhost:9095/metrics
+  Logs API:    http://localhost:9095/api/logs?path=/api/v1/payments
+  One tenant:  http://localhost:9095/api/logs?label.tenant=globex
+  Marketplace: http://localhost:9095/api/logs?label.channel=marketplace
+
+Press Ctrl+C to stop.
+TXT
 wait
