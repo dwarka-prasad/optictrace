@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Coins, Download } from 'lucide-react';
-import { fetchUsage, usageCsvUrl, type UsageResponse } from '@/lib/api';
+import { fetchLabelNames, fetchUsage, usageCsvUrl, type UsageResponse } from '@/lib/api';
 
 const WINDOWS = ['1h', '6h', '24h', '168h'];
 const WINDOW_LABELS: Record<string, string> = { '1h': '1h', '6h': '6h', '24h': '24h', '168h': '7d' };
@@ -11,21 +11,31 @@ export default function UsagePage() {
   const [data, setData] = useState<UsageResponse | null>(null);
   const [win, setWin] = useState('24h');
   const [error, setError] = useState<string | null>(null);
+  // Empty means "whatever telemetry.billing.consumer_label says" — the server
+  // decides, so the page does not have to know the config.
+  const [groupBy, setGroupBy] = useState('');
+  const [labelNames, setLabelNames] = useState<string[]>([]);
 
   const load = useCallback(async () => {
     try {
-      setData(await fetchUsage(win));
+      setData(await fetchUsage(win, groupBy || undefined));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
-  }, [win]);
+  }, [win, groupBy]);
 
   useEffect(() => {
     load();
     const t = setInterval(load, 10000);
     return () => clearInterval(t);
   }, [load]);
+
+  // Discovered once: the set of tags in play changes when the config does, not
+  // between polls.
+  useEffect(() => {
+    fetchLabelNames().then(setLabelNames).catch(() => setLabelNames([]));
+  }, []);
 
   const meterNames = useMemo(() => {
     const names = new Set<string>();
@@ -53,12 +63,27 @@ export default function UsagePage() {
         </h1>
         <div className="flex items-center gap-2">
           <a
-            href={usageCsvUrl(win)}
+            href={usageCsvUrl(win, groupBy || undefined)}
             download
             className="flex items-center gap-1.5 rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs text-[var(--muted)] hover:text-[var(--text)]"
           >
             <Download className="h-3.5 w-3.5" /> Billing CSV
           </a>
+          {labelNames.length > 0 && (
+            <select
+              value={groupBy}
+              onChange={(e) => setGroupBy(e.target.value)}
+              title="Group usage by any tag, not just the billing consumer"
+              className="rounded-lg border border-[var(--border)] bg-[var(--panel)] px-2.5 py-1.5 text-xs outline-none focus:border-[var(--accent)]/60"
+            >
+              <option value="">Group by: {data?.label ?? 'default'}</option>
+              {labelNames.map((n) => (
+                <option key={n} value={n}>
+                  Group by: {n}
+                </option>
+              ))}
+            </select>
+          )}
           <div className="flex gap-1 rounded-lg border border-[var(--border)] p-1">
             {WINDOWS.map((w) => (
               <button

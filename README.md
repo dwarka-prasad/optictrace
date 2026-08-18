@@ -1167,6 +1167,10 @@ the agent itself — no separate frontend deployment.
 
 </details>
 
+The inspector filters by tag, badges long-lived streams, and reconstructs the
+full request trace for any record — click a hop to jump to it. Usage groups by
+any tag, not just the billing consumer.
+
 Develop it with `cd ui && npm run dev`. The dev server runs on a different port, so
 add its origin to `telemetry.cors_origins` (e.g. `["http://localhost:3001"]`) — the
 agent sends no CORS headers unless an origin is explicitly allowed.

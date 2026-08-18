@@ -12,6 +12,11 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 ### Added
 
+- **The dashboard caught up with the tags and traces work.** The inspector gained a **Tags** column whose chips filter on click (`label.<name>=<value>`, all of them ANDed, removable from the filter bar), a **stream** badge so a 600,000ms row reads as a connection lifetime rather than a catastrophe ([#24](https://github.com/dwarka-prasad/optictrace/issues/24)), and a **request trace** section in the detail panel that fetches every hop of the trace and renders it as a tree with per-hop latency bars — clicking a hop jumps to it. A tag a rule declared but the request never populated shows as `name=∅` rather than being hidden, since a silently absent tag is the usual symptom of a mistyped source. Exports now carry the tag filters, so downloading what the table shows no longer means downloading everything.
+- **Usage can group by any tag**, not only the billing consumer label — partner, channel, product, whatever is in play. The picker is populated from tags present in recent traffic rather than from the config, because a tag that is declared but never populated is a dead option that sends someone to an empty breakdown.
+
+### Added
+
 - **Trace correlation across services.** Every record now carries `trace_id`, `span_id` and `parent_span_id`, taken from an inbound W3C `traceparent` or generated when the caller sends none. `/api/logs?trace=<id>` returns every hop of one request, so several services reporting into one store become a request tree rather than a flat list. Indexed in all three drivers, covered by the shared conformance suite.
 
   The forwarded request carries **this hop's** span so downstream calls nest under it — passing the caller's header through unchanged would make every downstream hop a sibling and flatten the tree. This is the one place OpticTrace writes to traffic and it is deliberately narrow: the forwarded copy only, never the response, never what the client sent. `service.trace.propagate_upstream: false` disables it; `service.trace.response_header` optionally returns the id to the caller and is off by default.

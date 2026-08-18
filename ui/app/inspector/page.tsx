@@ -1,9 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import { ChevronLeft, ChevronRight, Download, RefreshCw, Search, ShieldCheck, X } from 'lucide-react';
-import { exportUrl, fetchLogs, type LogQuery, type LogRecord } from '@/lib/api';
-import { MethodBadge, StatusBadge } from '@/components/badges';
+import { ChevronLeft, ChevronRight, Download, GitBranch, RefreshCw, Search, ShieldCheck, Tag, X } from 'lucide-react';
+import { exportUrl, fetchLogs, fetchTrace, type LogQuery, type LogRecord } from '@/lib/api';
+import { MethodBadge, StatusBadge, StreamBadge } from '@/components/badges';
 
 const PAGE_SIZE = 25;
 
@@ -19,6 +19,9 @@ export default function Inspector() {
   const [method, setMethod] = useState('');
   const [statusClass, setStatusClass] = useState('');
   const [since, setSince] = useState('');
+  // Tag filters. The multi-tenant question — "show me only this partner" —
+  // which the API has supported for a while and the UI could not ask.
+  const [labels, setLabels] = useState<Record<string, string>>({});
 
   const load = useCallback(async () => {
     try {
@@ -28,6 +31,7 @@ export default function Inspector() {
         q,
         method,
         since,
+        labels,
         limit: PAGE_SIZE,
         offset: page * PAGE_SIZE,
         ...statusRange,
@@ -38,7 +42,7 @@ export default function Inspector() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
-  }, [q, method, statusClass, since, page]);
+  }, [q, method, statusClass, since, labels, page]);
 
   useEffect(() => {
     const t = setTimeout(load, 250); // debounce typing
@@ -52,7 +56,7 @@ export default function Inspector() {
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold">Request Inspector</h1>
         <div className="flex items-center gap-2">
-          <ExportButtons query={currentQuery(q, method, statusClass, since)} />
+          <ExportButtons query={currentQuery(q, method, statusClass, since, labels)} />
           <button
             onClick={load}
             className="flex items-center gap-1.5 rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs text-[var(--muted)] hover:text-[var(--text)]"
@@ -82,6 +86,27 @@ export default function Inspector() {
           options={[['', 'Any status'], ['200', '2xx'], ['300', '3xx'], ['400', '4xx'], ['500', '5xx']]} />
         <FilterSelect value={since} onChange={(v) => { setSince(v); setPage(0); }}
           options={[['', 'All time'], ['15m', 'Last 15m'], ['1h', 'Last 1h'], ['6h', 'Last 6h'], ['24h', 'Last 24h']]} />
+
+        {Object.entries(labels).map(([k, v]) => (
+          <button
+            key={k}
+            onClick={() => {
+              const next = { ...labels };
+              delete next[k];
+              setLabels(next);
+              setPage(0);
+            }}
+            title="Remove this tag filter"
+            className="flex items-center gap-1 rounded-lg border border-[var(--accent)]/50 bg-[var(--accent)]/10 px-2 py-1 text-xs text-[var(--accent)]"
+          >
+            <Tag className="h-3 w-3" />
+            <span className="font-mono">{k}={v}</span>
+            <X className="h-3 w-3 opacity-70" />
+          </button>
+        ))}
+        {Object.keys(labels).length > 1 && (
+          <span className="text-[11px] text-[var(--muted)]">all tags must match</span>
+        )}
       </div>
 
       {error && (
@@ -99,6 +124,7 @@ export default function Inspector() {
                   <th className="px-3 py-2 font-medium">Method</th>
                   <th className="px-3 py-2 font-medium">Path</th>
                   <th className="px-3 py-2 font-medium">Status</th>
+                  <th className="px-3 py-2 font-medium">Tags</th>
                   <th className="px-3 py-2 text-right font-medium">Latency</th>
                 </tr>
               </thead>
@@ -116,13 +142,27 @@ export default function Inspector() {
                     </td>
                     <td className="px-3 py-2"><MethodBadge method={r.method} /></td>
                     <td className="max-w-64 truncate px-3 py-2 font-mono text-xs">{r.path}</td>
-                    <td className="px-3 py-2"><StatusBadge status={r.status} /></td>
+                    <td className="px-3 py-2">
+                      <div className="flex items-center gap-1.5">
+                        <StatusBadge status={r.status} />
+                        {r.stream && <StreamBadge />}
+                      </div>
+                    </td>
+                    <td className="px-3 py-2">
+                      <RowTags
+                        record={r}
+                        onPick={(k, v) => {
+                          setLabels({ ...labels, [k]: v });
+                          setPage(0);
+                        }}
+                      />
+                    </td>
                     <td className="px-3 py-2 text-right text-xs">{r.duration_ms.toFixed(1)}ms</td>
                   </tr>
                 ))}
                 {records.length === 0 && (
                   <tr>
-                    <td colSpan={5} className="px-4 py-10 text-center text-[var(--muted)]">
+                    <td colSpan={6} className="px-4 py-10 text-center text-[var(--muted)]">
                       No captured requests match these filters.
                     </td>
                   </tr>
@@ -143,16 +183,32 @@ export default function Inspector() {
         </div>
 
         {/* Detail panel */}
-        {selected && <DetailPanel record={selected} onClose={() => setSelected(null)} />}
+        {selected && (
+          <DetailPanel
+            record={selected}
+            onClose={() => setSelected(null)}
+            onPickTag={(k, v) => {
+              setLabels({ ...labels, [k]: v });
+              setPage(0);
+            }}
+            onSelectRecord={setSelected}
+          />
+        )}
       </div>
     </div>
   );
 }
 
-function currentQuery(q: string, method: string, statusClass: string, since: string): LogQuery {
+function currentQuery(
+  q: string,
+  method: string,
+  statusClass: string,
+  since: string,
+  labels: Record<string, string>,
+): LogQuery {
   const range =
     statusClass === '' ? {} : { status_min: Number(statusClass), status_max: Number(statusClass) + 99 };
-  return { q, method, since, ...range };
+  return { q, method, since, labels, ...range };
 }
 
 // Downloads matching records via /api/export — same filters as the table.
@@ -194,7 +250,145 @@ function FilterSelect({
   );
 }
 
-function DetailPanel({ record: r, onClose }: { record: LogRecord; onClose: () => void }) {
+/** Up to two tags per row, clickable to filter. Two because a row with six
+ *  chips is unreadable and the table is for scanning — the rest are in the
+ *  detail panel. */
+function RowTags({
+  record,
+  onPick,
+}: {
+  record: LogRecord;
+  onPick: (k: string, v: string) => void;
+}) {
+  const entries = Object.entries(record.labels ?? {}).filter(([, v]) => v !== '');
+  if (entries.length === 0) return <span className="text-xs text-[var(--muted)]">—</span>;
+  const shown = entries.slice(0, 2);
+  return (
+    <div className="flex flex-wrap items-center gap-1">
+      {shown.map(([k, v]) => (
+        <button
+          key={k}
+          onClick={(e) => {
+            e.stopPropagation(); // don't also open the detail panel
+            onPick(k, v);
+          }}
+          title={`Filter to ${k}=${v}`}
+          className="rounded border border-[var(--border)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--muted)] hover:border-[var(--accent)]/60 hover:text-[var(--accent)]"
+        >
+          {k}={v}
+        </button>
+      ))}
+      {entries.length > shown.length && (
+        <span className="text-[10px] text-[var(--muted)]">+{entries.length - shown.length}</span>
+      )}
+    </div>
+  );
+}
+
+/** Every hop of one request, as a tree.
+ *
+ *  This is what a trace id is for: several services reporting into one store
+ *  are otherwise a flat list with no way to ask "what did this call actually
+ *  do". Indentation follows parent_span_id, so the shape is the real call
+ *  graph rather than arrival order. */
+function TraceTree({
+  record,
+  onSelectRecord,
+}: {
+  record: LogRecord;
+  onSelectRecord: (r: LogRecord) => void;
+}) {
+  const [hops, setHops] = useState<LogRecord[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!record.trace_id) return;
+    let live = true;
+    fetchTrace(record.trace_id)
+      .then((rs) => live && setHops(rs))
+      .catch((e) => live && setError(e instanceof Error ? e.message : String(e)));
+    return () => {
+      live = false;
+    };
+  }, [record.trace_id]);
+
+  if (!record.trace_id) return null;
+
+  const total = hops?.reduce((max, h) => Math.max(max, h.duration_ms), 0) ?? 0;
+
+  // depth by walking parent links; a hop whose parent is not in the result
+  // (a service that does not report here) is shown at the root rather than
+  // hidden, because silently dropping it would misrepresent the call.
+  const bySpan = new Map((hops ?? []).map((h) => [h.span_id ?? '', h]));
+  const depthOf = (h: LogRecord): number => {
+    let d = 0;
+    let cur = h;
+    const guard = new Set<string>();
+    while (cur.parent_span_id && bySpan.has(cur.parent_span_id)) {
+      if (guard.has(cur.span_id ?? '')) break; // cycles cannot happen, but a UI must not hang if they do
+      guard.add(cur.span_id ?? '');
+      cur = bySpan.get(cur.parent_span_id)!;
+      d += 1;
+    }
+    return d;
+  };
+
+  return (
+    <Section
+      icon={<GitBranch className="h-3.5 w-3.5" />}
+      title={`Request trace${hops ? ` · ${hops.length} hop${hops.length === 1 ? '' : 's'}` : ''}`}
+    >
+      <div className="mb-2 break-all font-mono text-[10px] text-[var(--muted)]">{record.trace_id}</div>
+      {error && <div className="text-xs text-[var(--bad)]">{error}</div>}
+      {!hops && !error && <div className="text-xs text-[var(--muted)]">loading…</div>}
+      {hops?.length === 1 && (
+        <div className="mb-2 text-[11px] text-[var(--muted)]">
+          Only this hop reported. Put an OpticTrace sidecar in front of the services it
+          calls, and they appear here.
+        </div>
+      )}
+      <div className="space-y-1">
+        {hops?.map((h) => (
+          <button
+            key={h.id}
+            onClick={() => onSelectRecord(h)}
+            className={`flex w-full items-center gap-2 rounded px-1.5 py-1 text-left text-xs hover:bg-white/[.04] ${
+              h.id === record.id ? 'bg-[var(--accent)]/[.08]' : ''
+            }`}
+            style={{ paddingLeft: `${6 + depthOf(h) * 16}px` }}
+          >
+            <span className="w-20 shrink-0 truncate text-[var(--muted)]">{h.service || '—'}</span>
+            <MethodBadge method={h.method} />
+            <span className="flex-1 truncate font-mono text-[11px]">{h.path}</span>
+            <StatusBadge status={h.status} />
+            <span className="w-16 shrink-0 text-right tabular-nums text-[var(--muted)]">
+              {h.duration_ms.toFixed(1)}ms
+            </span>
+            {/* A bar, so the hop that actually cost the time is obvious. */}
+            <span className="hidden w-16 shrink-0 sm:block">
+              <span
+                className="block h-1 rounded bg-[var(--accent)]/50"
+                style={{ width: `${total ? Math.max(3, (h.duration_ms / total) * 100) : 0}%` }}
+              />
+            </span>
+          </button>
+        ))}
+      </div>
+    </Section>
+  );
+}
+
+function DetailPanel({
+  record: r,
+  onClose,
+  onPickTag,
+  onSelectRecord,
+}: {
+  record: LogRecord;
+  onClose: () => void;
+  onPickTag: (k: string, v: string) => void;
+  onSelectRecord: (r: LogRecord) => void;
+}) {
   const restricted = !r.request_headers && !r.request_body && !r.response_body;
   return (
     <div className="panel w-1/2 self-start overflow-hidden">
@@ -226,12 +420,33 @@ function DetailPanel({ record: r, onClose }: { record: LogRecord; onClose: () =>
         )}
         {r.labels && Object.keys(r.labels).length > 0 && (
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-[var(--muted)]">Labels:</span>
-            {Object.entries(r.labels).map(([k, v]) => (
-              <span key={k} className="rounded-full border border-[var(--border)] px-2 py-0.5">{k}={v || '∅'}</span>
-            ))}
+            <span className="text-[var(--muted)]">Tags:</span>
+            {Object.entries(r.labels).map(([k, v]) =>
+              v ? (
+                <button
+                  key={k}
+                  onClick={() => onPickTag(k, v)}
+                  title={`Filter to ${k}=${v}`}
+                  className="rounded-full border border-[var(--border)] px-2 py-0.5 hover:border-[var(--accent)]/60 hover:text-[var(--accent)]"
+                >
+                  {k}={v}
+                </button>
+              ) : (
+                // An empty value means the rule declared the tag but the
+                // request carried nothing — worth showing, since a silently
+                // absent tag is the usual symptom of a mistyped source.
+                <span
+                  key={k}
+                  title="Declared by a rule, but this request carried no value"
+                  className="rounded-full border border-dashed border-[var(--border)] px-2 py-0.5 text-[var(--muted)]"
+                >
+                  {k}=∅
+                </span>
+              ),
+            )}
           </div>
         )}
+        <TraceTree record={r} onSelectRecord={onSelectRecord} />
         {r.request_headers && <KV title="Request headers" data={r.request_headers} />}
         {r.request_body && <Body title="Request body" body={r.request_body} truncated={r.req_truncated} />}
         {r.response_headers && <KV title="Response headers" data={r.response_headers} />}
@@ -250,6 +465,8 @@ function MetaGrid({ r }: { r: LogRecord }) {
     ['Remote', r.remote],
     ['Size', `${r.req_bytes}B → ${r.resp_bytes}B`],
   ];
+  if (r.stream) rows.splice(2, 0, ['Kind', 'stream (duration is a connection lifetime)']);
+  if (r.span_id) rows.push(['Span', r.span_id]);
   return (
     <div className="grid grid-cols-2 gap-x-4 gap-y-1.5">
       {rows.map(([k, v]) => (
@@ -258,6 +475,27 @@ function MetaGrid({ r }: { r: LogRecord }) {
           <span className="truncate font-mono">{v}</span>
         </div>
       ))}
+    </div>
+  );
+}
+
+/** A titled block, matching the KV/Body idiom used elsewhere in this panel. */
+function Section({
+  icon,
+  title,
+  children,
+}: {
+  icon?: React.ReactNode;
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div>
+      <h3 className="mb-1.5 flex items-center gap-1.5 font-medium text-[var(--muted)]">
+        {icon}
+        {title}
+      </h3>
+      <div className="rounded-lg border border-[var(--border)] p-2">{children}</div>
     </div>
   );
 }

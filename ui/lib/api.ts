@@ -53,6 +53,15 @@ export interface LogRecord {
   resp_bytes: number;
   labels?: Record<string, string>;
   matched_rules?: string[];
+  /** Long-lived response (SSE, chunked, an upgraded connection). Its duration
+   *  is a connection lifetime, not a latency, which is why it is excluded from
+   *  percentiles — worth showing so a 600s row does not read as a disaster. */
+  stream?: boolean;
+  /** W3C trace context. Every hop of one request shares trace_id, so several
+   *  services reporting into one store can be reassembled into a tree. */
+  trace_id?: string;
+  span_id?: string;
+  parent_span_id?: string;
 }
 
 export interface LogQuery {
@@ -64,6 +73,10 @@ export interface LogQuery {
   since?: string;
   limit?: number;
   offset?: number;
+  /** Every hop of one request. */
+  trace?: string;
+  /** Tag filters, sent as label.<name>=<value>. All must match. */
+  labels?: Record<string, string>;
 }
 
 async function get<T>(path: string): Promise<T> {
@@ -75,12 +88,30 @@ async function get<T>(path: string): Promise<T> {
 export const fetchStats = (window: string, bucket: string) =>
   get<Stats>(`/api/stats?window=${window}&bucket=${bucket}`);
 
-export const fetchLogs = (query: LogQuery) => {
+/** Renders a LogQuery as query-string params, expanding tag filters into the
+ *  label.<name>=<value> form the API expects. Shared by fetchLogs and
+ *  exportUrl so an export always matches exactly what the table shows. */
+export function logParams(query: LogQuery): URLSearchParams {
   const params = new URLSearchParams();
   Object.entries(query).forEach(([k, v]) => {
+    if (k === 'labels') return;
     if (v !== undefined && v !== '' && v !== 0) params.set(k, String(v));
   });
-  return get<{ total: number; records: LogRecord[] }>(`/api/logs?${params}`);
+  Object.entries(query.labels ?? {}).forEach(([k, v]) => {
+    if (k && v) params.set(`label.${k}`, v);
+  });
+  return params;
+}
+
+export const fetchLogs = (query: LogQuery) =>
+  get<{ total: number; records: LogRecord[] }>(`/api/logs?${logParams(query)}`);
+
+/** Every hop of one request, oldest first so it reads as a sequence. */
+export const fetchTrace = async (traceId: string) => {
+  const res = await get<{ total: number; records: LogRecord[] }>(
+    `/api/logs?trace=${encodeURIComponent(traceId)}&limit=200`,
+  );
+  return res.records.slice().sort((a, b) => a.time.localeCompare(b.time));
 };
 
 export const fetchConfig = () =>
@@ -166,19 +197,37 @@ export interface UsageResponse {
   consumers: ConsumerUsage[];
 }
 
-export const fetchUsage = (window: string) =>
-  get<UsageResponse>(`/api/usage?window=${window}`);
+export const fetchUsage = (window: string, label?: string) =>
+  get<UsageResponse>(
+    `/api/usage?window=${window}${label ? `&label=${encodeURIComponent(label)}` : ''}`,
+  );
 
-export const usageCsvUrl = (window: string) =>
-  `${API_BASE}/api/usage?window=${window}&format=csv`;
+export const usageCsvUrl = (window: string, label?: string) =>
+  `${API_BASE}/api/usage?window=${window}&format=csv${label ? `&label=${encodeURIComponent(label)}` : ''}`;
+
+/** Tag names present in recent traffic.
+ *
+ *  Derived from stored records rather than from the config on purpose: a tag a
+ *  rule declares but no request ever populates is a dead option in a picker,
+ *  and offering it would send someone to an empty breakdown wondering what
+ *  they did wrong. */
+export async function fetchLabelNames(): Promise<string[]> {
+  const res = await get<{ records: LogRecord[] }>('/api/logs?limit=100');
+  const names = new Set<string>();
+  res.records.forEach((r) =>
+    Object.entries(r.labels ?? {}).forEach(([k, v]) => {
+      if (v) names.add(k);
+    }),
+  );
+  return [...names].sort();
+}
 
 /** Download URL for /api/export honoring the inspector's current filters. */
 export function exportUrl(format: 'csv' | 'jsonl', query: LogQuery) {
-  const params = new URLSearchParams({ format });
-  Object.entries(query).forEach(([k, v]) => {
-    if (v !== undefined && v !== '' && v !== 0 && k !== 'limit' && k !== 'offset') {
-      params.set(k, String(v));
-    }
-  });
+  // Reuses logParams so an export carries the tag filters too. Downloading
+  // "everything" when the table showed one tenant would be a bad surprise.
+  const { limit: _l, offset: _o, ...rest } = query;
+  const params = logParams(rest);
+  params.set('format', format);
   return `${API_BASE}/api/export?${params}`;
 }
