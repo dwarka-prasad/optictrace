@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 `0.7.0` is the first public release and contains all of that work.
 
+## [Unreleased]
+
+### Added
+
+- **`optictrace init -spec openapi.yaml`** generates a starting `optic.yaml` from an OpenAPI 3.x or Swagger 2.0 document. Governance is otherwise written by hand against an API you may not have written, and the gaps surface only once traffic flows. A specification already lists the routes and payload shapes, so most of a first draft can be derived: credential headers from declared `securitySchemes` (the one thing a spec states rather than implies), metadata-only capture on `/login`-shaped routes, and `redact.json_fields` for payload fields whose names are unambiguous, each annotated with its confidence and reason.
+
+  The generated file leads with what it is **not**: a spec describes what an API claims, and a field the document does not model cannot be masked by a rule derived from it. Caveats print to stderr so a redirect still yields a clean file, `init` refuses to overwrite an existing config, and it validates its own output before handing it over — a scaffolding tool that emits config the agent then rejects teaches people the format is unreliable.
+
+  `$ref` is resolved (including through `allOf`/`anyOf`/`oneOf`), path templates become globs, arrays contribute their element fields without an index, self-referencing schemas terminate, and remote `$ref` URLs are deliberately not fetched.
+
+### Fixed
+
+- **`card.number` was not recognised as a card number.** The sensitive-name heuristics matched `card_number` but not the `card: { number: ... }` shape every payment API actually uses, so the single most important field to mask was missed — by `optictrace suggest` on live traffic as well as by the new scaffolder. Nested parent/leaf pairs are now matched for card and bank-account numbers, deliberately as a *pair* so that `order.number` and `page.number` stay unflagged: a heuristic that flags every number field gets muted, and a muted heuristic protects nothing.
+
 ## [0.11.0] — 2026-08-19
 
 ### Added

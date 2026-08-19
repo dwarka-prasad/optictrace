@@ -68,7 +68,42 @@ func exact(names ...string) func(string) bool {
 	}
 }
 
+// nested matches a leaf name whose PARENT segment gives it meaning.
+//
+// `number` on its own is meaningless — an order number, a page number. Under a
+// parent called `card` it is a PAN, and that is the single most important field
+// in this table to catch. Matching the pair is what distinguishes them; a rule
+// on `number` alone would flag everything and be muted, and one on
+// `card_number` alone misses the extremely common `card: { number: ... }`
+// shape that every payment API uses.
+func nested(parents, leaves []string) func(string) bool {
+	return func(name string) bool {
+		segs := strings.Split(strings.ToLower(name), ".")
+		if len(segs) < 2 {
+			return false
+		}
+		leaf, parent := segs[len(segs)-1], segs[len(segs)-2]
+		matches := func(list []string, v string) bool {
+			for _, s := range list {
+				if v == s {
+					return true
+				}
+			}
+			return false
+		}
+		return matches(parents, parent) && matches(leaves, leaf)
+	}
+}
+
 var fieldRules = []nameRule{
+	{nested(
+		[]string{"card", "creditcard", "credit_card", "debitcard", "debit_card", "payment_card", "paymentcard"},
+		[]string{"number", "no", "num", "pan"}), High,
+		"payment card data is PCI-DSS scope"},
+	{nested(
+		[]string{"account", "bank", "bank_account", "bankaccount"},
+		[]string{"number", "no", "num"}), High,
+		"bank account details enable fraud if leaked"},
 	{contains("password", "passwd", "secret", "private_key", "privatekey"), High,
 		"credentials must never be stored in telemetry"},
 	{contains("api_key", "apikey", "access_token", "refresh_token", "auth_token", "bearer"), High,
@@ -108,6 +143,37 @@ var headerRules = []nameRule{
 		"cookies carry session credentials"},
 	{contains("x-forwarded-for", "x-real-ip"), Low,
 		"client IPs are personal data in several jurisdictions"},
+}
+
+// Classification is what the name heuristics concluded about one field or
+// header name.
+type Classification struct {
+	Confidence string
+	Why        string
+}
+
+// ClassifyField reports whether a FIELD name looks sensitive, and why.
+//
+// Exported so that a config generated from an OpenAPI document uses the same
+// table as one suggested from traffic. A second copy of this list would drift
+// from the first, and the drift would be silent — a field masked when a rule
+// was suggested from traffic but not when it was scaffolded from a spec.
+func ClassifyField(name string) (Classification, bool) {
+	return classify(fieldRules, name)
+}
+
+// ClassifyHeader is ClassifyField for header names.
+func ClassifyHeader(name string) (Classification, bool) {
+	return classify(headerRules, name)
+}
+
+func classify(rules []nameRule, name string) (Classification, bool) {
+	for _, r := range rules {
+		if r.match(name) {
+			return Classification{Confidence: r.confidence, Why: r.why}, true
+		}
+	}
+	return Classification{}, false
 }
 
 // Suggestion is one proposed governance change.
