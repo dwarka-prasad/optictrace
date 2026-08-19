@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 `0.7.0` is the first public release and contains all of that work.
 
+## [0.14.0] — 2026-08-20
+
+### Added
+
+- **Traces page.** One row per request, however many services it touched — filterable to failures, by service, by tenant or by path. Opening one draws a **waterfall on a shared timeline**, with the application log lines each hop wrote underneath it. Offsets carry as much information as widths: a 300ms request made of two 120ms calls is either nearly optimal or 120ms of avoidable waiting, and only the offsets say which. Until now a trace was reachable only from a hop you had already found, which is backwards — "what happened to this request" is the question people arrive with.
+
+  Backed by `GET /api/traces` and `ext.TraceStore`, an **optional** companion to `ext.Store` found by type assertion, for the same reason `ext.AppLogStore` is one: `Store` is implemented outside this module and cannot grow methods. Implemented for sqlite, postgres and clickhouse. A driver without it loses the listing, not correlation.
+
+- **Logs page.** Application log lines across requests, with level counts that double as filters, and every line linking back to the exchange that produced it — by span id, not by timestamp. A pasted log line is usually what someone arrives holding; the request is what they are trying to find.
+
+- **Overview: p95 drawn against the average**, because a mean over a bucket hides the handful of slow responses that are the actual problem — an incident can triple the p95 and barely move the average. And **capture & sampling**, reporting how many records kept a body: the only honest check that a sampling rule does what you think, since one sampling at `0.05` that matches nothing looks identical to one at `1.0` in every other figure on the page.
+
+- 4xx is now counted apart from 5xx per time bucket, so a caller sending bad requests stops reading as the service falling over.
+
+- An **animated data-flow diagram** on the product page. Every other way of saying "redaction happens before storage" is a sentence you have to trust; here the bounded copy branches off the traffic lane and the card number becomes `[REDACTED]` between two stages while the live request carries it through untouched. Under `prefers-reduced-motion` it holds the finished state rather than vanishing.
+
+### Fixed
+
+- **Charts no longer interpolate across quiet periods.** `/api/stats` returns only buckets that contain traffic, so ten quiet minutes were being drawn as a smooth line through traffic that never happened. Counts now fill with zero; latencies break the line instead, because an empty bucket has no latency and 0ms would claim the service got instantaneously fast.
+
+- **`record.time` is the completion instant, and is now documented as such.** Every implementation, the Go proxy included, stamps it when the exchange finishes — which was written down nowhere. A timeline built on it draws the parent starting *after* the children it called, because the parent is the last hop to finish. Trace start is derived as `time - duration_ms`, and the conformance suite asserts a trace begins before the hops inside it. Stamping the start instead would have been friendlier but would make old and new rows indistinguishable, silently corrupting any timeline that spans the change.
+
+### Changed
+
+- The store conformance suite asserts the new `Stats` figures and the trace listing, and was run against **real Postgres and ClickHouse servers**, not only sqlite. `examples/memstore` computes them too rather than being left behind as a bad reference for third-party drivers.
+
 ## [0.13.0] — 2026-08-19
 
 ### Fixed
@@ -317,7 +343,8 @@ Measured with `make bench` (12th Gen Intel i5-1235U, Go 1.25):
 - Control-plane authentication is available but **off by default**.
 - Homebrew publishing is configured but disabled until a `homebrew-tap` repository exists.
 
-[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.10.0...v0.11.0
