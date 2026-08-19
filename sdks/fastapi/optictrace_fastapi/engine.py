@@ -284,6 +284,12 @@ class Engine:
         if not cfg or cfg.get("version") != 1:
             raise ValueError(f"optic.yaml: unsupported version {cfg.get('version') if cfg else None}")
         self.service_name = (cfg.get("service") or {}).get("name", "")
+        # The only thread from a customer's screenshot back to the record.
+        # Without it a support conversation starts at "roughly what time?",
+        # which under concurrency identifies the wrong request.
+        self.trace_response_header = (
+            ((cfg.get("service") or {}).get("trace") or {}).get("response_header", "")
+        )
         defaults = cfg.get("defaults") or {}
         cap = defaults.get("capture") or {}
         self._defaults = {

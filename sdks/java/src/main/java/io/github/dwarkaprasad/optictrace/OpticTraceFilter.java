@@ -44,6 +44,7 @@ public final class OpticTraceFilter implements Filter {
     private final String service;
     private final Shipper shipper;
     private final boolean consoleLog;
+    private final String traceResponseHeader;
 
     public OpticTraceFilter(String configPath, String agentUrl, String serviceName) throws IOException {
         this(loadConfig(configPath), agentUrl, serviceName, false);
@@ -53,6 +54,7 @@ public final class OpticTraceFilter implements Filter {
         this.engine = new Engine(config);
         this.service = serviceName != null && !serviceName.isEmpty() ? serviceName : engine.serviceName();
         this.consoleLog = consoleLog;
+        this.traceResponseHeader = engine.traceResponseHeader();
         this.shipper = agentUrl == null || agentUrl.isEmpty()
                 ? null
                 : new Shipper(agentUrl.replaceAll("/+$", "") + "/api/ingest", 4096, 1, Duration.ofSeconds(5));
@@ -89,6 +91,15 @@ public final class OpticTraceFilter implements Filter {
         // application runs so its logs and outbound calls can name this span.
         TraceContext ctx = TraceContext.fromHeader(request.getHeader(TraceContext.HEADER));
         TraceContext.set(ctx);
+
+        // Echo the trace id back to the caller, if configured. Set BEFORE the
+        // chain runs: once the application writes a byte the response is
+        // committed and a header set afterwards is silently discarded — which
+        // would look exactly like the feature working until someone tried to
+        // use it on a real response.
+        if (!traceResponseHeader.isEmpty()) {
+            response.setHeader(traceResponseHeader, ctx.traceId);
+        }
 
         CapturingRequest wrappedReq = new CapturingRequest(request, buffer && policy.captureRequestBody, policy.captureLimit);
         // Response bytes are buffered when the body is stored OR when a meter

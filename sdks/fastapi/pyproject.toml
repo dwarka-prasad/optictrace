@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "optictrace-fastapi"
-version = "0.2.0"
+version = "0.3.0"
 description = "OpticTrace middleware for FastAPI/ASGI — config-driven API telemetry & governance"
 readme = "README.md"
 license = { text = "Apache-2.0" }

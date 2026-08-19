@@ -15,6 +15,8 @@ const CONFIG = `
 version: 1
 service:
   name: express-test
+  trace:
+    response_header: X-Trace-Id
 rules:
   - name: no-capture-on-auth
     match: { path: "/auth/**" }
@@ -124,6 +126,11 @@ async function main() {
   });
   assert.strictEqual(r1.status, 201);
   const body1 = await r1.json();
+  // The only thread from a customer's screenshot back to the record. The Go
+  // proxy has always echoed it; the SDKs silently ignored the setting until a
+  // real app was pointed at one.
+  const echoedTraceId = r1.headers.get('x-trace-id');
+  assert.match(echoedTraceId ?? '', /^[0-9a-f]{32}$/, 'trace id not echoed to the caller');
   assert.strictEqual(body1.echo.card.number, '4111111111111111', 'traffic must not be mutated');
 
   await fetch(`${base}/auth/login`, {
@@ -145,6 +152,8 @@ async function main() {
   const pay = emitted.find((e) => e.path === '/payments/charge');
   const auth = emitted.find((e) => e.path === '/auth/login');
   assert.ok(pay && auth, 'both records emitted');
+
+  assert.strictEqual(pay.trace_id, echoedTraceId, 'echoed header names a different trace than the record');
 
   const payStr = JSON.stringify(pay);
   assert.ok(!payStr.includes('4111111111111111'), 'card number leaked into telemetry');

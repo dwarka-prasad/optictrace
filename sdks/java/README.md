@@ -11,7 +11,7 @@ Tomcat.
 <dependency>
   <groupId>io.github.dwarka-prasad</groupId>
   <artifactId>optictrace-servlet</artifactId>
-  <version>0.9.0</version>
+  <version>0.10.0</version>
 </dependency>
 ```
 
@@ -58,7 +58,7 @@ than becoming its sibling.
 | Labels | `header:` `query:` `path:<n>` `static:` `json:` `json_response:`, each with an optional `\|<regex>` capture |
 | Meters | numeric paths for billing — read from the raw response even when the body is not stored |
 | Sampling | `sample`, plus tail-based `keep_errors` and `keep_slower_than` |
-| Trace | adopts an inbound `traceparent` or starts one |
+| Trace | adopts an inbound `traceparent` or starts one, and echoes the id on `service.trace.response_header` |
 | App logs | `OpticTraceLogHandler` |
 
 **Live traffic is never modified.** The response is teed as it is written, so

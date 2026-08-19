@@ -48,6 +48,10 @@ class Engine {
       throw new Error(`optic.yaml: unsupported version ${cfg && cfg.version} (expected 1)`);
     }
     this.serviceName = cfg.service?.name ?? '';
+    // The only thread from a customer's screenshot back to the record.
+    // Without it a support conversation starts at "roughly what time?", which
+    // under concurrency identifies the wrong request.
+    this.traceResponseHeader = cfg.service?.trace?.response_header ?? '';
     const cap = cfg.defaults?.capture ?? {};
     this.defaults = {
       request_body: cap.request_body !== false,

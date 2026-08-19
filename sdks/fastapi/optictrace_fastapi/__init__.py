@@ -59,6 +59,7 @@ class OpticTraceMiddleware:
         with open(config_path, encoding="utf-8") as f:
             self.engine = Engine(yaml.safe_load(f))
         self.service = service_name or self.engine.service_name
+        self.trace_response_header = self.engine.trace_response_header
         self.ingest_url = agent_url.rstrip("/") + "/api/ingest" if agent_url else None
         self.console_log = console_log
         # Delivery counters. The previous version swallowed every failure with
@@ -128,6 +129,18 @@ class OpticTraceMiddleware:
         async def tee_send(message):
             if message["type"] == "http.response.start":
                 state["status"] = message["status"]
+                # Echo the trace id back to the caller, if configured. Injected
+                # into the start message rather than set afterwards: in ASGI
+                # the headers go out with this message and there is no later
+                # point at which one can be added.
+                if self.trace_response_header:
+                    message = dict(message)
+                    message["headers"] = list(message.get("headers", [])) + [
+                        (
+                            self.trace_response_header.lower().encode("latin-1"),
+                            ctx.trace_id.encode("latin-1"),
+                        )
+                    ]
                 state["resp_headers"] = {
                     k.decode("latin-1"): v.decode("latin-1")
                     for k, v in message.get("headers", [])

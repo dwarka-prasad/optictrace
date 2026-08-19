@@ -52,7 +52,9 @@ public final class SelfTest {
 
     private static final String CONFIG = """
             version: 1
-            service: { name: java-test }
+            service:
+              name: java-test
+              trace: { response_header: X-Trace-Id }
             defaults:
               capture: { request_body: true, response_body: true, headers: true }
             rules:
@@ -222,6 +224,13 @@ public final class SelfTest {
             check("region label captured by regex", "ap".equals(labels.get("region")));
             check("partner label read from the payload", "flipkart".equals(labels.get("partner")));
             check("outcome label read from the response", "captured".equals(labels.get("outcome")));
+            // The only thread from a customer's screenshot back to the record.
+            // The Go proxy has always echoed it; the SDKs silently ignored the
+            // setting until a real Spring Boot app was pointed at one.
+            check("trace id echoed to the caller on the configured header",
+                    String.valueOf(rec.get("trace_id")).equals(out.responseHeaders().get("x-trace-id")));
+            check("trace header set before the first byte, or a container drops it",
+                    out.traceHeaderSetBeforeBody());
         }
 
         // Restricted route: metadata only, but still attributable.
@@ -306,7 +315,8 @@ public final class SelfTest {
     }
 
     // --- a minimal servlet environment --------------------------------
-    private record Captured(Map<String, Object> record, byte[] clientBytes) {
+    private record Captured(Map<String, Object> record, byte[] clientBytes,
+                           Map<String, String> responseHeaders, boolean traceHeaderSetBeforeBody) {
     }
 
     /**
@@ -322,6 +332,9 @@ public final class SelfTest {
         Map<String, String> responseHeaders = new LinkedHashMap<>();
         responseHeaders.put("content-type", "application/json");
         int[] statusHolder = {status};
+        // A header set after the first byte is written is silently discarded by
+        // a real container, so the ORDER is the thing worth asserting.
+        boolean[] traceHeaderBeforeBody = {false};
 
         HttpServletRequest request = (HttpServletRequest) Proxy.newProxyInstance(
                 SelfTest.class.getClassLoader(), new Class<?>[]{HttpServletRequest.class},
@@ -329,7 +342,7 @@ public final class SelfTest {
 
         HttpServletResponse response = (HttpServletResponse) Proxy.newProxyInstance(
                 SelfTest.class.getClassLoader(), new Class<?>[]{HttpServletResponse.class},
-                responseHandler(clientSink, responseHeaders, statusHolder));
+                responseHandler(clientSink, responseHeaders, statusHolder, traceHeaderBeforeBody));
 
         List<Map<String, Object>> captured = new ArrayList<>();
         // The filter prints the record when no agent is configured; capture it
@@ -348,7 +361,8 @@ public final class SelfTest {
         for (String line : sink.toString().split("\n")) {
             if (line.startsWith("{")) captured.add(Policy.mapper().readValue(line, Map.class));
         }
-        return new Captured(captured.isEmpty() ? null : captured.get(captured.size() - 1), clientSink.toByteArray());
+        return new Captured(captured.isEmpty() ? null : captured.get(captured.size() - 1),
+                clientSink.toByteArray(), responseHeaders, traceHeaderBeforeBody[0]);
     }
 
     private static InvocationHandler requestHandler(String method, String path, String query,
@@ -388,8 +402,17 @@ public final class SelfTest {
     }
 
     private static InvocationHandler responseHandler(ByteArrayOutputStream sink,
-                                                     Map<String, String> headers, int[] status) {
+                                                     Map<String, String> headers, int[] status,
+                                                     boolean[] traceHeaderBeforeBody) {
         return (proxy, m, args) -> switch (m.getName()) {
+            case "setHeader", "addHeader" -> {
+                String name = String.valueOf(args[0]);
+                if (name.equalsIgnoreCase("X-Trace-Id") && sink.size() == 0) {
+                    traceHeaderBeforeBody[0] = true;
+                }
+                headers.put(name.toLowerCase(Locale.ROOT), String.valueOf(args[1]));
+                yield null;
+            }
             case "getStatus" -> status[0];
             case "setStatus" -> {
                 status[0] = (int) args[0];

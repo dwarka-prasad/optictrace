@@ -47,6 +47,7 @@ function optictrace(options = {}) {
       engine.rules = next.rules;
       engine.defaults = next.defaults;
       engine.captureLimit = next.captureLimit;
+      engine.traceResponseHeader = next.traceResponseHeader;
     } catch (e) {
       onError(e);
     }
@@ -56,6 +57,12 @@ function optictrace(options = {}) {
     // Adopt the caller's trace or start one, and publish it before the
     // application runs so its logs and outbound calls can name this span.
     const ctx = trace.fromHeader(req.headers[trace.HEADER]);
+    // Echo the trace id back to the caller, if configured. Set BEFORE the
+    // handler runs: once it writes a byte the headers are flushed and a later
+    // setHeader throws ERR_HTTP_HEADERS_SENT.
+    if (engine.traceResponseHeader) {
+      res.setHeader(engine.traceResponseHeader, ctx.traceId);
+    }
     const start = process.hrtime.bigint();
     const policy = engine.evaluate(req.method, req.path ?? req.url.split('?')[0]);
     // The up-front draw. Tail-based rules can rescue a request this draw
