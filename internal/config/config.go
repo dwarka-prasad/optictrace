@@ -519,6 +519,39 @@ type AppLogsCfg struct {
 	// applied to the message and to every structured field value; each match
 	// is replaced with [REDACTED].
 	Redact AppLogRedact `yaml:"redact"`
+	// Sources collect lines the application already writes, instead of
+	// requiring it to POST them. An app that logs JSON to stdout needs no code
+	// change at all — which matters, because the services whose logs you most
+	// want are usually the ones nobody wants to modify.
+	Sources []AppLogSource `yaml:"sources"`
+}
+
+// AppLogSource is one place to read application log lines from.
+type AppLogSource struct {
+	// Type is "stdout" (the child process started with `optictrace run -exec`)
+	// or "file".
+	Type string `yaml:"type"`
+	// Path is the file to tail, for type: file. Rotation is followed.
+	Path string `yaml:"path"`
+	// Service overrides the service name attributed to these lines. Defaults
+	// to service.name.
+	Service string `yaml:"service"`
+	// Format is "json" (the default) or "text". A text line has no fields and
+	// no span of its own unless SpanPattern finds one, so text sources mostly
+	// produce orphans — which is worth knowing before choosing the format
+	// rather than after seeing an empty dashboard.
+	Format string `yaml:"format"`
+	// Field names to read a JSON line's parts from. Empty values fall back to
+	// the conventional names, so a structured logger usually needs no mapping.
+	TraceField   string `yaml:"trace_field"`   // default: trace_id
+	SpanField    string `yaml:"span_field"`    // default: span_id
+	LevelField   string `yaml:"level_field"`   // default: level
+	MessageField string `yaml:"message_field"` // default: message, then msg
+	RouteField   string `yaml:"route_field"`   // default: route
+	// SpanPattern extracts a span id from a line that has no structured field
+	// for it — a regex with one capture group. The escape hatch for text logs
+	// and for loggers that only interpolate the id into the message.
+	SpanPattern string `yaml:"span_pattern"`
 }
 
 // AppLogRedact is the log-line equivalent of a rule's redact block.
@@ -540,6 +573,11 @@ func (a *AppLogsCfg) validate() error {
 	for i, pat := range a.Redact.Patterns {
 		if _, err := regexp.Compile(pat); err != nil {
 			return fmt.Errorf("telemetry.app_logs.redact.patterns[%d] (%q): %w", i, pat, err)
+		}
+	}
+	for i := range a.Sources {
+		if err := a.Sources[i].validate(i); err != nil {
+			return err
 		}
 	}
 	if a.LevelMin != "" && LevelRankKnown(a.LevelMin) < 0 {
@@ -600,6 +638,38 @@ func LevelRankKnown(level string) int {
 		return 5
 	}
 	return -1
+}
+
+// validate checks one source at load time.
+func (s *AppLogSource) validate(i int) error {
+	switch s.Type {
+	case "stdout":
+		if s.Path != "" {
+			return fmt.Errorf("telemetry.app_logs.sources[%d]: type stdout takes no path", i)
+		}
+	case "file":
+		if s.Path == "" {
+			return fmt.Errorf("telemetry.app_logs.sources[%d]: type file requires a path", i)
+		}
+	default:
+		return fmt.Errorf("telemetry.app_logs.sources[%d]: type %q is not stdout or file", i, s.Type)
+	}
+	switch s.Format {
+	case "", "json", "text":
+	default:
+		return fmt.Errorf("telemetry.app_logs.sources[%d]: format %q is not json or text", i, s.Format)
+	}
+	if s.SpanPattern != "" {
+		re, err := regexp.Compile(s.SpanPattern)
+		if err != nil {
+			return fmt.Errorf("telemetry.app_logs.sources[%d].span_pattern: %w", i, err)
+		}
+		if re.NumSubexp() != 1 {
+			return fmt.Errorf("telemetry.app_logs.sources[%d].span_pattern needs exactly one "+
+				"capture group (it is what identifies the span), got %d", i, re.NumSubexp())
+		}
+	}
+	return nil
 }
 
 // DropOrphanLines reports whether uncorrelated lines are discarded.
