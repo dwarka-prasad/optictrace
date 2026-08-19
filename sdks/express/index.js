@@ -11,7 +11,15 @@
 
 const fs = require('fs');
 const yaml = require('js-yaml');
-const { Engine, sanitizeHeaders, redactBody } = require('./engine');
+const {
+  Engine,
+  sanitizeHeaders,
+  sanitizeQuery,
+  redactBody,
+  extractMeters,
+  labelValue,
+} = require('./engine');
+const trace = require('./trace');
 
 /**
  * @param {object}  options
@@ -43,6 +51,9 @@ function optictrace(options = {}) {
   });
 
   return function optictraceMiddleware(req, res, next) {
+    // Adopt the caller's trace or start one, and publish it before the
+    // application runs so its logs and outbound calls can name this span.
+    const ctx = trace.fromHeader(req.headers[trace.HEADER]);
     const start = process.hrtime.bigint();
     const policy = engine.evaluate(req.method, req.path ?? req.url.split('?')[0]);
     const sampled = policy.sampleRate >= 1 || Math.random() < policy.sampleRate;
@@ -83,7 +94,13 @@ function optictrace(options = {}) {
         }
       }
     };
-    if (sampled && policy.captureResponseBody) respChunks = [];
+    // Meters need the response bytes even when the body is not STORED:
+    // metering is independent of capture, which is what lets a rule keep a
+    // prompt private while still counting the tokens in it. Without this,
+    // `restrict: [response_body]` silently zeroes the billing.
+    if ((sampled && policy.captureResponseBody) || Object.keys(policy.meters).length > 0) {
+      respChunks = [];
+    }
     const origWrite = res.write.bind(res);
     const origEnd = res.end.bind(res);
     res.write = function (chunk, ...args) {
@@ -107,10 +124,15 @@ function optictrace(options = {}) {
         duration_ms: durationMs,
         remote: req.ip ?? req.socket?.remoteAddress ?? '',
         source: 'express',
+        trace_id: ctx.traceId,
+        span_id: ctx.spanId,
+        parent_span_id: ctx.parentSpanId || undefined,
         req_bytes: reqBytes || Number(req.headers['content-length'] ?? 0),
         resp_bytes: respBytes,
         matched_rules: policy.matchedRules.length ? policy.matchedRules : undefined,
       };
+      const rawQuery = String(req.originalUrl ?? req.url ?? '').split('?')[1] ?? '';
+      if (rawQuery) record.query = sanitizeQuery(rawQuery, policy);
       if (policy.captureHeaders) {
         record.request_headers = sanitizeHeaders(req.headers, policy);
         record.response_headers = sanitizeHeaders(res.getHeaders(), policy);
@@ -123,24 +145,43 @@ function optictrace(options = {}) {
         );
         if (reqTruncated) record.req_truncated = true;
       }
+      let governedResponse;
       if (respChunks && respChunks.length) {
-        record.response_body = redactBody(
-          Buffer.concat(respChunks).toString('utf8'),
-          String(res.getHeader('content-type') ?? ''),
-          policy,
-        );
-        if (respTruncated) record.resp_truncated = true;
+        const rawResponse = Buffer.concat(respChunks).toString('utf8');
+        // Meters read the RAW body, so a rule can keep a prompt private while
+        // still counting the tokens in it.
+        const meters = extractMeters(rawResponse, policy);
+        if (Object.keys(meters).length) record.meters = meters;
+        if (policy.captureResponseBody) {
+          governedResponse = redactBody(
+            rawResponse,
+            String(res.getHeader('content-type') ?? ''),
+            policy,
+          );
+          record.response_body = governedResponse;
+          if (respTruncated) record.resp_truncated = true;
+        }
       }
       if (Object.keys(policy.labels).length) {
+        // Labels read the GOVERNED bodies, so a label can never copy a value
+        // the policy just masked into a Prometheus dimension.
+        const parse = (text) => {
+          try {
+            return text ? JSON.parse(text) : undefined;
+          } catch {
+            return undefined;
+          }
+        };
+        const ctxForLabels = {
+          headers: req.headers,
+          query: req.query ?? {},
+          path: record.path,
+          requestBody: parse(record.request_body),
+          responseBody: parse(governedResponse),
+        };
         record.labels = {};
         for (const [name, src] of Object.entries(policy.labels)) {
-          const [kind, key] = String(src).split(':');
-          record.labels[name] =
-            kind === 'header'
-              ? String(req.headers[key.toLowerCase()] ?? '')
-              : kind === 'query'
-                ? String(req.query?.[key] ?? '')
-                : '';
+          record.labels[name] = labelValue(src, ctxForLabels);
         }
       }
 
@@ -158,9 +199,14 @@ function optictrace(options = {}) {
       }
     });
 
-    next();
+    // Everything downstream — the handler, its logging, its outbound calls —
+    // runs inside this span's scope.
+    trace.run(ctx, next);
   };
 }
 
 module.exports = optictrace;
 module.exports.optictrace = optictrace;
+module.exports.outboundHeaders = trace.outboundHeaders;
+module.exports.currentSpan = trace.current;
+module.exports.LogShipper = require('./logs').LogShipper;
