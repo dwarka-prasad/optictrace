@@ -6,218 +6,8 @@
 <meta property="og:title" content="OpticTrace">
 <meta property="og:description" content="Declarative API telemetry and governance. One optic.yaml controls what your API traffic reveals.">
 <meta property="og:type" content="website">
+<link rel="stylesheet" href="assets/site.css">
 <style>
-  /* ===================================================================
-     A committed dark canvas — not a default. Every product screenshot on
-     this page is a dark UI, so a light ground would fight the content it
-     exists to show. Colours are painted explicitly throughout so the page
-     holds regardless of the host's theme.
-
-     The recurring motif is REDACTION: an amber block standing in for a
-     value that was masked. It is what the product does, so it is what the
-     page is built out of.
-     =================================================================== */
-  :root {
-    --void:      #070B11;
-    --surface:   #0E141D;
-    --surface-2: #151E2A;
-    --surface-3: #1B2635;
-    --line:      #1E2A38;
-    --line-soft: #141D28;
-
-    --ink:    #E6EDF5;
-    --ink-2:  #93A3B5;
-    --ink-3:  #61728A;
-
-    --accent:      #46C4E6;  /* optical cyan */
-    --accent-deep: #1B6E86;
-    --redact:      #E8A33D;  /* the masking motif */
-    --good:        #48C98D;
-    --bad:         #E8736A;
-
-    --font-display: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
-                    "Helvetica Neue", Arial, sans-serif;
-    --font-body: var(--font-display);
-    --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
-                 "DejaVu Sans Mono", "Liberation Mono", monospace;
-
-    --measure: 66ch;
-    --gutter: clamp(1.15rem, 5vw, 4rem);
-    --maxw: 78rem;
-  }
-
-  * { box-sizing: border-box; }
-  html { scroll-behavior: smooth; }
-  @media (prefers-reduced-motion: reduce) {
-    html { scroll-behavior: auto; }
-    *, *::before, *::after { animation: none !important; transition: none !important; }
-  }
-
-  body {
-    margin: 0;
-    background: var(--void);
-    color: var(--ink);
-    font-family: var(--font-body);
-    font-size: 16px;
-    line-height: 1.65;
-    -webkit-font-smoothing: antialiased;
-    overflow-x: hidden;
-  }
-
-  .wrap { max-width: var(--maxw); margin: 0 auto; padding-inline: var(--gutter); }
-  .prose { max-width: var(--measure); }
-
-  h1, h2, h3 { margin: 0; text-wrap: balance; font-weight: 650; letter-spacing: -0.035em; }
-  h2 { font-size: clamp(1.7rem, 4vw, 2.6rem); line-height: 1.12; }
-  h3 { font-size: clamp(1.05rem, 2vw, 1.25rem); letter-spacing: -0.02em; }
-  p { margin: 0 0 1.15rem; color: var(--ink-2); }
-  p strong { color: var(--ink); font-weight: 600; }
-  a { color: var(--accent); text-underline-offset: 3px; }
-  a:focus-visible, button:focus-visible {
-    outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px;
-  }
-  code {
-    font-family: var(--font-mono); font-size: 0.875em;
-    background: var(--surface-2); border: 1px solid var(--line);
-    padding: 0.1em 0.36em; border-radius: 4px; color: var(--ink);
-  }
-
-  /* --- the redaction motif, used as a divider instead of a hairline --- */
-  .redact-rule {
-    height: 3px; width: 56px; background: var(--redact);
-    border-radius: 1px; margin-bottom: 1.4rem;
-  }
-  .eyebrow {
-    font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.18em;
-    text-transform: uppercase; color: var(--ink-3); margin-bottom: 0.7rem;
-  }
-
-  section { padding-block: clamp(4rem, 9vw, 7.5rem); }
-  .band { background: var(--surface); border-block: 1px solid var(--line); }
-
-  /* ============================ NAV ============================ */
-  nav {
-    position: sticky; top: 0; z-index: 50;
-    background: rgba(7, 11, 17, 0.82);
-    backdrop-filter: blur(12px);
-    border-bottom: 1px solid var(--line-soft);
-  }
-  .nav-inner {
-    max-width: var(--maxw); margin: 0 auto; padding: 0.85rem var(--gutter);
-    display: flex; align-items: center; gap: 1.6rem;
-  }
-  .brand {
-    display: flex; align-items: center; gap: 0.55rem;
-    font-weight: 650; letter-spacing: -0.02em; font-size: 1.02rem;
-    color: var(--ink); text-decoration: none;
-  }
-  .lens {
-    width: 15px; height: 15px; border-radius: 50%;
-    border: 2px solid var(--accent); position: relative; flex: none;
-  }
-  .lens::after {
-    content: ""; position: absolute; inset: 3px;
-    border-radius: 50%; background: var(--accent);
-  }
-  .nav-links { margin-left: auto; display: flex; gap: 1.4rem; align-items: center; }
-  .nav-links a {
-    color: var(--ink-2); text-decoration: none; font-size: 0.9rem;
-  }
-  .nav-links a:hover { color: var(--ink); }
-  .btn {
-    display: inline-flex; align-items: center; gap: 0.5rem;
-    padding: 0.55rem 1.05rem; border-radius: 7px; font-size: 0.9rem;
-    font-weight: 550; text-decoration: none; border: 1px solid transparent;
-    transition: background 0.15s ease, border-color 0.15s ease;
-  }
-  .btn-primary { background: var(--accent); color: #04202B; }
-  .btn-primary:hover { background: #6BD3EF; }
-  .btn-ghost { border-color: var(--line); color: var(--ink); }
-  .btn-ghost:hover { border-color: var(--accent-deep); background: var(--surface-2); }
-  @media (max-width: 720px) { .nav-links a:not(.btn) { display: none; } }
-
-  /* ============================ HERO ============================ */
-  .hero { padding-block: clamp(3.5rem, 8vw, 6.5rem) clamp(2rem, 5vw, 3.5rem); }
-  .hero h1 {
-    font-size: clamp(2.4rem, 6.6vw, 4.7rem);
-    line-height: 1.03; letter-spacing: -0.045em; font-weight: 680;
-    margin-bottom: 1.35rem; max-width: 17ch;
-  }
-  /* The aesthetic bet: a word in the headline is literally redacted, then
-     wipes away to reveal itself — the page performs what the product does. */
-  .masked {
-    position: relative; display: inline-block; color: var(--ink);
-    isolation: isolate;
-  }
-  .masked::after {
-    content: ""; position: absolute; inset: 0.06em -0.16em 0.1em -0.16em;
-    background: var(--redact); border-radius: 3px; z-index: 2;
-    transform-origin: right center;
-    animation: unmask 1s cubic-bezier(0.65, 0, 0.35, 1) 1.5s forwards;
-  }
-  @keyframes unmask { to { transform: scaleX(0); } }
-  @media (prefers-reduced-motion: reduce) {
-    .masked::after { animation: none; transform: scaleX(0); }
-  }
-  .lede {
-    font-size: clamp(1.03rem, 1.75vw, 1.2rem); color: var(--ink-2);
-    max-width: 56ch; margin-bottom: 2rem; line-height: 1.6;
-  }
-  .hero-actions { display: flex; flex-wrap: wrap; gap: 0.7rem; align-items: center; }
-  .install {
-    font-family: var(--font-mono); font-size: 0.88rem;
-    background: var(--surface); border: 1px solid var(--line);
-    padding: 0.55rem 0.95rem; border-radius: 7px; color: var(--ink-2);
-    white-space: nowrap; overflow-x: auto; max-width: 100%;
-  }
-  .install b { color: var(--accent); font-weight: 400; }
-
-  .hero-figure { margin-top: clamp(2.5rem, 6vw, 4rem); }
-  .shot {
-    width: 100%; height: auto; display: block; border-radius: 10px;
-    border: 1px solid var(--line);
-    box-shadow: 0 30px 70px -30px rgba(0, 0, 0, 0.9), 0 0 0 1px rgba(70, 196, 230, 0.06);
-  }
-  figcaption {
-    margin-top: 0.85rem; font-size: 0.83rem; color: var(--ink-3);
-    max-width: 62ch;
-  }
-
-  .stats {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-    gap: 1px; background: var(--line); border: 1px solid var(--line);
-    border-radius: 10px; overflow: hidden; margin-top: 2.6rem;
-  }
-  .stat { background: var(--surface); padding: 1.1rem 1.2rem; }
-  .stat b {
-    display: block; font-size: 1.5rem; font-weight: 650;
-    letter-spacing: -0.03em; color: var(--ink);
-    font-variant-numeric: tabular-nums;
-  }
-  .stat span { font-size: 0.78rem; color: var(--ink-3); }
-
-  /* ======================= THE TRADE-OFF ======================= */
-  .versus {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-    gap: 1rem; margin-top: 2.2rem;
-  }
-  .card {
-    background: var(--surface); border: 1px solid var(--line);
-    border-radius: 10px; padding: 1.4rem;
-  }
-  .card.bad-path { border-color: rgba(232, 115, 106, 0.28); }
-  .card.good-path { border-color: rgba(70, 196, 230, 0.32); }
-  .card h3 { margin-bottom: 0.5rem; }
-  .card p { margin: 0; font-size: 0.93rem; }
-  .tag {
-    font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.13em;
-    text-transform: uppercase; margin-bottom: 0.6rem; display: block;
-  }
-  .tag.no { color: var(--bad); }
-  .tag.yes { color: var(--accent); }
-
-  /* ======================= FLOW DIAGRAM ======================= */
-
   /* ---- Animated data-flow diagram ------------------------------------
      One request, drawn as it actually travels: through the proxy to the
      upstream and back untouched, while a bounded copy branches down into the
@@ -291,181 +81,6 @@
     .lbl-clear { opacity: 0; }
     .lbl-masked { opacity: 1; }
   }
-
-  .flow { overflow-x: auto; padding-block: 0.5rem; }
-  .flow-inner { min-width: 720px; }
-  .lane-label {
-    font-family: var(--font-mono); font-size: 0.7rem; letter-spacing: 0.13em;
-    text-transform: uppercase; display: flex; align-items: center; gap: 0.5rem;
-    margin-bottom: 0.75rem;
-  }
-  .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
-  .lane-traffic { color: var(--accent); }
-  .lane-traffic .dot { background: var(--accent); }
-  .lane-tel { color: var(--redact); }
-  .lane-tel .dot { background: var(--redact); }
-
-  .flow-row { display: flex; align-items: stretch; gap: 0; margin-bottom: 0.5rem; }
-  .node {
-    flex: 1; background: var(--surface-2); border: 1px solid var(--line);
-    border-radius: 8px; padding: 0.75rem 0.9rem; min-width: 0;
-  }
-  .node .nt {
-    font-family: var(--font-mono); font-size: 0.82rem; font-weight: 600;
-    color: var(--ink); display: block;
-  }
-  .node .ns { font-size: 0.75rem; color: var(--ink-3); line-height: 1.4; }
-  .node.core { background: rgba(70, 196, 230, 0.09); border-color: var(--accent-deep); }
-  .node.end { flex: 0 0 8.5rem; background: var(--surface-3); }
-  .arrow {
-    flex: 0 0 2.2rem; display: grid; place-items: center;
-    color: var(--ink-3); font-family: var(--font-mono);
-  }
-  .tee {
-    display: flex; align-items: center; gap: 0.6rem; margin: 0.7rem 0;
-    padding-left: calc(8.5rem + 2.2rem);
-    font-family: var(--font-mono); font-size: 0.73rem; color: var(--redact);
-  }
-  .drop {
-    width: 2px; height: 24px; flex: none;
-    background: repeating-linear-gradient(to bottom, var(--redact) 0 4px, transparent 4px 9px);
-  }
-  .stages { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.5rem; }
-  .stage {
-    background: var(--surface-2); border: 1px solid var(--line);
-    border-left: 3px solid var(--redact); border-radius: 6px; padding: 0.65rem 0.75rem;
-  }
-  .stage i {
-    font-family: var(--font-mono); font-style: normal; font-size: 0.66rem;
-    color: var(--redact); letter-spacing: 0.07em; display: block;
-  }
-  .stage b { display: block; font-size: 0.82rem; margin: 0.1rem 0; }
-  .stage span { font-size: 0.73rem; color: var(--ink-3); line-height: 1.4; }
-
-  /* ======================= CODE BLOCKS ======================= */
-  pre {
-    font-family: var(--font-mono); font-size: 0.83rem; line-height: 1.65;
-    background: var(--surface); border: 1px solid var(--line);
-    border-radius: 10px; padding: 1.15rem 1.3rem; overflow-x: auto;
-    margin: 0; color: var(--ink); tab-size: 2;
-  }
-  pre .c { color: var(--ink-3); font-style: italic; }
-  pre .k { color: var(--accent); }
-  pre .s { color: var(--good); }
-  pre .r { color: var(--redact); font-weight: 600; }
-  .code-label {
-    font-family: var(--font-mono); font-size: 0.72rem; color: var(--ink-3);
-    margin-bottom: 0.5rem; letter-spacing: 0.05em;
-  }
-  .split {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
-    gap: 1.4rem; align-items: start; margin-top: 2rem;
-  }
-
-  /* ======================= FEATURES ======================= */
-  .features {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(255px, 1fr));
-    gap: 1px; background: var(--line); border: 1px solid var(--line);
-    border-radius: 12px; overflow: hidden; margin-top: 2.4rem;
-  }
-  .feature { background: var(--surface); padding: 1.5rem 1.4rem; }
-  .feature .cmd {
-    font-family: var(--font-mono); font-size: 0.78rem; color: var(--accent);
-    display: block; margin-bottom: 0.55rem;
-  }
-  .feature h3 { font-size: 1rem; margin-bottom: 0.4rem; }
-  .feature p { font-size: 0.9rem; margin: 0; }
-
-  /* ======================= BENCHMARK CHART ======================= */
-  .chart { margin-top: 2rem; display: grid; gap: 0.85rem; }
-  .bar-row { display: grid; grid-template-columns: minmax(0, 15rem) 1fr auto; gap: 1rem; align-items: center; }
-  .bar-label { font-size: 0.88rem; color: var(--ink-2); }
-  .bar-track {
-    height: 26px; background: var(--surface-2); border-radius: 5px;
-    border: 1px solid var(--line); overflow: hidden; position: relative;
-  }
-  .bar-fill {
-    height: 100%; border-radius: 4px 0 0 4px;
-    transform-origin: left center;
-    animation: grow 1.1s cubic-bezier(0.22, 1, 0.36, 1) both;
-  }
-  @keyframes grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
-  @media (prefers-reduced-motion: reduce) { .bar-fill { animation: none; } }
-  .bar-val {
-    font-family: var(--font-mono); font-size: 0.85rem; color: var(--ink);
-    font-variant-numeric: tabular-nums; white-space: nowrap;
-  }
-  @media (max-width: 640px) {
-    .bar-row { grid-template-columns: 1fr auto; }
-    .bar-label { grid-column: 1 / -1; }
-  }
-
-  /* ======================= PR COMMENT ======================= */
-  .pr {
-    background: var(--surface); border: 1px solid var(--line);
-    border-radius: 10px; overflow: hidden; margin-top: 2rem;
-  }
-  .pr-head {
-    display: flex; align-items: center; gap: 0.6rem; padding: 0.75rem 1.1rem;
-    border-bottom: 1px solid var(--line); background: var(--surface-2);
-    font-size: 0.85rem; color: var(--ink-2);
-  }
-  .avatar {
-    width: 22px; height: 22px; border-radius: 50%; flex: none;
-    background: var(--accent-deep); display: grid; place-items: center;
-  }
-  .avatar .lens { width: 11px; height: 11px; border-width: 1.5px; }
-  .pr-body { padding: 1.15rem; }
-  .pr-verdict {
-    border-left: 3px solid var(--bad); padding-left: 0.9rem; margin-bottom: 1.1rem;
-  }
-  .pr-verdict b { color: var(--bad); font-size: 1.02rem; }
-  .pr-verdict p { margin: 0.3rem 0 0; font-size: 0.88rem; }
-  table.pr-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
-  table.pr-table th {
-    text-align: left; font-family: var(--font-mono); font-size: 0.68rem;
-    letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-3);
-    padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--line); font-weight: 600;
-  }
-  table.pr-table td {
-    padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--line-soft);
-    color: var(--ink-2); vertical-align: top;
-  }
-  table.pr-table td.n { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink); }
-  table.pr-table code { background: none; border: none; padding: 0; color: var(--accent); }
-  .sev { font-weight: 700; }
-  .sev.x { color: var(--bad); }
-  .sev.w { color: var(--redact); }
-  .tbl-scroll { overflow-x: auto; }
-
-  /* ======================= SCREENSHOT BAND ======================= */
-  .shots { display: grid; gap: 2.6rem; margin-top: 2.6rem; }
-  .shot-item figcaption { margin-top: 0.75rem; }
-  .shot-item h3 { margin-bottom: 0.3rem; }
-
-  /* ======================= FOOTER / CTA ======================= */
-  .cta { text-align: left; }
-  .cta h2 { max-width: 18ch; }
-  footer {
-    border-top: 1px solid var(--line); padding-block: 2.5rem 3.5rem;
-    color: var(--ink-3); font-size: 0.85rem;
-  }
-  .foot-grid {
-    display: flex; flex-wrap: wrap; gap: 1rem 2.5rem; align-items: center;
-    justify-content: space-between;
-  }
-  .foot-links { display: flex; flex-wrap: wrap; gap: 1.3rem; }
-  .foot-links a { color: var(--ink-2); text-decoration: none; }
-  .foot-links a:hover { color: var(--accent); }
-
-  ul.ticks { list-style: none; padding: 0; margin: 1.2rem 0 0; }
-  ul.ticks li {
-    position: relative; padding-left: 1.5rem; margin-bottom: 0.6rem;
-    color: var(--ink-2); font-size: 0.93rem;
-  }
-  ul.ticks li::before {
-    content: "▸"; position: absolute; left: 0; color: var(--accent);
-  }
 </style>
 
 <nav>
@@ -474,10 +89,10 @@
     <div class="nav-links">
       <a href="#how">How it works</a>
       <a href="#config">Config</a>
-      <a href="#init">Start from a spec</a>
       <a href="#trace">Traces &amp; logs</a>
       <a href="#tooling">Tooling</a>
       <a href="#performance">Performance</a>
+      <a href="integrate.html">Integrate</a>
       <a class="btn btn-ghost" href="https://github.com/dwarka-prasad/optictrace">GitHub</a>
     </div>
   </div>
@@ -1181,8 +796,17 @@ docker compose up --build
         macOS and Linux on Intel and ARM, <code>go install</code> builds from source, and every
         release ships checksummed, cosign-signed archives with an SBOM.
       </p>
+      <p class="prose" style="margin-top:1.4rem;font-size:0.93rem;color:var(--ink-3)">
+        Putting it in front of something that already exists? The
+        <a href="integrate.html">integration guide</a> has the steps for each route —
+        sidecar on a host, in Docker, in Compose or in Kubernetes; middleware for
+        Express, FastAPI, Java, Go and Gin — plus a rollout order for a service already
+        in production that never has a step where the store holds data you did not
+        intend it to.
+      </p>
       <div class="hero-actions" style="margin-top:1.8rem">
-        <a class="btn btn-primary" href="https://github.com/dwarka-prasad/optictrace">Read the docs on GitHub</a>
+        <a class="btn btn-primary" href="integrate.html">Integration guide</a>
+        <a class="btn btn-ghost" href="https://github.com/dwarka-prasad/optictrace">Read the docs on GitHub</a>
         <a class="btn btn-ghost" href="https://github.com/dwarka-prasad/optictrace/releases">Download a release</a>
       </div>
     </div>

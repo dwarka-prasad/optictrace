@@ -204,6 +204,11 @@ flowchart TB
 Everything above ships in a **single binary** — the dashboard is compiled in as static files.
 The offline tools are commands you run against captured history, not long-running services.
 
+**A step-by-step [integration guide](https://dwarka-prasad.github.io/optictrace/integrate.html)**
+covers each route in full — sidecar on a host, in Docker, in Compose or as a Kubernetes
+sidecar; middleware for Express, FastAPI, Java, Go and Gin — plus a rollout order for a
+service that is already in production.
+
 **Two deployment modes share one code path:**
 
 - **Sidecar / gateway** — `optictrace run` reverse-proxies to your service.

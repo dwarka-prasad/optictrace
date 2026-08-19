@@ -1,0 +1,776 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%230E141D'/><circle cx='16' cy='16' r='9' fill='none' stroke='%2346C4E6' stroke-width='3'/><circle cx='16' cy='16' r='3.5' fill='%2346C4E6'/></svg>">
+<title>Integrating OpticTrace</title>
+<meta name="description" content="Integration steps for every supported module — sidecar, Express, FastAPI, Java servlet, Go and Gin — including how to adopt OpticTrace in a project that is already running.">
+<meta property="og:title" content="Integrating OpticTrace">
+<meta property="og:description" content="Sidecar or in-process middleware, with a staged rollout for projects already in production.">
+<meta property="og:type" content="article">
+<link rel="stylesheet" href="assets/site.css">
+<style>
+  /* ---- Integration guide -------------------------------------------- */
+
+  /* The chooser. Two routes in, and the decision is nearly always made on
+     one question — may you change the application's code — so that question
+     leads rather than a feature matrix. */
+  .routes { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.2rem; margin-top: 2rem; }
+  .route { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 1.5rem 1.4rem; }
+  .route.in-process { border-color: rgba(70, 196, 230, 0.32); }
+  .route h3 { font-size: 1.05rem; margin-bottom: 0.3rem; }
+  .route .when { font-size: 0.83rem; color: var(--accent); margin-bottom: 0.8rem; font-family: var(--font-mono); }
+  .route p { font-size: 0.9rem; margin: 0 0 0.7rem; }
+  .route ul { margin: 0; padding-left: 1.1rem; font-size: 0.85rem; color: var(--ink-2); }
+  .route li { margin-bottom: 0.3rem; }
+
+  /* Numbered steps. The numbers are load-bearing here: these are sequences
+     where doing step three before step two leaves you with a running agent
+     that records nothing. */
+  .steps { counter-reset: step; margin-top: 1.8rem; display: grid; gap: 1.5rem; }
+  /* min-width:0 on every grid child that contains a <pre>. A grid item's
+     automatic minimum size is its min-content width, so a long code line
+     widens the track instead of scrolling inside its own box — which turns a
+     scrollable snippet into a horizontally scrolling PAGE on a phone. */
+  .step-item { counter-increment: step; position: relative; padding-left: 2.6rem; min-width: 0; }
+  .step-item::before {
+    content: counter(step); position: absolute; left: 0; top: 0;
+    width: 1.75rem; height: 1.75rem; border-radius: 50%;
+    display: grid; place-items: center;
+    background: var(--surface-2); border: 1px solid var(--line);
+    color: var(--accent); font-family: var(--font-mono); font-size: 0.8rem;
+  }
+  .step-item h4 { font-size: 0.98rem; margin: 0.15rem 0 0.45rem; }
+  .step-item p { font-size: 0.9rem; color: var(--ink-2); margin: 0 0 0.6rem; max-width: 72ch; }
+  .step-item pre { margin-top: 0.5rem; }
+
+  /* One panel per stack. Tabs would hide four of the five, and people arrive
+     here having already decided which language they are in — so they all
+     stand open and the page is searchable with ctrl-F. */
+  .stack { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 1.6rem 1.5rem; margin-top: 1.6rem; }
+  .stack > header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.7rem; margin-bottom: 0.3rem; }
+  .stack h3 { font-size: 1.1rem; margin: 0; }
+  .stack .badge {
+    font-family: var(--font-mono); font-size: 0.72rem; padding: 0.15rem 0.5rem;
+    border: 1px solid var(--line); border-radius: 5px; color: var(--ink-3);
+  }
+  .stack .badge.ok { color: var(--good); border-color: rgba(72, 201, 141, 0.3); }
+  .stack > p.lede-sm { font-size: 0.9rem; color: var(--ink-2); margin: 0.4rem 0 0; max-width: 76ch; }
+
+  .note {
+    border-left: 2px solid var(--redact); padding: 0.15rem 0 0.15rem 0.9rem;
+    margin: 1rem 0 0; font-size: 0.86rem; color: var(--ink-2); max-width: 76ch;
+  }
+  .note b { color: var(--ink); }
+  .note.good { border-left-color: var(--good); }
+
+  #verify .split > *, .routes > *, .steps > * { min-width: 0; }
+
+  /* Shared `pre` has margin:0 because on the landing page every snippet is
+     separated by prose. Here they stack directly, so adjacent ones need the
+     gap put back — and one after a paragraph needs breathing room above it. */
+  .stack pre + pre, .step-item pre + pre, #verify pre + pre { margin-top: 0.7rem; }
+  .stack > pre:first-of-type { margin-top: 1rem; }
+  .stack p + pre, .step-item p + pre, .note + pre { margin-top: 0.75rem; }
+
+  table.matrix { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 1.6rem; }
+  table.matrix th, table.matrix td { padding: 0.55rem 0.7rem; border-bottom: 1px solid var(--line-soft); text-align: left; }
+  table.matrix th { color: var(--ink-3); font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  table.matrix td:first-child { color: var(--ink); }
+  table.matrix .y { color: var(--good); }
+  table.matrix .n { color: var(--ink-3); }
+</style>
+
+<nav>
+  <div class="nav-inner">
+    <a class="brand" href="index.html"><span class="lens" aria-hidden="true"></span> OpticTrace</a>
+    <div class="nav-links">
+      <a href="#choose">Choose a route</a>
+      <a href="#config">The config</a>
+      <a href="#sidecar">Sidecar</a>
+      <a href="#middleware">Middleware</a>
+      <a href="#existing">Existing projects</a>
+      <a href="#verify">Verify</a>
+      <a class="btn btn-ghost" href="https://github.com/dwarka-prasad/optictrace">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<main id="top">
+
+  <section class="hero wrap">
+    <div class="eyebrow">Integration guide</div>
+    <h1>Two ways in. Neither of them rewrites your service.</h1>
+    <p class="lede">
+      OpticTrace either sits <strong>in front of</strong> your service as a sidecar, or
+      <strong>inside</strong> it as middleware. Both routes run the same rule engine
+      against the same <code>optic.yaml</code>, so you can start with the sidecar,
+      move to in-process later, and keep the policy file you already wrote.
+    </p>
+    <div class="hero-actions">
+      <a class="btn btn-primary" href="#choose">Pick a route</a>
+      <a class="btn btn-ghost" href="#existing">Adopting it mid-flight</a>
+    </div>
+  </section>
+
+  <!-- ======================= CHOOSE ======================= -->
+  <section id="choose" class="band">
+    <div class="wrap">
+      <div class="redact-rule"></div>
+      <div class="eyebrow">Step zero</div>
+      <div class="prose">
+        <h2>One question decides it</h2>
+        <p>
+          <strong>Can you change the application&rsquo;s code?</strong> If not — a vendor
+          binary, a service nobody owns any more, a language with no SDK here — the sidecar
+          is the whole answer and needs no cooperation from the process it fronts. If you
+          can, in-process middleware buys you one thing the sidecar cannot: sensitive
+          values are masked <em>inside</em> the process that saw them and never cross a
+          boundary in the clear.
+        </p>
+      </div>
+
+      <div class="routes">
+        <div class="route">
+          <h3>Sidecar / gateway</h3>
+          <div class="when">optictrace run</div>
+          <p>
+            A reverse proxy in front of your service. Zero code change, any language,
+            any framework — including ones that do not exist yet.
+          </p>
+          <ul>
+            <li>Nothing to import, nothing to redeploy in the app</li>
+            <li>One network hop added</li>
+            <li>Raw payloads reach the agent&rsquo;s memory before being governed</li>
+            <li>Best first move for an existing system</li>
+          </ul>
+        </div>
+        <div class="route in-process">
+          <h3>In-process middleware</h3>
+          <div class="when">Express · FastAPI · Java · Go · Gin</div>
+          <p>
+            The same engine inside your app. Governance runs before any byte leaves the
+            process, and the agent stores what it is sent.
+          </p>
+          <ul>
+            <li>A card number is masked in the JVM, interpreter or goroutine that saw it</li>
+            <li>No extra hop, no extra container</li>
+            <li>Agent downtime never touches your request path — shipping is fire-and-forget</li>
+            <li>Needs one dependency and roughly five lines</li>
+          </ul>
+        </div>
+      </div>
+
+      <p class="note">
+        <b>They compose.</b> A sidecar in front of the services you cannot change, and the
+        middleware inside the ones you can, all reporting into <em>one</em> agent in
+        collector mode. Records carry the emitting service name, so the fleet stays
+        separable on every chart and in every Prometheus series.
+      </p>
+    </div>
+  </section>
+
+  <!-- ======================= CONFIG ======================= -->
+  <section id="config" class="wrap">
+    <div class="redact-rule"></div>
+    <div class="eyebrow">Before either route</div>
+    <div class="prose">
+      <h2>Write one <code>optic.yaml</code>, or generate it</h2>
+      <p>
+        The same file is read by the sidecar and by every SDK. Parsing is strict —
+        unknown keys are rejected rather than ignored, so a typo like
+        <code>restirct:</code> fails at load instead of quietly disabling your governance.
+      </p>
+    </div>
+
+    <div class="steps">
+      <div class="step-item">
+        <h4>Generate a first draft from a spec you already have</h4>
+        <p>
+          If there is an OpenAPI 3.x or Swagger 2.0 document, most of a first draft can be
+          derived from it: credential headers from declared <code>securitySchemes</code>,
+          metadata-only capture on login-shaped routes, and redaction for payload fields
+          whose names are unambiguous — each annotated with its confidence and reason.
+        </p>
+<pre><span class="c"># the config goes to stdout; the caveats go to stderr, so a redirect</span>
+<span class="c"># still leaves you a clean file</span>
+optictrace init -spec openapi.yaml &gt; optic.yaml
+
+<span class="c"># or name the file, in which case it refuses to overwrite a reviewed one</span>
+optictrace init -spec openapi.yaml -out optic.yaml</pre>
+        <p class="note">
+          A spec describes what an API <em>claims</em>. A field the document does not model
+          cannot be masked by a rule derived from it, which is why the generated file leads
+          with its own caveats and why <code>scan</code> below exists.
+        </p>
+      </div>
+
+      <div class="step-item">
+        <h4>Or start from the minimum and grow it</h4>
+        <p>Three keys are enough to run. Everything else has a default.</p>
+<pre>version: <span class="k">1</span>
+
+service:
+  name: payments-api
+  listen: <span class="s">":8080"</span>              <span class="c"># sidecar only — omit for SDK / collector mode</span>
+  upstream: <span class="s">"http://127.0.0.1:9000"</span>
+
+telemetry:
+  admin_listen: <span class="s">"127.0.0.1:9095"</span>   <span class="c"># dashboard · /metrics · query APIs</span>
+  store:
+    driver: sqlite
+    dsn: optic.db
+
+rules:
+  - name: redact-payment-secrets
+    match:
+      path: <span class="s">"/api/v1/payments/**"</span>
+    redact:
+      headers: [Authorization, Cookie]
+      json_fields:
+        - <span class="s">"$.**.card.number"</span>
+        - <span class="s">"$.**.card.cvv"</span>
+    labels:
+      tenant: <span class="s">"header:X-Tenant-ID"</span></pre>
+      </div>
+
+      <div class="step-item">
+        <h4>Validate it before anything depends on it</h4>
+        <p>
+          <code>validate</code> is a lint pass with no traffic involved. <code>test</code>
+          asserts what a rule <em>does</em> to a payload, so a redaction you rely on cannot
+          silently stop matching after a refactor.
+        </p>
+<pre>optictrace validate -config optic.yaml
+optictrace test     -config optic.yaml   <span class="c"># reads optic.test.yaml beside it</span></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= SIDECAR ======================= -->
+  <section id="sidecar" class="band">
+    <div class="wrap">
+      <div class="redact-rule"></div>
+      <div class="eyebrow">Route one</div>
+      <div class="prose">
+        <h2>Sidecar, four ways</h2>
+        <p>
+          The pattern is identical everywhere: OpticTrace takes the port clients already
+          call, your service moves to a private one, and <code>upstream</code> points at
+          it. The response comes back byte-for-byte — same status, same headers, same
+          body — so nothing downstream of the client can tell the difference.
+        </p>
+      </div>
+
+      <div class="stack">
+        <header><h3>A. On a host, from the binary</h3><span class="badge">no container</span></header>
+        <p class="lede-sm">Two moves: your service stops listening publicly, OpticTrace takes over that port.</p>
+<pre><span class="c"># install</span>
+brew install dwarka-prasad/tap/optictrace
+<span class="c"># or</span>
+go install github.com/dwarka-prasad/optictrace/cmd/optictrace@latest
+
+<span class="c"># your app moves off 8080 (say to 9000), then:</span>
+optictrace run -config optic.yaml</pre>
+        <p class="note">
+          <code>telemetry.admin_listen</code> defaults to <b>loopback</b>. The admin port
+          serves the dashboard and every captured payload, so exposing it means turning on
+          <code>telemetry.auth</code> in the same change, not later.
+        </p>
+      </div>
+
+      <div class="stack">
+        <header><h3>B. Docker, alongside an existing container</h3><span class="badge">ghcr.io</span></header>
+        <p class="lede-sm">
+          The published image already has the dashboard compiled in and runs as a non-root
+          user. Its default command reads <code>/etc/optictrace/optic.yaml</code>, so the
+          only thing to mount is the config.
+        </p>
+<pre>docker run --rm \
+  -p 8080:8080 -p 9095:9095 \
+  -v <span class="s">"$PWD/optic.yaml:/etc/optictrace/optic.yaml:ro"</span> \
+  -v optictrace-data:/data \
+  ghcr.io/dwarka-prasad/optictrace:latest</pre>
+        <p class="note">
+          <code>upstream</code> must be reachable <em>from the agent&rsquo;s network
+          namespace</em>. Pointing it at <code>127.0.0.1</code> from inside a container is
+          the most common first mistake — use the service name on a shared Docker network,
+          or <code>host.docker.internal</code> on Docker Desktop.
+        </p>
+      </div>
+
+      <div class="stack">
+        <header><h3>C. Docker Compose, in front of a service you already have</h3></header>
+        <p class="lede-sm">
+          Give the agent the published port and take it away from the app. The app keeps
+          its own port on the internal network, so nothing about it changes.
+        </p>
+<pre>services:
+  api:
+    build: .
+    expose: [<span class="s">"9000"</span>]          <span class="c"># internal only — no ports: any more</span>
+
+  optictrace:
+    image: ghcr.io/dwarka-prasad/optictrace:latest
+    ports: [<span class="s">"8080:8080"</span>, <span class="s">"9095:9095"</span>]
+    volumes:
+      - ./optic.yaml:/etc/optictrace/optic.yaml:ro
+      - optictrace-data:/data
+    depends_on: [api]
+
+volumes:
+  optictrace-data:</pre>
+<pre><span class="c"># optic.yaml — upstream is the compose service name</span>
+service:
+  name: api
+  listen: <span class="s">":8080"</span>
+  upstream: <span class="s">"http://api:9000"</span></pre>
+        <p class="note good">
+          The repository&rsquo;s own <code>docker-compose.yml</code> is a working version of
+          this with Prometheus and Grafana attached and a seeder that drives multi-tenant
+          traffic on startup — an empty dashboard tells you nothing about whether the rules
+          work. <code>docker compose up --build</code>.
+        </p>
+      </div>
+
+      <div class="stack">
+        <header><h3>D. Kubernetes</h3><span class="badge">two shapes</span></header>
+        <p class="lede-sm">
+          <strong>As a true sidecar</strong>, sharing a Pod with the app — the agent talks
+          to it over localhost, and the Service is repointed at the agent&rsquo;s port:
+        </p>
+<pre>spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          <span class="c"># unchanged — still listening on 9000</span>
+
+        - name: optictrace
+          image: ghcr.io/dwarka-prasad/optictrace:latest
+          ports:
+            - { name: proxy, containerPort: 8080 }
+            - { name: admin, containerPort: 9095 }
+          env:
+            - name: OPTICTRACE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef: { name: optictrace-admin, key: token }
+          volumeMounts:
+            - { name: optic-config, mountPath: /etc/optictrace, readOnly: <span class="k">true</span> }
+          readinessProbe:
+            httpGet: { path: /healthz, port: admin }
+      volumes:
+        - name: optic-config
+          configMap: { name: optic-config }     <span class="c"># holds optic.yaml</span></pre>
+<pre><span class="c"># in optic.yaml — same Pod, so localhost is correct here</span>
+service:
+  listen: <span class="s">":8080"</span>
+  upstream: <span class="s">"http://127.0.0.1:9000"</span>
+
+telemetry:
+  admin_listen: <span class="s">"0.0.0.0:9095"</span>    <span class="c"># the probe is another container</span>
+  auth:
+    token_env: OPTICTRACE_ADMIN_TOKEN</pre>
+        <p class="lede-sm" style="margin-top:1.2rem">
+          <strong>Or as a shared gateway</strong> in front of several backends, which is
+          what the bundled Helm chart deploys — ConfigMap-managed config, health probes, an
+          optional PVC for the SQLite store, and a ServiceMonitor for Prometheus Operator:
+        </p>
+<pre>helm install optictrace ./deploy/helm/optictrace \
+  --set config.service.upstream=<span class="s">"http://my-api:80"</span> \
+  --set persistence.enabled=<span class="k">true</span> \
+  --set serviceMonitor.enabled=<span class="k">true</span></pre>
+        <p class="note">
+          The chart turns admin <b>auth on by default</b> and generates a token on first
+          install, preserved across upgrades. Inside a cluster the admin port is reachable
+          by anything that can resolve the Service, and it serves captured payloads —
+          turning that off should be a decision, not an accident.
+        </p>
+<pre><span class="c"># read the generated token</span>
+kubectl get secret optictrace-admin-token -o jsonpath=<span class="s">'{.data.token}'</span> | base64 -d</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= MIDDLEWARE ======================= -->
+  <section id="middleware" class="wrap">
+    <div class="redact-rule"></div>
+    <div class="eyebrow">Route two</div>
+    <div class="prose">
+      <h2>In-process middleware</h2>
+      <p>
+        Every SDK does the same four things: evaluate your <code>optic.yaml</code>, tee the
+        request and response without buffering-and-replaying them, apply the policy, and
+        ship the governed record to the agent. Shipping is fire-and-forget on a background
+        worker — <strong>agent downtime never affects your request path.</strong>
+      </p>
+      <p>
+        With an SDK the agent is not proxying anything, so it runs in
+        <strong>collector mode</strong>: leave <code>service.listen</code> and
+        <code>service.upstream</code> out of the config entirely and it starts admin-only.
+      </p>
+    </div>
+
+<pre><span class="c"># the agent for an SDK fleet — no listen, no upstream</span>
+optictrace run -config optic.yaml</pre>
+<pre><span class="c">optictrace collector mode — no proxy listener  service=shop-api rules=4</span></pre>
+
+    <div class="stack">
+      <header><h3>Node.js — Express</h3><span class="badge">@optictrace/express</span></header>
+<pre>npm install @optictrace/express</pre>
+<pre><span class="k">const</span> express = require(<span class="s">'express'</span>);
+<span class="k">const</span> optictrace = require(<span class="s">'@optictrace/express'</span>);
+
+<span class="k">const</span> app = express();
+app.use(optictrace({
+  configPath: <span class="s">'optic.yaml'</span>,
+  agentUrl: <span class="s">'http://localhost:9095'</span>,   <span class="c">// omit to log JSON to stdout</span>
+}));
+app.use(express.json());                <span class="c">// AFTER optictrace</span></pre>
+      <p class="note">
+        <b>Mount it before your body parser.</b> The middleware tees the raw request
+        stream; a parser that has already consumed it leaves nothing to capture.
+      </p>
+      <p class="lede-sm" style="margin-top:1.1rem">Log lines, filed under the request that wrote them:</p>
+<pre><span class="k">const</span> { LogShipper } = require(<span class="s">'@optictrace/express'</span>);
+<span class="k">const</span> log = <span class="k">new</span> LogShipper(<span class="s">'http://localhost:9095'</span>, <span class="s">'checkout'</span>);
+
+log.info(<span class="s">'charge captured'</span>, { amount: <span class="k">129.0</span> });
+<span class="c">// delivery is counted, not assumed: log.sent / log.failed / log.dropped</span></pre>
+      <p class="lede-sm" style="margin-top:1.1rem">And a call this service makes downstream:</p>
+<pre><span class="k">const</span> headers = { ...optictrace.outboundHeaders() };
+<span class="k">await</span> fetch(url, { headers });   <span class="c">// carries THIS hop's span, so the next nests under it</span></pre>
+      <p class="lede-sm">Rules hot-reload on <code>kill -HUP &lt;pid&gt;</code>, mirroring the agent.</p>
+    </div>
+
+    <div class="stack">
+      <header><h3>Python — FastAPI, Starlette, any ASGI app</h3><span class="badge">optictrace-fastapi</span></header>
+<pre>pip install optictrace-fastapi</pre>
+<pre><span class="k">from</span> fastapi <span class="k">import</span> FastAPI
+<span class="k">from</span> optictrace_fastapi <span class="k">import</span> OpticTraceMiddleware
+
+app = FastAPI()
+app.add_middleware(
+    OpticTraceMiddleware,
+    config_path=<span class="s">"optic.yaml"</span>,
+    agent_url=<span class="s">"http://localhost:9095"</span>,   <span class="c"># omit to log JSON to stdout</span>
+)</pre>
+      <p class="lede-sm" style="margin-top:1.1rem">Logging and downstream propagation:</p>
+<pre><span class="k">import</span> logging
+<span class="k">from</span> optictrace_fastapi <span class="k">import</span> OpticTraceLogHandler, outbound_headers
+
+logging.getLogger().addHandler(
+    OpticTraceLogHandler(<span class="s">"http://localhost:9095"</span>, <span class="s">"checkout"</span>))
+
+<span class="c"># a downstream call carries this hop's span</span>
+httpx.post(url, headers=outbound_headers(), json=payload)</pre>
+      <p class="note">
+        It is pure ASGI — no FastAPI import inside the middleware — so Starlette, Litestar
+        or a hand-rolled ASGI app all work the same way.
+      </p>
+    </div>
+
+    <div class="stack">
+      <header><h3>Java — Spring Boot, Quarkus, Jetty, Tomcat</h3><span class="badge">optictrace-servlet</span></header>
+      <p class="lede-sm">
+        A plain <code>jakarta.servlet.Filter</code>, so anything on Servlet 5+ can use it.
+        Not on Maven Central yet — build it into your local repository first:
+      </p>
+<pre>git clone https://github.com/dwarka-prasad/optictrace
+(<span class="k">cd</span> optictrace/sdks/java &amp;&amp; mvn install -DskipTests)</pre>
+<pre>&lt;dependency&gt;
+  &lt;groupId&gt;io.github.dwarka-prasad&lt;/groupId&gt;
+  &lt;artifactId&gt;optictrace-servlet&lt;/artifactId&gt;
+  &lt;version&gt;0.10.0&lt;/version&gt;
+&lt;/dependency&gt;</pre>
+<pre><span class="k">@Bean</span>
+FilterRegistrationBean&lt;OpticTraceFilter&gt; optictrace() <span class="k">throws</span> IOException {
+    <span class="k">var</span> f = <span class="k">new</span> OpticTraceFilter(<span class="s">"optic.yaml"</span>, <span class="s">"http://localhost:9095"</span>, <span class="s">"checkout"</span>);
+    <span class="k">var</span> reg = <span class="k">new</span> FilterRegistrationBean&lt;&gt;(f);
+    reg.setOrder(Ordered.HIGHEST_PRECEDENCE);   <span class="c">// see the bytes the client sent</span>
+    reg.addUrlPatterns(<span class="s">"/*"</span>);
+    <span class="k">return</span> reg;
+}</pre>
+      <p class="lede-sm" style="margin-top:1.1rem">Logging and downstream propagation:</p>
+<pre>Logger parent = Logger.getLogger(<span class="s">"com.example.shop"</span>);
+parent.setLevel(Level.FINE);        <span class="c">// see the note below</span>
+parent.addHandler(<span class="k">new</span> OpticTraceLogHandler(<span class="s">"http://localhost:9095"</span>, <span class="s">"checkout"</span>));
+
+<span class="c">// on an outbound call</span>
+HttpHeaders h = <span class="k">new</span> HttpHeaders();
+TraceContext.outboundHeaders().forEach(h::set);</pre>
+      <p class="note">
+        <b>java.util.logging filters on the logger level before a handler is consulted</b>,
+        and its default is <code>INFO</code>. Without raising it, debug lines are never
+        shipped — and the setup looks like it is working, because everything at
+        <code>info</code> and above arrives normally.
+      </p>
+      <p class="note">
+        <b>Spring Boot 2 / Tomcat 9</b> need the <code>javax.servlet</code> variant. It is
+        <em>generated</em> rather than kept as a second copy — two copies of one engine
+        drift, and the copy nobody runs is the one that drifts:
+      </p>
+<pre>(<span class="k">cd</span> sdks/java &amp;&amp; ./scripts/gen-javax.sh)   <span class="c"># -&gt; target/javax-src</span></pre>
+    </div>
+
+    <div class="stack">
+      <header><h3>Go — net/http and Gin</h3><span class="badge ok">same engine as the agent</span></header>
+      <p class="lede-sm">
+        The Go path is not a reimplementation: it is the agent&rsquo;s own interceptor
+        exposed as middleware, so it inherits every feature the proxy has by construction.
+      </p>
+<pre>go get github.com/dwarka-prasad/optictrace</pre>
+<pre><span class="k">import</span> (
+    <span class="s">"github.com/dwarka-prasad/optictrace"</span>
+    optictracegin <span class="s">"github.com/dwarka-prasad/optictrace/sdks/gin"</span>   <span class="c">// Gin only</span>
+)</pre>
+<pre>agent, err := optictrace.New(<span class="s">"optic.yaml"</span>)
+<span class="k">if</span> err != <span class="k">nil</span> { log.Fatal(err) }
+<span class="k">defer</span> agent.Close()
+agent.ServeAdmin(<span class="s">"ui/out"</span>)   <span class="c">// dashboard + /metrics on the admin port</span>
+
+<span class="c">// net/http</span>
+http.ListenAndServe(<span class="s">":8080"</span>, agent.Middleware(mux))
+
+<span class="c">// Gin</span>
+r.Use(optictracegin.Middleware(agent))</pre>
+      <p class="lede-sm" style="margin-top:1.1rem">Logging and downstream propagation:</p>
+<pre>logger := slog.New(optictrace.NewLogHandler(<span class="s">"http://localhost:9095"</span>, <span class="s">"checkout"</span>, <span class="k">nil</span>))
+logger.InfoContext(ctx, <span class="s">"charge captured"</span>, <span class="s">"amount"</span>, <span class="k">129.0</span>)
+
+<span class="k">for</span> k, v := <span class="k">range</span> optictrace.OutboundHeaders(ctx) { req.Header.Set(k, v) }</pre>
+      <p class="note">
+        <b>Use slog&rsquo;s <code>...Context</code> variants.</b> A plain
+        <code>logger.Info()</code> passes <code>context.Background()</code>, which carries
+        no span, so those lines arrive as orphans and the agent drops them by default.
+      </p>
+    </div>
+
+    <div class="tbl-scroll">
+    <table class="matrix">
+      <caption class="eyebrow" style="text-align:left;margin-bottom:0.6rem">What each route gives you</caption>
+      <thead>
+        <tr>
+          <th>Capability</th><th>Sidecar</th><th>Go / Gin</th><th>Express</th><th>FastAPI</th><th>Java</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>Restriction &amp; redaction</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td></tr>
+        <tr><td>Labels, meters, sampling</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td></tr>
+        <tr><td>Tail sampling (<code>keep_errors</code>, <code>keep_slower_than</code>)</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td></tr>
+        <tr><td>W3C trace context</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td></tr>
+        <tr><td><code>trace.response_header</code></td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td></tr>
+        <tr><td>Application log shipping</td><td class="y">✓ <span class="n">via <code>-exec</code> / file</span></td><td class="y">✓ slog</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓ JUL</td></tr>
+        <tr><td>Masks data inside your process</td><td class="n">—</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td></tr>
+        <tr><td>Needs no code change</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>Serves the dashboard itself</td><td class="y">✓</td><td class="y">✓</td><td class="n">via agent</td><td class="n">via agent</td><td class="n">via agent</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <!-- ======================= EXISTING PROJECTS ======================= -->
+  <section id="existing" class="band">
+    <div class="wrap">
+      <div class="redact-rule"></div>
+      <div class="eyebrow">Adopting it mid-flight</div>
+      <div class="prose">
+        <h2>Adding this to something already in production</h2>
+        <p>
+          The temptation is to write the rules first and turn everything on at once. That
+          gets it backwards: you do not yet know what your traffic actually contains, and
+          the first thing a governance tool should do is <em>tell you</em> rather than
+          assume. The order below never has a step where the store holds data you did not
+          intend it to.
+        </p>
+      </div>
+
+      <div class="steps">
+        <div class="step-item">
+          <h4>Start with capture off entirely</h4>
+          <p>
+            Deploy with metadata only — status, latency, byte counts, labels. You get
+            golden signals and per-tenant attribution on day one, and no payload is stored
+            anywhere while you are still deciding what the rules should be.
+          </p>
+<pre>defaults:
+  capture:
+    request_body: <span class="k">false</span>
+    response_body: <span class="k">false</span>
+    headers: <span class="k">false</span></pre>
+        </div>
+
+        <div class="step-item">
+          <h4>Find out what the traffic contains, from the traffic</h4>
+          <p>
+            <code>suggest</code> reads field and header <em>names</em> and proposes rules.
+            <code>scan</code> inspects <em>values</em> against detectors — card numbers,
+            tokens, emails — and finds what naming conventions miss. They answer different
+            halves of the same question, so run both.
+          </p>
+<pre>optictrace suggest -config optic.yaml -window 24h -apply proposed.yaml
+optictrace scan    -config optic.yaml -window 24h</pre>
+<pre><span class="c">⚠ [high] credit-card in POST /api/** → request_body.$.ref</span>
+<span class="c">    a Luhn-valid card number — PCI-DSS scope · sample 41••••••••••••11</span>
+<span class="c">    fix: redact:</span>
+<span class="c">           json_fields: ["$.ref"]</span></pre>
+          <p class="note">
+            Names alone are not enough. That finding is a field called <code>ref</code>
+            holding a card number: invisible to <code>suggest</code>, obvious to
+            <code>scan</code>, and reported with the rule fragment that would have masked
+            it. This is also why the step above turns capture off — you want these two to
+            be the first things that read a payload.
+          </p>
+        </div>
+
+        <div class="step-item">
+          <h4>Turn capture on route by route, redaction first</h4>
+          <p>
+            Merge the proposed rules, then enable bodies only where a rule already masks
+            what matters. A route with no rule is a route with no protection, and
+            <code>scan</code> will keep saying so.
+          </p>
+<pre>optictrace validate -config optic.yaml
+optictrace test     -config optic.yaml   <span class="c"># pin what each rule does</span></pre>
+        </div>
+
+        <div class="step-item">
+          <h4>Sample the hot paths, but never lose the interesting requests</h4>
+          <p>
+            A high-volume read path does not need every body stored. Sampling gates the
+            <strong>body only</strong> — the record is always written, so no count, rate or
+            percentile changes — and the tail-based rules rescue the ones worth having
+            after the outcome is known.
+          </p>
+<pre>  - name: sample-catalog-reads
+    match: { path: <span class="s">"/api/v1/catalog/**"</span>, methods: [GET] }
+    sample: <span class="k">0.4</span>
+    keep_errors: <span class="k">true</span>          <span class="c"># 5xx are always kept</span>
+    keep_slower_than: 200ms   <span class="c"># and so is anything slow</span></pre>
+          <p class="note">
+            Check the result on the <b>Capture &amp; sampling</b> panel. It is the only
+            honest read on this: a rule sampling at <code>0.05</code> that matches nothing
+            looks identical to one at <code>1.0</code> in every other number on the page.
+          </p>
+        </div>
+
+        <div class="step-item">
+          <h4>Keep the policy honest as the API changes</h4>
+          <p>
+            Governance rots the moment someone adds a field. Wire the review into CI, where
+            it diffs the config against the base branch and re-runs the scan over recent
+            traffic — a rule that used to cover a route and now does not becomes a failing
+            check rather than a discovery six months later.
+          </p>
+<pre>optictrace review -config optic.yaml \
+  -base-config base/optic.yaml \
+  -from http://optictrace.internal:9095</pre>
+        </div>
+      </div>
+
+      <p class="note good">
+        <b>Nothing here is one-way.</b> The sidecar and the SDKs read the same file, so a
+        service that starts behind a proxy and later imports the middleware keeps its
+        policy verbatim — and the config it was validated against is the config it still
+        runs.
+      </p>
+    </div>
+  </section>
+
+  <!-- ======================= VERIFY ======================= -->
+  <section id="verify" class="wrap">
+    <div class="redact-rule"></div>
+    <div class="eyebrow">Before you call it done</div>
+    <div class="prose">
+      <h2>Prove it is actually working</h2>
+      <p>
+        Every one of these checks exists because the corresponding failure has happened
+        here, and each looked healthy from the outside while it was happening.
+      </p>
+    </div>
+
+    <div class="split">
+      <div>
+        <div class="code-label">Records are arriving</div>
+<pre>curl -s localhost:9095/api/stats | jq .total</pre>
+        <p class="note">
+          A Python SDK once passed every offline test it had while a live agent rejected
+          <b>100%</b> of its records — the timestamps were not strict RFC3339 and the
+          failure was swallowed. Nothing offline can catch that. If you write SDK tests,
+          run them with <code>OPTIC_AGENT_URL</code> set so a real agent has to accept the
+          output.
+        </p>
+      </div>
+      <div>
+        <div class="code-label">The secret is not in the store</div>
+<pre>curl -s <span class="s">'localhost:9095/api/logs?limit=50'</span> \
+  | grep -c <span class="s">'4111111111111111'</span>   <span class="c"># want: 0</span></pre>
+        <p class="note">
+          Read it out of the store rather than trusting the rule. A redaction path that
+          matches nothing and a redaction path that works both produce a dashboard with no
+          card numbers on the screen you are looking at.
+        </p>
+      </div>
+      <div>
+        <div class="code-label">The trace joins up</div>
+<pre>curl -s <span class="s">'localhost:9095/api/traces?window=1h'</span> \
+  | jq <span class="s">'.traces[0] | {spans, services}'</span></pre>
+        <p class="note">
+          More than one hop means your outbound propagation is working. One hop on a
+          request you know fans out means the <code>traceparent</code> is not being copied
+          onto the downstream call.
+        </p>
+      </div>
+      <div>
+        <div class="code-label">Log lines are landing on their request</div>
+<pre>curl -s localhost:9095/api/applogs/stats</pre>
+        <p class="note">
+          Watch <code>spans_with_logs</code>, not just <code>total</code>. Lines with no
+          request behind them are dropped by default and counted in
+          <code>optictrace_app_logs_dropped_total</code> — a high drop count usually means
+          logging outside a request, or a span that never reached the logger.
+        </p>
+      </div>
+      <div>
+        <div class="code-label">Nothing is ungoverned</div>
+<pre>optictrace scan -config optic.yaml -window 1h -fail-on high</pre>
+        <p class="note">
+          Exits non-zero on a finding, so it belongs in CI. A route nobody wrote a rule for
+          is the normal way sensitive data ends up stored.
+        </p>
+      </div>
+      <div>
+        <div class="code-label">Traffic is untouched</div>
+<pre>diff &lt;(curl -s localhost:9000/api/v1/orders) \
+     &lt;(curl -s localhost:8080/api/v1/orders)</pre>
+        <p class="note good">
+          Compare your service directly against the proxied path. They must be identical:
+          live traffic is never modified, and the one deliberate exception is the
+          <code>traceparent</code> on the <em>forwarded</em> request — never the response,
+          never what the client sent.
+        </p>
+      </div>
+    </div>
+
+    <div class="hero-actions" style="margin-top:2.4rem">
+      <a class="btn btn-primary" href="index.html">Back to the overview</a>
+      <a class="btn btn-ghost" href="https://github.com/dwarka-prasad/optictrace#optic-yaml-reference">Full optic.yaml reference</a>
+    </div>
+  </section>
+
+</main>
+
+<footer class="wrap">
+  <div class="foot-grid">
+    <div>
+      <div class="brand" style="margin-bottom:0.4rem">
+        <span class="lens" aria-hidden="true"></span> OpticTrace
+      </div>
+      Declarative API telemetry &amp; governance · Apache-2.0
+    </div>
+    <div class="foot-links">
+      <a href="index.html">Overview</a>
+      <a href="https://github.com/dwarka-prasad/optictrace">GitHub</a>
+      <a href="https://github.com/dwarka-prasad/optictrace/blob/main/CHANGELOG.md">Changelog</a>
+      <a href="https://github.com/dwarka-prasad/optictrace/releases">Releases</a>
+    </div>
+  </div>
+</footer>
