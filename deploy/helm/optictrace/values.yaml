@@ -34,7 +34,7 @@ auth:
   enabled: true
   # Leave empty to generate a random token on first install. It is preserved
   # across upgrades, so clients holding it keep working.
-  #   kubectl get secret <release>-optictrace-admin-token -o jsonpath='{.data.token}' | base64 -d
+  #   kubectl get secret <release>-admin-token -o jsonpath='{.data.token}' | base64 -d
   token: ""
   # Bring your own Secret instead (e.g. from an external secrets operator).
   existingSecret: ""
