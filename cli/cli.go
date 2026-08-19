@@ -58,6 +58,7 @@ import (
 	"github.com/dwarka-prasad/optictrace/internal/replay"
 	"github.com/dwarka-prasad/optictrace/internal/review"
 	"github.com/dwarka-prasad/optictrace/internal/ruletest"
+	"github.com/dwarka-prasad/optictrace/internal/scaffold"
 	"github.com/dwarka-prasad/optictrace/internal/scan"
 	"github.com/dwarka-prasad/optictrace/internal/spec"
 	"github.com/dwarka-prasad/optictrace/internal/store"
@@ -83,6 +84,10 @@ func Run(args []string, ver string) {
 	configPath := fs.String("config", "optic.yaml", "path to optic.yaml")
 	uiDir := fs.String("ui", "ui/out", "static dashboard directory (optional)")
 	execCmd := fs.String("exec", "", "run: start this command and collect its stdout/stderr as application logs")
+	initService := fs.String("service", "", "init: service name (default: the spec's title)")
+	initListen := fs.String("proxy-listen", "", "init: sidecar listen address, e.g. :8080")
+	initUpstream := fs.String("upstream", "", "init: upstream URL to forward to")
+	initLow := fs.Bool("include-low", false, "init: also mask low-confidence names (name, first_name)")
 	specPath := fs.String("spec", "", "OpenAPI spec file (check/mock/sdk)")
 	outPath := fs.String("out", "", "output file (spec/sdk); default stdout")
 	window := fs.Duration("window", 24*time.Hour, "traffic window to analyze (spec/check)")
@@ -136,11 +141,13 @@ func Run(args []string, ver string) {
 			from: *fromAgent, fromFile: *fromFile, token: *token,
 			window: *window, out: *outPath, failOn: *reviewFailOn,
 		})
+	case "init":
+		initConfig(*specPath, *outPath, *initService, *initListen, *initUpstream, *initLow)
 	case "version":
 		fmt.Println("optictrace", version)
 	default:
 		fmt.Fprintf(os.Stderr,
-			"unknown command %q\n  (run, validate, test, scan, suggest, review, purge, replay,\n   spec, check, sdk, mock, version)\n", cmd)
+			"unknown command %q\n  (init, run, validate, test, scan, suggest, review, purge,\n   replay, spec, check, sdk, mock, version)\n", cmd)
 		os.Exit(2)
 	}
 }
@@ -619,6 +626,73 @@ func startChild(command string, collector *applog.Collector, sources []config.Ap
 		done <- code
 	}()
 	return done
+}
+
+// initConfig scaffolds an optic.yaml from an OpenAPI or Swagger document.
+//
+// The bootstrap problem: governance is otherwise written by hand against an API
+// you may not have written, and the gaps only surface once traffic flows. A
+// specification already lists the routes and payload shapes, so most of a first
+// draft can be derived rather than guessed.
+func initConfig(specPath, outPath, service, listen, upstream string, includeLow bool) {
+	if specPath == "" {
+		fmt.Fprintln(os.Stderr, "✗ -spec is required: point it at an OpenAPI or Swagger document\n"+
+			"  optictrace init -spec openapi.yaml -out optic.yaml")
+		os.Exit(2)
+	}
+	raw, err := os.ReadFile(specPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+		os.Exit(1)
+	}
+	doc, err := scaffold.Parse(raw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ %s: %v\n", specPath, err)
+		os.Exit(1)
+	}
+	res := scaffold.Generate(doc, scaffold.Options{
+		ServiceName: service, Listen: listen, Upstream: upstream, IncludeLow: includeLow,
+	})
+
+	// Validate what was generated before handing it over. A scaffolding tool
+	// that emits a file the agent then refuses is worse than no tool: it
+	// teaches people the config format is unreliable.
+	cfg, err := config.Parse([]byte(res.YAML))
+	if err == nil {
+		err = cfg.Validate()
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ generated config did not validate — this is a bug in `init`, "+
+			"please report it with the spec that caused it:\n  %v\n", err)
+		os.Exit(1)
+	}
+
+	if outPath == "" {
+		fmt.Print(res.YAML)
+	} else {
+		// Never clobber: an existing optic.yaml is a reviewed policy, and
+		// overwriting it from a spec would silently discard hand-written rules.
+		if _, err := os.Stat(outPath); err == nil {
+			fmt.Fprintf(os.Stderr, "✗ %s already exists — refusing to overwrite a reviewed policy.\n"+
+				"  Write elsewhere with -out, or delete it deliberately.\n", outPath)
+			os.Exit(1)
+		}
+		if err := os.WriteFile(outPath, []byte(res.YAML), 0o600); err != nil {
+			fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✓ wrote %s — %d route(s), %d rule(s), %d field(s) masked\n",
+			outPath, res.Routes, res.Rules, res.MaskedFields)
+	}
+
+	// To stderr, so `optictrace init -spec x.yaml > optic.yaml` still produces a
+	// clean file while the caveats stay visible.
+	if len(res.Notes) > 0 {
+		fmt.Fprintln(os.Stderr, "\nBefore trusting this:")
+		for _, n := range res.Notes {
+			fmt.Fprintf(os.Stderr, "  · %s\n", n)
+		}
+	}
 }
 
 func loadTraffic(configPath string, window time.Duration) (*config.Config, []store.Record) {

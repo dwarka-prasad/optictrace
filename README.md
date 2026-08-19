@@ -35,6 +35,7 @@ Prometheus dimensions.
 - [Pull-request reviews](#pull-request-reviews)
 - [Traffic-powered tooling](#traffic-powered-tooling)
 - [Following one request](#following-one-request-across-services) — [what it logged](#what-the-request-logged)
+- [Start from your OpenAPI spec](#start-from-your-openapi-spec) — `optictrace init`
 - [Examples](#examples) — runnable apps, not snippets
 - [Export plugins](#export-plugins)
 - [Framework SDKs](#framework-sdks)
@@ -1429,6 +1430,45 @@ proxy, not asserted from the code:
 - **The linter catches real breakage.** A proposed spec dropping a field was rejected with *"clients send request field `credit_card` (28 times, last 22m ago)"* and a non-zero exit.
 - **Plugins receive governed data only.** A Python CSV plugin and a file exporter both ran live; neither output contained a card number or a restricted payload.
 - **A clean clone works.** Cloned fresh from GitHub: builds, six test packages pass, CLI runs.
+
+---
+
+## Start from your OpenAPI spec
+
+Writing governance by hand against an API you may not have written means finding
+out what you missed once traffic flows. A specification already lists the routes
+and payload shapes, so most of the first draft can be derived:
+
+```bash
+optictrace init -spec openapi.yaml -out optic.yaml
+```
+
+Reads OpenAPI 3.x and Swagger 2.0, YAML or JSON, and produces rules for what the
+document actually states — credential headers from its `securitySchemes`,
+metadata-only capture on `/login`-shaped routes, and `redact.json_fields` for
+payload fields whose names are unambiguous, each annotated with why:
+
+```yaml
+  - name: redact-api-v1-payments-charge
+    match:
+      path: "/api/v1/payments/charge"
+    redact:
+      query_params: ["api_key"]
+      json_fields:
+        - "$.**.card.number"    # high · payment card data is PCI-DSS scope
+        - "$.**.card.cvv"       # high · payment card data is PCI-DSS scope
+        - "$.**.customer.email" # medium · email addresses are personal data
+```
+
+**It is a starting point and says so in its own header.** A spec describes what
+an API *claims*; governance has to hold for what it *does*. A field the document
+does not model cannot be masked by a rule derived from it, specs drift, and a
+field called `ref` can hold a card number — which is what `optictrace scan`
+finds on real traffic and no name heuristic ever will. Caveats print to stderr,
+so `init -spec x.yaml > optic.yaml` still gives you a clean file.
+
+It refuses to overwrite an existing `optic.yaml`, and validates what it produced
+before handing it over.
 
 ---
 
