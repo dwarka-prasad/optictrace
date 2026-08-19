@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 `0.7.0` is the first public release and contains all of that work.
 
+## [0.13.0] — 2026-08-19
+
+### Fixed
+
+- **`service.trace.response_header` is now honoured by every SDK**, not only the proxy. All three SDKs parsed the setting and never used it, so an SDK-instrumented service returned no trace id to its caller. That header is the only thread from a customer's screenshot back to the record; without it a support conversation starts at "roughly what time was that?", which under concurrent traffic identifies the wrong request.
+
+  Each SDK sets it **before the handler writes its first byte**, because a header added after the response is committed is discarded — silently by a servlet container, loudly by Node, and impossibly by ASGI, where headers ride on the `http.response.start` message and there is no later point to add one.
+
+- **Header names on records ingested from an SDK are canonicalised.** Go's `http.Header` is canonical (`Authorization`); every SDK hands over what the wire carried, which is lower case. `optictrace suggest` keys its coverage check on the canonical name, so against SDK traffic it reported `authorization` as an ungoverned credential on a route whose own rule already masked it. Advice to add a rule you already have is worse than silence. Names only — the values were governed in-process and are not touched.
+
+### Added
+
+- **`examples/springboot-shop`** — a Spring Boot 3 service on the Java SDK, with a checkout that fans out to a catalog read and a payment charge over real HTTP, so one request produces three correlated spans. It is the Java SDK's first example, and the app that found both of the bugs above: each was invisible to a test suite that drove the SDK through its own doubles.
+
+### Changed
+
+- SDK versions: java `0.9.0` → `0.10.0`, express and fastapi `0.2.0` → `0.3.0`.
+
 ## [0.12.0] — 2026-08-19
 
 ### Added
@@ -300,6 +318,7 @@ Measured with `make bench` (12th Gen Intel i5-1235U, Go 1.25):
 - Homebrew publishing is configured but disabled until a `homebrew-tap` repository exists.
 
 [Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.12.0...HEAD
+[0.13.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.9.0...v0.10.0
