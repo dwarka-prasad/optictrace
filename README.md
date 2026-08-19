@@ -1203,24 +1203,33 @@ telemetry:
   store: { driver: sqlite, dsn: shop.db }
 ```
 
-| | Express | FastAPI | Gin / net-http |
-|---|:--:|:--:|:--:|
-| Restriction + redaction | ✅ | ✅ | ✅ |
-| Labels (`header:` `query:`) | ✅ | ✅ | ✅ |
-| Labels (`static:` `path:` `\|regex`) | — | ✅ | ✅ |
-| Labels (`json:` `json_response:`) | — | — | ✅ |
-| Meters | — | ✅ | ✅ |
-| Trace correlation | — | ✅ | ✅ |
-| Application logs | — | ✅ | — |
+| | Express | FastAPI | Java / Servlet | Gin / net-http |
+|---|:--:|:--:|:--:|:--:|
+| Restriction + redaction | ✅ | ✅ | ✅ | ✅ |
+| Query-param redaction | ✅ | ✅ | ✅ | ✅ |
+| Labels — all six sources, `\|regex` capture | ✅ | ✅ | ✅ | ✅ |
+| Meters | ✅ | ✅ | ✅ | ✅ |
+| Trace correlation | ✅ | ✅ | ✅ | ✅ |
+| Tail-based `keep_errors` / `keep_slower_than` | ✅ | — | ✅ | ✅ |
+| Application logs | ✅ | ✅ | ✅ | ✅ |
 
-<sub>Gin and net/http route through the same Go interceptor as the proxy, so they
-inherit everything it does. Express is a separate implementation and is behind.</sub>
+<sub>Gin and net/http route through the same Go interceptor as the proxy, so
+they inherit everything it does. Every SDK's suite can assert that a **live
+agent accepts** what it produces — set `OPTIC_AGENT_URL` and run it that way in
+CI, because offline tests cannot catch a record the agent rejects.</sub>
 
 ### Node.js / Express
 
 ```js
 const optictrace = require('@optictrace/express');
 app.use(optictrace({ configPath: 'optic.yaml', agentUrl: 'http://localhost:9095' }));
+
+// Your logs, filed under the request that wrote them
+const logs = new optictrace.LogShipper('http://localhost:9095', 'checkout');
+logs.info('order received', { sku: 'SKU-100' });
+
+// Calls this service makes downstream
+await fetch(url, { headers: optictrace.outboundHeaders() });
 ```
 
 ### Python / FastAPI
@@ -1245,6 +1254,25 @@ await client.get(url, headers=outbound_headers())
 FastAPI application built on this — real HTTP calls between services, logs
 correlated per span, and a 25-assertion verification suite.
 
+### Java / Jakarta Servlet
+
+Spring Boot 3, Quarkus, Jetty, Tomcat — anything on Jakarta Servlet 5+.
+
+```java
+@Bean
+FilterRegistrationBean<OpticTraceFilter> optictrace() throws IOException {
+    return new FilterRegistrationBean<>(
+        new OpticTraceFilter("optic.yaml", "http://localhost:9095", "checkout"));
+}
+
+// Your logs, filed under the request that wrote them
+Logger.getLogger("").addHandler(
+    new OpticTraceLogHandler("http://localhost:9095", "checkout"));
+
+// Calls this service makes downstream
+TraceContext.outboundHeaders().forEach(builder::header);
+```
+
 ### Go / net-http + Gin
 
 ```go
@@ -1254,7 +1282,18 @@ agent.ServeAdmin("ui/out")                            // metrics + dashboard on 
 
 http.ListenAndServe(":8080", agent.Middleware(mux))   // net/http
 r.Use(optictracegin.Middleware(agent))                // Gin
+
+// slog, correlated to the request being served
+logger := slog.New(optictrace.NewLogHandler("http://localhost:9095", "checkout", nil))
+logger.InfoContext(ctx, "charge captured", "amount", 129.0)
+
+// and the headers for a downstream call
+for k, v := range optictrace.OutboundHeaders(ctx) { req.Header.Set(k, v) }
 ```
+
+<sub>Use slog's `...Context` variants: plain `logger.Info()` passes
+`context.Background()`, which carries no span, so those lines arrive as orphans
+the agent drops by default.</sub>
 
 ---
 
