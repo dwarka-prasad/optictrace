@@ -40,6 +40,10 @@ cd sdks/express && npm install && npm test
 cd sdks/fastapi && python3 test_middleware.py
 cd sdks/gin && go test ./...
 
+# Java (needs Maven, or javac + the jars on the classpath — see sdks/java/README)
+cd sdks/java && mvn compile exec:java \
+  -Dexec.mainClass=io.github.dwarkaprasad.optictrace.SelfTest
+
 # The example applications — each starts a real stack and asserts against it
 cd examples/python-shop  && ./run.sh && .venv/bin/python verify.py   # 25 checks
 cd examples/lead-pipeline && ./run.sh && python3 verify.py           # 19 checks
@@ -48,7 +52,14 @@ cd examples/lead-pipeline && ./run.sh && python3 verify.py           # 19 checks
 The examples are where end-to-end claims get checked. `sdks/fastapi` shipped for
 weeks delivering **zero** records — its timestamps were rejected by the agent and
 the failure was swallowed — because nothing ran the SDK against a live agent.
-If you change an SDK, run its example.
+If you change an SDK, run its example — and run its suite with
+`OPTIC_AGENT_URL` pointing at a live agent, which is the only way to catch a
+record the agent rejects.
+
+The four SDKs implement the **same** rule engine and must agree on what a rule
+means. A source one of them cannot resolve returns an empty value, never a
+guessed one: the same optic.yaml producing different Prometheus series
+depending on which runtime served the request is worse than a missing label.
 
 ### The traffic fixture
 

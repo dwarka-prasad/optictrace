@@ -436,7 +436,7 @@
     <div class="stats">
       <div class="stat"><b>+0.22 µs</b><span>added latency, restricted route</span></div>
       <div class="stat"><b>13</b><span>CLI commands</span></div>
-      <div class="stat"><b>3</b><span>framework SDKs</span></div>
+      <div class="stat"><b>4</b><span>framework SDKs, one engine</span></div>
       <div class="stat"><b>0</b><span>CGO dependencies</span></div>
     </div>
   </section>
@@ -914,8 +914,15 @@ http.ListenAndServe(<span class="s">":8080"</span>, agent.<span class="k">Middle
 <span class="c"># your ordinary logging, filed under the request that wrote it</span>
 logging.getLogger().addHandler(
     <span class="k">OpticTraceLogHandler</span>(<span class="s">"http://localhost:9095"</span>))</pre>
+        <div class="code-label" style="margin-top:1.4rem">Java · Spring Boot, Quarkus, Jetty</div>
+<pre><span class="k">new</span> OpticTraceFilter(
+    <span class="s">"optic.yaml"</span>, <span class="s">"http://localhost:9095"</span>, <span class="s">"checkout"</span>);
+
+Logger.getLogger(<span class="s">""</span>).addHandler(
+    <span class="k">new</span> OpticTraceLogHandler(agentUrl, <span class="s">"checkout"</span>));</pre>
         <ul class="ticks">
           <li>SDKs apply governance <strong>in-process</strong> — raw payloads never cross a process boundary</li>
+          <li>All four evaluate the <strong>same rule engine</strong>: the same optic.yaml producing different series depending on which runtime served the request would be worse than no telemetry, so parity is asserted by each SDK's suite against a live agent</li>
           <li>With no <code>listen</code> and no <code>upstream</code> the agent runs in <strong>collector mode</strong>: store, metrics and dashboard, no proxy in the request path</li>
           <li>SQLite for a sidecar, Postgres when several agents share history</li>
           <li>Export to files, webhooks, OpenTelemetry, or your own executable</li>

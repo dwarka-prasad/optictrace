@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 `0.7.0` is the first public release and contains all of that work.
 
-## [Unreleased]
+## [0.10.0] — 2026-08-19
 
 ### Added
 
@@ -259,7 +259,8 @@ Measured with `make bench` (12th Gen Intel i5-1235U, Go 1.25):
 - Control-plane authentication is available but **off by default**.
 - Homebrew publishing is configured but disabled until a `homebrew-tap` repository exists.
 
-[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.8.2...v0.9.0
 [0.8.2]: https://github.com/dwarka-prasad/optictrace/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/dwarka-prasad/optictrace/compare/v0.8.0...v0.8.1
