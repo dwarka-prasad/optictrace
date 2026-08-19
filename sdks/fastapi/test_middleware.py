@@ -36,6 +36,8 @@ rules:
       json_fields: ["$.**.card.number"]
     labels:
       tenant: "header:X-Tenant-ID"
+      partner: "json:$.**.source"
+      outcome: "json_response:$.ok"
 """
 
 # --- engine parity checks ----------------------------------------------------
@@ -116,7 +118,7 @@ async def main():
     sent = await call(
         mw, "POST", "/payments/charge",
         {"content-type": "application/json", "authorization": "Bearer tok", "x-tenant-id": "acme"},
-        json.dumps({"card": {"number": "4111111111111111"}, "amount": 5}).encode(),
+        json.dumps({"source": "flipkart", "card": {"number": "4111111111111111"}, "amount": 5}).encode(),
     )
     resp_body = json.loads(sent[-1]["body"])
     assert resp_body["echo"]["card"]["number"] == "4111111111111111", "traffic must not be mutated"
@@ -134,6 +136,10 @@ async def main():
     assert REDACTED in pay_str
     assert pay["request_headers"]["authorization"] == REDACTED
     assert pay["labels"]["tenant"] == "acme"
+    # json: / json_response: — the last parity gap in this SDK.
+    assert pay["labels"]["partner"] == "flipkart", pay["labels"]
+    assert pay["labels"]["outcome"] == "true", pay["labels"]
+    assert "4111111111111111" not in json.dumps(pay["labels"]), "a label leaked a masked value"
     assert pay["matched_rules"] == ["redact-payments"]
 
     auth_str = json.dumps(auth)
