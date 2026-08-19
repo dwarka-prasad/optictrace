@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,4 +86,58 @@ func TestCanonicalHeaderNamesKeepsFirstOnCollision(t *testing.T) {
 	if canonicalHeaderNames(nil) != nil {
 		t.Error("nil must stay nil, so an absent header map is not stored as an empty one")
 	}
+}
+
+// A driver that cannot list traces must say so plainly and name itself. The
+// dashboard hides the tab on a 501; a 500 would show an error banner for a
+// feature the operator never asked for.
+func TestTracesEndpointDegradesOnADriverWithoutTraceSupport(t *testing.T) {
+	s := &Server{Reader: readerWithoutTraces{}, HealthOpen: true, Version: "test"}
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/traces?window=1h", nil))
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status %d, want 501: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "readerWithoutTraces") {
+		t.Errorf("the message must name the driver that could not do it, got %s", rec.Body.String())
+	}
+}
+
+func TestTracesEndpointPassesFiltersThrough(t *testing.T) {
+	fake := &traceReader{}
+	s := &Server{Reader: fake, HealthOpen: true, Version: "test"}
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET",
+		"/api/traces?window=15m&errors=1&service=shop&q=orders&label.tenant=acme&limit=7&offset=14", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	got := fake.last
+	if !got.ErrorsOnly || got.Service != "shop" || got.Search != "orders" ||
+		got.Labels["tenant"] != "acme" || got.Limit != 7 || got.Offset != 14 {
+		t.Errorf("filters lost on the way to the store: %+v", got)
+	}
+	if d := time.Since(got.Since); d < 14*time.Minute || d > 16*time.Minute {
+		t.Errorf("window resolved to %v ago, want ~15m", d)
+	}
+	// An oversized limit must be clamped, not passed on: the page size is what
+	// stands between a dashboard poll and a full table scan.
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/traces?limit=100000", nil))
+	if fake.last.Limit != 100 {
+		t.Errorf("limit = %d, want it clamped to the default", fake.last.Limit)
+	}
+}
+
+// A reader that implements ext.Store but not ext.TraceStore.
+type readerWithoutTraces struct{ store.LogStore }
+
+type traceReader struct {
+	store.LogStore
+	last store.TraceFilter
+}
+
+func (f *traceReader) Traces(_ context.Context, filter store.TraceFilter) ([]store.TraceSummary, int64, error) {
+	f.last = filter
+	return nil, 0, nil
 }

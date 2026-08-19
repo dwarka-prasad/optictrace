@@ -16,6 +16,8 @@ import {
   fetchAppLogStats,
   fetchRuleStats,
   fetchServices,
+  fillGaps,
+  bucketMillis,
   fetchStats,
   fetchUsage,
   type AppLogSummary,
@@ -70,6 +72,9 @@ export default function Overview() {
     const t = setInterval(load, 5000);
     return () => clearInterval(t);
   }, [load]);
+
+  // Quiet buckets are absent from the API response, not zero — see fillGaps.
+  const series = fillGaps(stats?.series ?? [], bucketMillis(win.bucket));
 
   // Governance coverage: the share of traffic a rule actually applied to.
   // This is the number that distinguishes this tool from an APM, so it belongs
@@ -178,18 +183,18 @@ export default function Overview() {
       <div className="grid gap-4 lg:grid-cols-3">
         <div className="panel p-4 lg:col-span-2">
           <PanelTitle>Request volume &amp; errors</PanelTitle>
-          <TrafficChart series={stats?.series ?? []} />
+          <TrafficChart series={series} />
         </div>
         <div className="panel p-4">
-          <PanelTitle>Succeeded vs failed</PanelTitle>
-          <StatusMixChart series={stats?.series ?? []} />
+          <PanelTitle>Succeeded · rejected · failed</PanelTitle>
+          <StatusMixChart series={series} />
         </div>
       </div>
 
       <div className="grid gap-4 lg:grid-cols-3">
         <div className="panel p-4">
-          <PanelTitle>Average latency</PanelTitle>
-          <LatencyChart series={stats?.series ?? []} />
+          <PanelTitle>Latency · p95 against the average</PanelTitle>
+          <LatencyChart series={series} />
         </div>
 
         <div className="panel p-4">
@@ -222,6 +227,56 @@ export default function Overview() {
           )}
         </div>
       </div>
+
+      {/* What the policy actually did to this window.
+          Every other number on this page would look identical whether the
+          sampling rules were working or matching nothing at all. */}
+      {stats && stats.total > 0 && stats.bodies_kept > 0 && (
+        <div className="panel p-4">
+          <PanelTitle>
+            <span className="flex items-center gap-2">
+              <ShieldCheck className="h-3.5 w-3.5" /> Capture &amp; sampling
+            </span>
+          </PanelTitle>
+          <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
+            <div>
+              <div className="mb-1.5 flex items-baseline justify-between text-xs">
+                <span className="text-[var(--muted)]">bodies stored</span>
+                <span className="tabular-nums">
+                  {fmtCount(stats.bodies_kept)} of {fmtCount(stats.total)} records
+                </span>
+              </div>
+              <div className="h-2 overflow-hidden rounded-full bg-[var(--border)]/60">
+                <div
+                  className="h-full rounded-full bg-[var(--accent)]"
+                  style={{ width: `${Math.min(100, (stats.bodies_kept / stats.total) * 100)}%` }}
+                />
+              </div>
+              <p className="mt-2 text-[11px] text-[var(--muted)]">
+                {stats.bodies_kept >= stats.total ? (
+                  <>
+                    Every body is being kept. Sampling a hot read path is what stops the store
+                    growing faster than anyone reads it.
+                  </>
+                ) : (
+                  <>
+                    Sampling dropped{' '}
+                    <strong className="text-[var(--text)]">
+                      {Math.round((1 - stats.bodies_kept / stats.total) * 100)}%
+                    </strong>{' '}
+                    of bodies. Every request is still counted — a record is always written, and
+                    only the payload is sampled, so no percentile or total moves.
+                  </>
+                )}
+              </p>
+            </div>
+            <div className="grid grid-cols-2 gap-4 sm:w-56">
+              <Metric label="traffic seen" value={fmtBytes(stats.bytes_seen)} />
+              <Metric label="fields masked" value={String(redacting)} />
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* The fleet. Only worth a panel when there is more than one service
           reporting — otherwise it is a table with one row saying nothing. */}
@@ -420,6 +475,15 @@ function toneClass(tone?: 'good' | 'warn' | 'bad') {
 }
 
 const fmtCount = (n: number) => Intl.NumberFormat().format(n);
+
+/** Bytes in the units people actually say them in. Binary steps, because
+ *  that is what every other tool in this space reports. */
+const fmtBytes = (n: number) => {
+  if (!n) return '0 B';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+  return `${(n / 1024 ** i).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+};
 const fmtMs = (ms: number) => (ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${ms.toFixed(1)}ms`);
 
 function classTone(cls: string) {

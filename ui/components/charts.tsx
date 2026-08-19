@@ -57,7 +57,17 @@ export function TrafficChart({ series }: { series: TimeBucket[] }) {
   );
 }
 
+/** Average and p95 together.
+ *
+ *  The average alone was actively misleading: the requests worth investigating
+ *  are in the tail, and a handful of 3s responses inside a minute of 5ms ones
+ *  move the mean by almost nothing. Shown as a pair so the GAP between them is
+ *  the reading — a wide gap means a few requests are having a very different
+ *  experience from the typical one. */
 export function LatencyChart({ series }: { series: TimeBucket[] }) {
+  // A driver that does not compute a per-bucket percentile sends zeros. Drawing
+  // a flat line along the axis would read as "no latency", so drop the series.
+  const hasTail = series.some((b) => (b.p95_latency_ms ?? 0) > 0);
   return (
     <ResponsiveContainer width="100%" height={220}>
       <LineChart data={series} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
@@ -67,9 +77,12 @@ export function LatencyChart({ series }: { series: TimeBucket[] }) {
         <Tooltip
           contentStyle={tooltipStyle}
           labelFormatter={(v) => new Date(v as string).toLocaleString()}
-          formatter={(v) => [`${Number(v).toFixed(2)} ms`, 'avg latency']}
+          formatter={(v, name) => [`${Number(v).toFixed(1)} ms`, name as string]}
         />
-        <Line type="monotone" dataKey="avg_latency_ms" stroke="#34d399" strokeWidth={2} dot={false} isAnimationActive={false} />
+        {hasTail && (
+          <Line type="monotone" dataKey="p95_latency_ms" name="p95" stroke="#fbbf24" strokeWidth={2} dot={false} connectNulls={false} isAnimationActive={false} />
+        )}
+        <Line type="monotone" dataKey="avg_latency_ms" name="average" stroke="#34d399" strokeWidth={2} strokeDasharray="4 3" dot={false} connectNulls={false} isAnimationActive={false} />
       </LineChart>
     </ResponsiveContainer>
   );
@@ -81,12 +94,17 @@ export function LatencyChart({ series }: { series: TimeBucket[] }) {
  *  traffic is failing", and a proportion needs a common baseline. Colour
  *  carries the severity so the shape is readable without the legend. */
 export function StatusMixChart({ series }: { series: TimeBucket[] }) {
-  // The stats series carries total and 5xx; the remainder is everything that
-  // did not fail. Deriving it here keeps the API honest — it reports what it
-  // measured, not a pre-chewed shape for one chart.
+  // The stats series carries the total and each failing class; the remainder
+  // is everything that succeeded. Deriving it here keeps the API honest — it
+  // reports what it measured, not a pre-chewed shape for one chart.
+  //
+  // 4xx sits between: a rejected request is not a healthy one, but it is also
+  // not the service falling over, and stacking them together would turn a
+  // caller sending bad input into an incident.
   const data = series.map((b) => ({
     time: b.time,
-    ok: Math.max(0, b.count - b.errors),
+    ok: Math.max(0, b.count - b.errors - (b.client_errors ?? 0)),
+    rejected: b.client_errors ?? 0,
     errors: b.errors,
   }));
   return (
@@ -97,7 +115,8 @@ export function StatusMixChart({ series }: { series: TimeBucket[] }) {
         <YAxis tick={tickStyle} axisLine={false} tickLine={false} allowDecimals={false} />
         <Tooltip contentStyle={tooltipStyle} labelFormatter={(v) => new Date(v as string).toLocaleString()} />
         <Area type="monotone" dataKey="ok" stackId="1" name="succeeded" stroke="#34d399" fill="#34d399" fillOpacity={0.25} strokeWidth={1.5} isAnimationActive={false} />
-        <Area type="monotone" dataKey="errors" stackId="1" name="failed" stroke="#f87171" fill="#f87171" fillOpacity={0.4} strokeWidth={1.5} isAnimationActive={false} />
+        <Area type="monotone" dataKey="rejected" stackId="1" name="rejected (4xx)" stroke="#fbbf24" fill="#fbbf24" fillOpacity={0.3} strokeWidth={1.5} isAnimationActive={false} />
+        <Area type="monotone" dataKey="errors" stackId="1" name="failed (5xx)" stroke="#f87171" fill="#f87171" fillOpacity={0.4} strokeWidth={1.5} isAnimationActive={false} />
       </AreaChart>
     </ResponsiveContainer>
   );

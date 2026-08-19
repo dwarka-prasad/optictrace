@@ -2,13 +2,18 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Activity, Coins, Eye, FileCode2, Route, ScrollText, Server, ShieldCheck, Gauge } from 'lucide-react';
+import { Activity, Coins, Eye, FileCode2, GitBranch, Route, ScrollText, Server, ShieldCheck, Gauge, Terminal } from 'lucide-react';
 import { API_BASE } from '@/lib/api';
 
 const links = [
   { href: '/', label: 'Overview', icon: Activity },
   { href: '/routes', label: 'Routes', icon: Route },
+  // Traces before Inspector: "what happened to this request" is the question
+  // people arrive with, and the record list is where you go once you know
+  // which hop you want.
+  { href: '/traces', label: 'Traces', icon: GitBranch },
   { href: '/inspector', label: 'Inspector', icon: ScrollText },
+  { href: '/logs', label: 'Logs', icon: Terminal },
   { href: '/usage', label: 'Usage', icon: Coins },
   { href: '/governance', label: 'Governance', icon: ShieldCheck },
   { href: '/config', label: 'Config', icon: FileCode2 },

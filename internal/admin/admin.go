@@ -27,6 +27,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -120,6 +121,10 @@ func (s *Server) Handler() http.Handler {
 	routeFunc("GET /api/routes", ext.CapReadStats, s.routes)
 	routeFunc("GET /api/rules/stats", ext.CapReadStats, s.ruleStats)
 	routeFunc("GET /api/services", ext.CapReadStats, s.services)
+	// Trace summaries are aggregates — counts, routes, timings, and the root
+	// hop's labels. No captured payload, so this sits with the stats grant;
+	// reading a trace's bodies still means /api/logs and CapReadPayload.
+	routeFunc("GET /api/traces", ext.CapReadStats, s.traces)
 	routeFunc("GET /api/system", ext.CapReadStats, s.system)
 	routeFunc("GET /api/usage", ext.CapReadStats, s.usage)
 
@@ -926,19 +931,27 @@ func filterFromQuery(r *http.Request) store.Filter {
 	if tid := r.URL.Query().Get("trace"); tid != "" {
 		f.TraceID = tid
 	}
-	// label.<name>=<value> selects by tag: the multi-tenant question, "show me
-	// only this tenant's calls". Values are matched literally by every driver.
-	for key, vals := range r.URL.Query() {
+	f.Labels = labelFilters(r.URL.Query())
+	return f
+}
+
+// labelFilters reads label.<name>=<value> params: the multi-tenant question,
+// "show me only this tenant's calls". Values are matched literally by every
+// driver. Returns nil when none are present, so a filter map is never created
+// just to be empty.
+func labelFilters(q url.Values) map[string]string {
+	var out map[string]string
+	for key, vals := range q {
 		name, ok := strings.CutPrefix(key, "label.")
 		if !ok || name == "" || len(vals) == 0 || vals[0] == "" {
 			continue
 		}
-		if f.Labels == nil {
-			f.Labels = map[string]string{}
+		if out == nil {
+			out = map[string]string{}
 		}
-		f.Labels[name] = vals[0]
+		out[name] = vals[0]
 	}
-	return f
+	return out
 }
 
 func parseDurationDefault(s string, def time.Duration) time.Duration {
@@ -1107,6 +1120,46 @@ func (s *Server) queryAppLogs(w http.ResponseWriter, r *http.Request) {
 		lines = []store.AppLog{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"lines": lines, "total": total})
+}
+
+// traces lists recent traces, rolled up one row each.
+//
+// The capability is resolved by type assertion on the reader rather than from
+// a field on Server: a driver that cannot list traces is still a valid driver,
+// and a field would have to be remembered at every construction site — which
+// is exactly how the embedded AdminHandler ended up without app logs.
+func (s *Server) traces(w http.ResponseWriter, r *http.Request) {
+	ts, ok := s.Reader.(store.TraceStore)
+	if !ok {
+		// Not an error: correlation still works without a list. Say which
+		// driver could not do it, because "traces: unsupported" with no
+		// subject sends people to read the source.
+		httpError(w, http.StatusNotImplemented,
+			fmt.Sprintf("this store driver (%T) cannot list traces; every record still carries its trace id", s.Reader))
+		return
+	}
+	q := r.URL.Query()
+	f := store.TraceFilter{
+		Since:      time.Now().Add(-parseDurationDefault(q.Get("window"), time.Hour)),
+		ErrorsOnly: q.Get("errors") == "1" || q.Get("errors") == "true",
+		Service:    q.Get("service"),
+		Search:     q.Get("q"),
+		Labels:     labelFilters(q),
+	}
+	f.Limit, _ = strconv.Atoi(q.Get("limit"))
+	f.Offset, _ = strconv.Atoi(q.Get("offset"))
+	if f.Limit <= 0 || f.Limit > 500 {
+		f.Limit = 100
+	}
+	traces, total, err := ts.Traces(r.Context(), f)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if traces == nil {
+		traces = []store.TraceSummary{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"traces": traces, "total": total})
 }
 
 // analysisRows is the row bound for the analysis endpoints, resolved. App logs

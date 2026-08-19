@@ -31,6 +31,12 @@ type (
 	AppLogFilter  = ext.AppLogFilter
 	AppLogStore   = ext.AppLogStore
 	AppLogSummary = ext.AppLogSummary
+	// TraceSummary rolls every hop of one request into a row. TraceStore is
+	// OPTIONAL for the same reason AppLogStore is: Store is implemented
+	// outside this module, so it cannot grow methods.
+	TraceSummary = ext.TraceSummary
+	TraceFilter  = ext.TraceFilter
+	TraceStore   = ext.TraceStore
 )
 
 const (

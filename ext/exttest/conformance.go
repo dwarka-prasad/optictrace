@@ -78,6 +78,120 @@ func RunStoreSuite(t *testing.T, open OpenFunc) {
 	// own tests.
 	t.Run("app_logs", func(t *testing.T) { testAppLogs(t, open) })
 	t.Run("app_logs_erasure", func(t *testing.T) { testAppLogErasure(t, open) })
+
+	// Trace listing is OPTIONAL in the same way, and skips for a driver that
+	// does not implement ext.TraceStore.
+	t.Run("traces", func(t *testing.T) { testTraces(t, open) })
+}
+
+// traceStore returns the driver's trace side, or skips the sub-test.
+func traceStore(t *testing.T, s ext.Store) ext.TraceStore {
+	t.Helper()
+	ts, ok := s.(ext.TraceStore)
+	if !ok {
+		t.Skip("driver does not implement ext.TraceStore (optional)")
+	}
+	return ts
+}
+
+// A trace list is a different question from a record list, and every driver
+// must answer it the same way: one row per trace, named by the entry hop,
+// carrying inner failures the root status hides.
+func testTraces(t *testing.T, open OpenFunc) {
+	ctx := context.Background()
+	s := open(t)
+	ts := traceStore(t, s)
+
+	base := time.Now().Add(-time.Minute)
+	hop := func(at time.Time, trace, span, parent, svc, method, route string, status int, dur float64, tenant string) {
+		t.Helper()
+		r := Record(status, dur, route, tenant)
+		r.Time, r.Route, r.Method, r.Service = at, route, method, svc
+		r.TraceID, r.SpanID, r.ParentSpanID = trace, span, parent
+		mustSave(t, s, r)
+	}
+	// One checkout: three hops, two services, an inner 5xx the root hides.
+	hop(base, "t1", "root", "", "shop", "POST", "/api/v1/orders", 201, 120, "acme")
+	hop(base.Add(10*time.Millisecond), "t1", "cat", "root", "shop", "GET", "/api/v1/catalog/**", 200, 12, "acme")
+	hop(base.Add(30*time.Millisecond), "t1", "pay", "root", "payments", "POST", "/api/v1/payments/**", 502, 40, "acme")
+	// A second, clean trace belonging to another tenant.
+	hop(base.Add(time.Second), "t2", "r2", "", "shop", "GET", "/api/v1/health", 200, 2, "globex")
+
+	all, total, err := ts.Traces(ctx, ext.TraceFilter{Since: base.Add(-time.Hour)})
+	if err != nil {
+		t.Fatalf("traces: %v", err)
+	}
+	if total != 2 || len(all) != 2 {
+		t.Fatalf("want 2 traces, got %d rows / total %d", len(all), total)
+	}
+	if all[0].TraceID != "t2" {
+		t.Errorf("traces must come back newest-first, got %s then %s", all[0].TraceID, all[1].TraceID)
+	}
+	byID := map[string]ext.TraceSummary{}
+	for _, tr := range all {
+		byID[tr.TraceID] = tr
+	}
+	t1 := byID["t1"]
+	if t1.Route != "/api/v1/orders" || t1.Method != "POST" || t1.Status != 201 {
+		t.Errorf("root hop = %s %s %d, want POST /api/v1/orders 201", t1.Method, t1.Route, t1.Status)
+	}
+	if t1.Spans != 3 || t1.Services != 2 {
+		t.Errorf("spans=%d services=%d, want 3 and 2", t1.Spans, t1.Services)
+	}
+	if t1.Errors != 1 {
+		t.Errorf("errors=%d, want the inner 502 counted — the root's 201 hides it", t1.Errors)
+	}
+	if t1.DurationMS != 120 {
+		t.Errorf("duration=%v, want the ROOT's 120ms; concurrent hops do not sum to a wall clock", t1.DurationMS)
+	}
+	if t1.Labels["tenant"] != "acme" {
+		t.Errorf("root labels not carried: %v", t1.Labels)
+	}
+	// ext.Record.Time is when a hop FINISHED, so a trace begins one duration
+	// before its earliest record. Reading Time as the start puts the root —
+	// the last hop to finish — after the children it called, and every
+	// waterfall drawn from it is wrong.
+	rootFinished := base.Add(120 * time.Millisecond)
+	if t1.End.Before(t1.Start) {
+		t.Errorf("end %v precedes start %v", t1.End, t1.Start)
+	}
+	if !t1.Start.Before(base.Add(-100 * time.Millisecond)) {
+		t.Errorf("start = %v, want ~120ms before the root's recorded time (%v): "+
+			"the root began before the children it called", t1.Start, base)
+	}
+	if t1.End.Before(rootFinished.Add(-time.Second)) {
+		t.Errorf("end = %v, want at or after the last hop's completion", t1.End)
+	}
+	if d := t1.End.Sub(t1.Start); d < 120*time.Millisecond {
+		t.Errorf("wall clock = %v, want at least the root's own 120ms", d)
+	}
+
+	errsOnly, n, err := ts.Traces(ctx, ext.TraceFilter{Since: base.Add(-time.Hour), ErrorsOnly: true})
+	if err != nil {
+		t.Fatalf("traces: %v", err)
+	}
+	if n != 1 || len(errsOnly) != 1 || errsOnly[0].TraceID != "t1" {
+		t.Errorf("errors-only = %v (total %d), want just t1 — filtering on the ROOT status would return none",
+			errsOnly, n)
+	}
+
+	tenant, n, err := ts.Traces(ctx, ext.TraceFilter{
+		Since: base.Add(-time.Hour), Labels: map[string]string{"tenant": "globex"}})
+	if err != nil {
+		t.Fatalf("traces: %v", err)
+	}
+	if n != 1 || len(tenant) != 1 || tenant[0].TraceID != "t2" {
+		t.Errorf("tenant filter = %v (total %d), want just t2", tenant, n)
+	}
+
+	// The pager's total must be one the pages can actually produce.
+	page, n, err := ts.Traces(ctx, ext.TraceFilter{Since: base.Add(-time.Hour), Limit: 1, Offset: 1})
+	if err != nil {
+		t.Fatalf("traces: %v", err)
+	}
+	if n != 2 || len(page) != 1 || page[0].TraceID != "t1" {
+		t.Errorf("page 2 = %v (total %d), want t1 with a total of 2", page, n)
+	}
 }
 
 // appLogStore returns the driver's app-log side, or skips the sub-test.
@@ -633,6 +747,28 @@ func testStats(t *testing.T, open OpenFunc) {
 	}
 	if len(st.Series) == 0 || len(st.TopRoutes) == 0 {
 		t.Error("Stats must populate the time series and top routes")
+	}
+	// Every fixture record carries a request body, so a driver that reports
+	// none is not computing the figure the sampling panel reads.
+	if st.BodiesKept != 100 {
+		t.Errorf("bodies kept = %d of 100 stored bodies", st.BodiesKept)
+	}
+	if st.BytesSeen != 100*(12+34) {
+		t.Errorf("bytes seen = %d, want %d", st.BytesSeen, 100*(12+34))
+	}
+	var counted, tailed int64
+	for _, b := range st.Series {
+		counted += b.Count + 0
+		if b.P95Latency > 0 {
+			tailed++
+		}
+		if b.ClientErrors != 0 {
+			t.Errorf("bucket reports %d 4xx, but the fixture has none — 5xx must not be double-counted",
+				b.ClientErrors)
+		}
+	}
+	if tailed == 0 {
+		t.Error("no bucket carries a p95: an average alone hides the requests worth looking at")
 	}
 
 	routes, err := s.RouteStats(ctx, time.Now().Add(-time.Hour))

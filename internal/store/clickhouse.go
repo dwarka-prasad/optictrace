@@ -333,12 +333,21 @@ func (s *ClickHouseStore) Stats(ctx context.Context, since time.Time, bucket tim
 	}
 	rows.Close()
 
+	// What governance did to the window: see the note on Stats.BodiesKept.
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT countIf(req_body <> '' OR resp_body <> ''), sum(req_bytes + resp_bytes)
+		FROM logs WHERE ts >= ?`, sinceMs).Scan(&st.BodiesKept, &st.BytesSeen); err != nil {
+		return nil, err
+	}
+
 	bms := bucket.Milliseconds()
 	if bms <= 0 {
 		bms = 60_000
 	}
 	rows, err = s.db.QueryContext(ctx, `
-		SELECT intDiv(ts, ?) * ? AS b, count(), countIf(status >= 500), avg(duration_ms)
+		SELECT intDiv(ts, ?) * ? AS b, count(), countIf(status >= 500),
+		       countIf(status >= 400 AND status < 500), avg(duration_ms),
+		       quantileExactIf(0.95)(duration_ms, stream = 0)
 		FROM logs WHERE ts >= ? GROUP BY b ORDER BY b`, bms, bms, sinceMs)
 	if err != nil {
 		return nil, err
@@ -346,7 +355,7 @@ func (s *ClickHouseStore) Stats(ctx context.Context, since time.Time, bucket tim
 	for rows.Next() {
 		var t int64
 		var b TimeBucket
-		if err := rows.Scan(&t, &b.Count, &b.Errors, &b.AvgLatency); err != nil {
+		if err := rows.Scan(&t, &b.Count, &b.Errors, &b.ClientErrors, &b.AvgLatency, &b.P95Latency); err != nil {
 			rows.Close()
 			return nil, err
 		}

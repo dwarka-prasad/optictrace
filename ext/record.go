@@ -24,7 +24,16 @@ func AnalysisLimit(limit int) int {
 
 // Record is one captured HTTP exchange, post-governance.
 type Record struct {
-	ID      int64     `json:"id"`
+	ID int64 `json:"id"`
+	// Time is when the exchange COMPLETED — the record is written once the
+	// response is known, and every implementation stamps it there.
+	//
+	// Anything that needs the start must subtract DurationMS. A trace
+	// waterfall built on Time directly draws the parent starting after the
+	// children it called, because the parent is the last hop to finish.
+	// Stamping the start instead would have been the friendlier choice, but
+	// changing it now would make old and new rows indistinguishable and
+	// silently corrupt every timeline that spans the change.
 	Time    time.Time `json:"time"`
 	Service string    `json:"service"`
 	Method  string    `json:"method"`
@@ -100,6 +109,14 @@ type TimeBucket struct {
 	Count      int64     `json:"count"`
 	Errors     int64     `json:"errors"` // status >= 500
 	AvgLatency float64   `json:"avg_latency_ms"`
+	// ClientErrors counts 4xx separately. Folding them into Errors would say
+	// the service is failing when a caller is sending bad requests, and the
+	// two need opposite responses.
+	ClientErrors int64 `json:"client_errors"`
+	// P95Latency is the tail within this bucket. An average over a bucket
+	// hides exactly the requests worth looking at: a handful of 3s responses
+	// inside a minute of 5ms ones move the mean by almost nothing.
+	P95Latency float64 `json:"p95_latency_ms"`
 }
 
 // RouteStat aggregates one route's traffic.
@@ -123,6 +140,18 @@ type Stats struct {
 	StatusCounts map[string]int64 `json:"status_counts"` // by class: 2xx, 4xx...
 	Series       []TimeBucket     `json:"series"`
 	TopRoutes    []RouteStat      `json:"top_routes"`
+
+	// BodiesKept is how many records in the window stored a request or
+	// response body. Against Total it is the only honest read on what
+	// sampling is actually doing — a `sample: 0.05` that quietly matches
+	// nothing and a `sample: 1.0` look identical in every other number on the
+	// page. Zero from a driver that does not compute it, so treat 0 as
+	// "unknown" rather than "nothing was kept".
+	BodiesKept int64 `json:"bodies_kept"`
+	// BytesSeen is the request and response bytes that passed through, whether
+	// or not their bodies were stored. Paired with BodiesKept it answers "what
+	// is this costing me to keep".
+	BytesSeen int64 `json:"bytes_seen"`
 }
 
 // RouteDetail extends RouteStat with the percentiles the Routes dashboard

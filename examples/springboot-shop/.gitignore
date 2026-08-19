@@ -3,3 +3,5 @@ target/
 *.db-shm
 *.db-wal
 *.log
+.idea/
+*.iml

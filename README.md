@@ -543,6 +543,7 @@ for a complete workflow. This repo dogfoods it in
 | `GET /api/usage` | Per-consumer usage and cost (`&format=csv`) |
 | `GET /api/scan` | Sensitive values found outside your rules (masked) |
 | `GET /api/services` | Per-service aggregates (fleet view) |
+| `GET /api/traces` | Recent traces, one row each (`?errors=1` / `?service=` / `?q=` / `?label.<k>=`) |
 | `GET /api/spec` | OpenAPI inferred from traffic |
 | `GET /api/export` | CSV or JSONL download of captured records |
 | `GET /api/config` | Current config + validity |
@@ -1355,19 +1356,36 @@ the agent itself — no separate frontend deployment.
 
 | Page | Shows |
 |---|---|
-| **Overview** | Live request volume, error rate, latency charts; top routes with per-route P95 |
+| **Overview** | Golden signals; **p95 drawn against the average**; succeeded/rejected/failed split apart; traffic by tenant; **capture & sampling**; top routes; which rules are firing |
 | **Routes** | Every route with sortable P50/P95/P99, error rates, traffic volume |
+| **Traces** | One row per request however many services it touched, then a **waterfall** on a shared timeline with each hop's log lines under it |
 | **Inspector** | Searchable/filterable exchanges; redacted fields highlighted; CSV/JSONL export |
+| **Logs** | Application log lines across requests — filter by level, service or text; every line links back to the request that wrote it |
 | **Usage** | Per-consumer requests, data, compute, meters and estimated cost |
 | **Governance** | Each rule's actions (restrict/redact/labels/sample/meter) with live match counts |
 | **Config** | View `optic.yaml`, lint edits live against the running agent, trigger hot reload |
 | **System** | Agent health, store size, per-exporter delivery/failure/drop counters |
 
+Two panels answer questions no other page can:
+
+- **Latency shows p95 next to the average**, and the gap is the reading. A mean over a
+  bucket hides the handful of 3s responses that are the actual problem — an incident can
+  triple the p95 while barely moving the average.
+- **Capture & sampling** reports how many records kept a body. It is the only honest check
+  that a sampling rule is doing what you think: a rule sampling at `0.05` that matches
+  nothing looks identical to one at `1.0` in every other number on the page.
+
 <details>
 <summary>More screenshots</summary>
 
-**Overview** — golden signals and top routes
+**Traces** — a failed checkout as a waterfall, with the log lines each hop wrote
+<img src="docs/assets/dashboard-traces.png" width="100%">
+
+**Overview** — golden signals, p95 against the average, and what sampling actually did
 <img src="docs/assets/dashboard-overview.png" width="100%">
+
+**Logs** — application lines across requests, each linking back to its own request
+<img src="docs/assets/dashboard-logs.png" width="100%">
 
 **Routes** — every route with sortable P50/P95/P99
 <img src="docs/assets/dashboard-routes.png" width="100%">
@@ -1383,6 +1401,18 @@ the agent itself — no separate frontend deployment.
 The inspector filters by tag, badges long-lived streams, and reconstructs the
 full request trace for any record — click a hop to jump to it. Usage groups by
 any tag, not just the billing consumer.
+
+The Traces page needs a store driver that can group by trace id — `ext.TraceStore`,
+an **optional** companion to `ext.Store` in the same way `ext.AppLogStore` is. The
+bundled sqlite, postgres and clickhouse drivers all implement it; a third-party driver
+that does not is still a complete driver, and loses the listing rather than correlation
+(every record still carries its trace and span ids, and the Inspector reassembles a
+trace from any hop in it).
+
+One thing worth knowing if you build on the API: **`record.time` is when the exchange
+finished**, not when it started. Subtract `duration_ms` for the start — a waterfall
+built on `time` directly draws the parent beginning after the children it called,
+because the parent is the last hop to finish.
 
 Develop it with `cd ui && npm run dev`. The dev server runs on a different port, so
 add its origin to `telemetry.cors_origins` (e.g. `["http://localhost:3001"]`) — the

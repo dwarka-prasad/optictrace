@@ -1,6 +1,7 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { Suspense, useCallback, useEffect, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { ChevronLeft, ChevronRight, Download, GitBranch, RefreshCw, Search, ShieldCheck, Tag, Terminal, X } from 'lucide-react';
 import {
   exportUrl,
@@ -15,7 +16,17 @@ import { MethodBadge, StatusBadge, StreamBadge } from '@/components/badges';
 
 const PAGE_SIZE = 25;
 
-export default function Inspector() {
+/** useSearchParams needs a Suspense boundary under the app router, and a
+ *  static export renders this page with none of them resolved. */
+export default function InspectorPage() {
+  return (
+    <Suspense fallback={<div className="text-sm text-[var(--muted)]">loading…</div>}>
+      <Inspector />
+    </Suspense>
+  );
+}
+
+function Inspector() {
   const [records, setRecords] = useState<LogRecord[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(0);
@@ -30,6 +41,11 @@ export default function Inspector() {
   // Tag filters. The multi-tenant question — "show me only this partner" —
   // which the API has supported for a while and the UI could not ask.
   const [labels, setLabels] = useState<Record<string, string>>({});
+  // ?trace=<id> arrives from the Traces page: "show me these hops with their
+  // payloads". Read once into state rather than kept in the URL, so clearing
+  // the filter here does not need a navigation.
+  const params = useSearchParams();
+  const [trace, setTrace] = useState(params.get('trace') ?? '');
 
   const load = useCallback(async () => {
     try {
@@ -40,6 +56,7 @@ export default function Inspector() {
         method,
         since,
         labels,
+        trace,
         limit: PAGE_SIZE,
         offset: page * PAGE_SIZE,
         ...statusRange,
@@ -50,7 +67,7 @@ export default function Inspector() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
-  }, [q, method, statusClass, since, labels, page]);
+  }, [q, method, statusClass, since, labels, trace, page]);
 
   useEffect(() => {
     const t = setTimeout(load, 250); // debounce typing
@@ -94,6 +111,21 @@ export default function Inspector() {
           options={[['', 'Any status'], ['200', '2xx'], ['300', '3xx'], ['400', '4xx'], ['500', '5xx']]} />
         <FilterSelect value={since} onChange={(v) => { setSince(v); setPage(0); }}
           options={[['', 'All time'], ['15m', 'Last 15m'], ['1h', 'Last 1h'], ['6h', 'Last 6h'], ['24h', 'Last 24h']]} />
+
+        {trace && (
+          <button
+            onClick={() => {
+              setTrace('');
+              setPage(0);
+            }}
+            title="Stop filtering to this one request"
+            className="flex items-center gap-1 rounded-lg border border-[var(--accent)]/50 bg-[var(--accent)]/10 px-2 py-1 text-xs text-[var(--accent)]"
+          >
+            <GitBranch className="h-3 w-3" />
+            <span className="font-mono">trace {trace.slice(0, 12)}…</span>
+            <X className="h-3 w-3 opacity-70" />
+          </button>
+        )}
 
         {Object.entries(labels).map(([k, v]) => (
           <button
