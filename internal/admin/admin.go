@@ -795,6 +795,16 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	if rec.Route == "" {
 		rec.Route = rec.Path
 	}
+	// Canonicalise header NAMES so a record from an SDK compares equal to one
+	// from the proxy. Go's http.Header is already canonical (Authorization);
+	// an SDK hands over whatever the wire carried, which for HTTP/2 is always
+	// lower case. Without this `optictrace suggest` reports a header its own
+	// rule already masks, because the coverage lookup is keyed on the
+	// canonical name — advice to add a rule you already have is worse than no
+	// advice. Names only: the values were governed in-process and are not
+	// touched here.
+	rec.RequestHeaders = canonicalHeaderNames(rec.RequestHeaders)
+	rec.ResponseHeaders = canonicalHeaderNames(rec.ResponseHeaders)
 	if s.Collector != nil {
 		s.Collector.SDKIngested()
 		s.Collector.Observe(metrics.Observation{
@@ -815,6 +825,24 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 		s.Dispatcher.Enqueue(&rec)
 	}
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// canonicalHeaderNames rewrites map keys to http.Header's canonical form.
+// On a collision the value already stored wins, so a record carrying both
+// "authorization" and "Authorization" cannot have a masked value replaced by
+// an unmasked one through map iteration order.
+func canonicalHeaderNames(h map[string]string) map[string]string {
+	if h == nil {
+		return nil
+	}
+	out := make(map[string]string, len(h))
+	for name, val := range h {
+		k := http.CanonicalHeaderKey(name)
+		if _, exists := out[k]; !exists {
+			out[k] = val
+		}
+	}
+	return out
 }
 
 // ui serves the embedded dashboard build when present, falling back to a

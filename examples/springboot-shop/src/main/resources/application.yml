@@ -1,0 +1,15 @@
+server:
+  port: 8080
+
+logging:
+  level:
+    com.example.shop: DEBUG
+  pattern:
+    console: "%d{HH:mm:ss} %-5level %logger{20} - %msg%n"
+
+optictrace:
+  # Where the agent's admin API listens. The agent runs in collector mode: it
+  # proxies nothing, because the SDK is already in the request path.
+  agent: http://127.0.0.1:9095
+  config: optic.yaml
+  service: shop-api

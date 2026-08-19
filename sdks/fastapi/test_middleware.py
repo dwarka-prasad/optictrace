@@ -12,12 +12,15 @@ import tempfile
 from optictrace_fastapi import OpticTraceMiddleware
 from optictrace_fastapi.engine import Engine, redact_path, match_segments, split_path, REDACTED
 
+import re
 import yaml
 
 CONFIG = """
 version: 1
 service:
   name: fastapi-test
+  trace:
+    response_header: X-Trace-Id
 rules:
   - name: meter-ai
     match:
@@ -135,6 +138,15 @@ async def main():
     )
     resp_body = json.loads(sent[-1]["body"])
     assert resp_body["echo"]["card"]["number"] == "4111111111111111", "traffic must not be mutated"
+
+    # The only thread from a customer's screenshot back to the record. The Go
+    # proxy has always echoed it; the SDKs silently ignored the setting until a
+    # real app was pointed at one. In ASGI it has to ride on the
+    # http.response.start message — there is no later point to add a header.
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    echoed = dict(start["headers"]).get(b"x-trace-id", b"").decode()
+    assert re.fullmatch(r"[0-9a-f]{32}", echoed), f"trace id not echoed to the caller: {echoed!r}"
+    assert emitted[-1]["trace_id"] == echoed, "echoed header names a different trace than the record"
 
     await call(mw, "POST", "/auth/login",
                {"content-type": "application/json"}, json.dumps({"password": "hunter2"}).encode())

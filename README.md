@@ -964,6 +964,13 @@ service:
     response_header: X-Trace-Id   # off by default — returns the id to the caller
 ```
 
+`response_header` is honoured by the proxy **and by every SDK**, which is what
+makes a support conversation start from the customer's screenshot rather than
+from "roughly what time was that?" — a question that, under concurrent traffic,
+identifies the wrong request. The SDKs set it before the handler writes its
+first byte, because a header added after the response is committed is silently
+discarded.
+
 A malformed `traceparent` starts a fresh trace rather than failing anything:
 losing correlation is a nuisance, failing a request over a bad header would be
 a fault.

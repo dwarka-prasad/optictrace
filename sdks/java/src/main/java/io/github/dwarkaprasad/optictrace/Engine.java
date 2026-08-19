@@ -26,6 +26,7 @@ public final class Engine {
     public static final String REDACTED = "[REDACTED]";
 
     private final String serviceName;
+    private final String traceResponseHeader;
     private final boolean defaultRequestBody;
     private final boolean defaultResponseBody;
     private final boolean defaultHeaders;
@@ -40,6 +41,7 @@ public final class Engine {
         }
         Map<String, Object> service = map(cfg.get("service"));
         this.serviceName = str(service.get("name"), "");
+        this.traceResponseHeader = str(map(service.get("trace")).get("response_header"), "");
 
         Map<String, Object> defaults = map(cfg.get("defaults"));
         Map<String, Object> capture = map(defaults.get("capture"));
@@ -57,6 +59,17 @@ public final class Engine {
 
     public String serviceName() {
         return serviceName;
+    }
+
+    /**
+     * Header to echo the trace id back to the caller on, or "" for none.
+     *
+     * <p>This is the only thread from a customer's screenshot back to the
+     * record. Without it a support conversation starts at "roughly what time?",
+     * which under concurrency identifies the wrong request.
+     */
+    public String traceResponseHeader() {
+        return traceResponseHeader;
     }
 
     /** Evaluate every rule against a request. Later rules win on capture flags; redactions, labels and meters accumulate. */
