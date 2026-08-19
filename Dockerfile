@@ -4,22 +4,39 @@
 #   Stage 1: build the Next.js dashboard (static export)
 #   Stage 2: build the Go agent (pure Go, CGO disabled — modernc SQLite)
 #   Stage 3: minimal runtime image
+#
+# Both build stages are pinned to $BUILDPLATFORM and cross-compile to
+# $TARGETARCH. Without those pins, buildx builds every stage once per target
+# platform — so a `--platform linux/amd64,linux/arm64` build ran the whole
+# Next.js compile a second time under QEMU emulation, which took this from
+# minutes to the better part of an hour and eventually never finished at all.
+#
+# Nothing here needs emulation: the dashboard is a static export and is
+# architecture-independent, and the agent is pure Go with CGO off, so GOARCH is
+# all it takes to target another architecture.
 # ============================================================================
 
-FROM node:22-alpine AS ui
+FROM --platform=$BUILDPLATFORM node:22-alpine AS ui
 WORKDIR /src/ui
 COPY ui/package.json ui/package-lock.json* ./
-RUN npm install --no-audit --no-fund
+# `npm ci` when a lockfile is present: an image build must be reproducible, and
+# `npm install` is free to resolve a different tree than the one that was tested.
+RUN if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; \
+    else npm install --no-audit --no-fund; fi
 COPY ui/ .
-RUN npm run build   # -> /src/ui/out
+RUN npm run build   # -> /src/ui/out (static, architecture-independent)
 
-FROM golang:1.25-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 ARG VERSION=docker
-RUN CGO_ENABLED=0 go build -trimpath \
+# Supplied by buildx for each requested platform.
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -trimpath \
       -ldflags "-s -w -X main.version=${VERSION}" \
       -o /out/optictrace ./cmd/optictrace
 
