@@ -87,5 +87,16 @@ nothing ever asked one. Run it that way in CI.
 that already has one gets the filter loaded by a different classloader than the
 one serving requests.
 
-For `javax.servlet` (Spring Boot 2, Tomcat 9), change the import and dependency
-— the rest of the code is unchanged.
+### Spring Boot 2 / Tomcat 9 (`javax.servlet`)
+
+```bash
+./scripts/gen-javax.sh          # -> target/javax-src
+```
+
+The two servlet APIs differ only in package name for everything this SDK
+touches, so the javax variant is **generated** rather than kept as a second
+copy. Two copies of the same engine drift, and the copy nobody runs is the one
+that drifts. The script fails if a `jakarta.` reference survives the rewrite —
+that would mean a new API surface it does not know about — and CI compiles *and
+runs* the generated variant against `javax.servlet-api:4.0.1`, so it is tested
+rather than assumed.

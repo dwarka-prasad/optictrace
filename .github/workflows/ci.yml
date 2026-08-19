@@ -113,6 +113,19 @@ jobs:
           mvn -q -B compile
           javac -d target/test-classes -cp "target/classes:$(cat cp.txt)"             src/test/java/io/github/dwarkaprasad/optictrace/SelfTest.java
           java -cp "target/classes:target/test-classes:$(cat cp.txt)"             io.github.dwarkaprasad.optictrace.SelfTest
+      - name: Java SDK tests (javax variant)
+        working-directory: sdks/java
+        # The javax variant is GENERATED from the jakarta sources, so it has to
+        # be RUN and not merely compiled — a generated copy nobody executes is
+        # the copy that breaks.
+        run: |
+          ./scripts/gen-javax.sh target/javax-src
+          mvn -q -B dependency:get -Dartifact=javax.servlet:javax.servlet-api:4.0.1
+          JAVAX=$(find ~/.m2 -name 'javax.servlet-api-4.0.1.jar' | head -1)
+          CP="$(tr ':' '\n' < cp.txt | grep -v 'jakarta.servlet' | paste -sd:):$JAVAX"
+          mkdir -p target/javax-classes
+          javac -d target/javax-classes -cp "$CP" target/javax-src/io/github/dwarkaprasad/optictrace/*.java
+          java -cp "target/javax-classes:$CP" io.github.dwarkaprasad.optictrace.SelfTest
 
   assets:
     runs-on: ubuntu-latest

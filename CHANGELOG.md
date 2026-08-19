@@ -12,6 +12,16 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 ### Added
 
+- **Collect the logs an application already writes.** `optictrace run -exec "python app.py"` captures a child process's stdout and stderr, and `telemetry.app_logs.sources` tails files with rotation followed. Ingestion previously required every service to POST its lines, which means touching code in the services whose logs you most want — usually the ones nobody wants to modify.
+
+  Collected output is echoed through untouched: collecting a service's logs must not stop them reaching wherever its operators already read them, and this process does not get to rewrite another program's output stream. Tailing starts at the END of an existing file, because replaying a large log on every restart floods the store with history nobody asked for and retention then discards the recent lines that were actually wanted. A text source with no `span_pattern` warns at startup, since every one of its lines would be dropped as an orphan.
+
+- **Per-rule log policy.** A `logs:` block on a rule tightens `telemetry.app_logs` for the routes it matches — a stricter level floor, a lower line cap, extra redaction, or `drop: true`. It can only ever tighten, which is precisely what makes it safe to resolve from a route the producer reports without verifying it: the worst a lying or silent client can do is land on the global floor. `logs:` with the feature disabled is now a config error rather than dead config.
+
+- **`optictrace review` reads application log lines**, the way `scan` already did, and prints how many — "no leaks" over zero lines means something very different from no leaks over forty thousand.
+
+- **A generated `javax.servlet` variant of the Java SDK** for Spring Boot 2 and Tomcat 9. Generated rather than maintained as a second copy, because two copies of the same engine drift and the copy nobody runs is the one that drifts; CI compiles *and runs* the full suite against it.
+
 - **Postgres and ClickHouse store application logs.** Previously SQLite only, so the feature was unavailable on exactly the multi-node deployments most likely to want it. Both implement the full `ext.AppLogStore` and both erase log lines together with the records a `purge` removes — ClickHouse deletes the lines first, because it has no transaction across the two mutations and a retry is safe while an orphaned line nothing can match again is not.
 
 - **`ext/exttest` asserts the app-log contract**, including the erasure rule that `ext/applog.go` documents. That rule cannot be inferred from the interface signatures: a driver can implement `Store` and `AppLogStore` perfectly and still leave a purged tenant's log lines behind, and a log is the likelier place for the personal data to be sitting. The sub-tests skip for a driver without app-log support, so the interface stays genuinely optional. Verified by breaking each driver's purge in turn and watching the suite fail.
