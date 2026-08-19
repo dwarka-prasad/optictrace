@@ -317,7 +317,7 @@ Measured with `make bench` (12th Gen Intel i5-1235U, Go 1.25):
 - Control-plane authentication is available but **off by default**.
 - Homebrew publishing is configured but disabled until a `homebrew-tap` repository exists.
 
-[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.13.0...HEAD
 [0.13.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.10.0...v0.11.0
