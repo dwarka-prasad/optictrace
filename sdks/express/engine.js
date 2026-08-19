@@ -66,12 +66,16 @@ class Engine {
         methods: r.match.methods ? new Set(r.match.methods.map((m) => m.toUpperCase())) : null,
         restrict: new Set(r.restrict ?? []),
         redactHeaders: (r.redact?.headers ?? []).map((h) => h.toLowerCase()),
+        redactQueryParams: (r.redact?.query_params ?? []).map((q) => q.toLowerCase()),
         redactPaths: (r.redact?.json_fields ?? []).map((p) => {
           if (!p.startsWith('$.')) throw new Error(`optic.yaml: json field ${p} must start with '$.'`);
           return p.slice(2).split('.');
         }),
         labels: r.labels ?? null,
+        meters: parseMeters(r.meter, r.name ?? `#${i}`),
         sample: typeof r.sample === 'number' ? r.sample : null,
+        keepErrors: r.keep_errors === true,
+        keepSlowerThanMs: parseDuration(r.keep_slower_than),
       };
     });
   }
@@ -84,11 +88,15 @@ class Engine {
       captureHeaders: this.defaults.headers,
       captureLimit: this.captureLimit,
       redactHeaders: new Set(),
+      redactQueryParams: new Set(),
       redactPaths: [],
       labels: {},
+      meters: {},
       matchedRules: [],
       routePattern: '',
       sampleRate: 1.0,
+      keepErrors: false,
+      keepSlowerThanMs: null,
     };
     const segs = splitPath(urlPath);
     for (const r of this.rules) {
@@ -101,8 +109,17 @@ class Engine {
       if (r.restrict.has('response_body')) policy.captureResponseBody = false;
       if (r.restrict.has('headers')) policy.captureHeaders = false;
       for (const h of r.redactHeaders) policy.redactHeaders.add(h);
+      for (const q of r.redactQueryParams) policy.redactQueryParams.add(q);
       policy.redactPaths.push(...r.redactPaths);
       if (r.labels) Object.assign(policy.labels, r.labels);
+      Object.assign(policy.meters, r.meters);
+      if (r.keepErrors) policy.keepErrors = true;
+      if (r.keepSlowerThanMs !== null) {
+        policy.keepSlowerThanMs =
+          policy.keepSlowerThanMs === null
+            ? r.keepSlowerThanMs
+            : Math.min(policy.keepSlowerThanMs, r.keepSlowerThanMs);
+      }
     }
     return policy;
   }
@@ -164,4 +181,204 @@ function redactBody(raw, contentType, policy) {
   return `<${contentType || 'unknown'} body, ${Buffer.byteLength(raw)} bytes captured>`;
 }
 
-module.exports = { Engine, sanitizeHeaders, redactBody, redactPath, matchSegments, splitPath, REDACTED };
+/** `meter: {name: "$.usage.total_tokens"}` -> {name: [["usage","total_tokens"]]}. */
+function parseMeters(spec, ruleName) {
+  const out = {};
+  for (const [name, paths] of Object.entries(spec ?? {})) {
+    out[name] = (Array.isArray(paths) ? paths : [paths]).map((p) => {
+      if (!String(p).startsWith('$.')) {
+        throw new Error(`optic.yaml rule ${ruleName}: meter ${name} path ${p} must start with '$.'`);
+      }
+      return String(p).slice(2).split('.');
+    });
+  }
+  return out;
+}
+
+/** Go-style durations ("250ms", "1s") — optic.yaml is written for the Go agent. */
+function parseDuration(v) {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  if (s.endsWith('ms')) return Number(s.slice(0, -2));
+  if (s.endsWith('s')) return Number(s.slice(0, -1)) * 1000;
+  if (s.endsWith('m')) return Number(s.slice(0, -1)) * 60000;
+  const n = Number(s);
+  return Number.isNaN(n) ? null : n;
+}
+
+/**
+ * Mask named query parameters, keeping order and everything else. A credential
+ * in a query string is still a credential, and it lands in the recorded URL
+ * rather than in a header — a separate place needing a separate rule.
+ */
+function sanitizeQuery(query, policy) {
+  if (!query || policy.redactQueryParams.size === 0) return query ?? '';
+  return query
+    .split('&')
+    .map((pair) => {
+      const eq = pair.indexOf('=');
+      if (eq < 0) return pair;
+      const key = pair.slice(0, eq);
+      return policy.redactQueryParams.has(key.toLowerCase()) ? `${key}=${REDACTED}` : pair;
+    })
+    .join('&');
+}
+
+/** Walk a dotted path summing numbers, supporting `*` and `**`. Mirrors the Go engine. */
+function sumNumeric(node, path, acc) {
+  if (node === null || node === undefined) return;
+  if (path.length === 0) {
+    if (typeof node === 'number' && Number.isFinite(node)) {
+      acc.sum += node;
+      acc.found = true;
+    }
+    return;
+  }
+  if (Array.isArray(node)) {
+    for (const child of node) sumNumeric(child, path, acc);
+    return;
+  }
+  if (typeof node !== 'object') return;
+  const [seg, ...rest] = path;
+  if (seg === '**') {
+    if (rest.length) sumNumeric(node, rest, acc);
+    for (const child of Object.values(node)) sumNumeric(child, path, acc);
+    return;
+  }
+  if (seg === '*') {
+    for (const child of Object.values(node)) sumNumeric(child, rest, acc);
+    return;
+  }
+  if (seg in node) sumNumeric(node[seg], rest, acc);
+}
+
+/**
+ * Pull numeric usage out of a response body.
+ *
+ * Reads the RAW bytes, not the stored body: metering is independent of
+ * capture, which is what lets a rule keep a prompt private while still
+ * counting the tokens in it.
+ */
+function extractMeters(raw, policy) {
+  const out = {};
+  if (!raw || Object.keys(policy.meters).length === 0) return out;
+  let doc;
+  try {
+    doc = JSON.parse(raw);
+  } catch {
+    return out;
+  }
+  for (const [name, paths] of Object.entries(policy.meters)) {
+    const acc = { sum: 0, found: false };
+    for (const p of paths) sumNumeric(doc, p, acc);
+    if (acc.found) out[name] = acc.sum;
+  }
+  return out;
+}
+
+/** First value at a dotted path, read from the ALREADY-REDACTED body. */
+function firstString(doc, spec) {
+  if (!doc || !String(spec).startsWith('$.')) return '';
+  const walk = (node, path) => {
+    if (node === null || node === undefined) return undefined;
+    if (path.length === 0) {
+      return typeof node === 'object' ? undefined : String(node);
+    }
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const hit = walk(child, path);
+        if (hit !== undefined) return hit;
+      }
+      return undefined;
+    }
+    if (typeof node !== 'object') return undefined;
+    const [seg, ...rest] = path;
+    if (seg === '**') {
+      if (rest.length) {
+        const here = walk(node, rest);
+        if (here !== undefined) return here;
+      }
+      for (const child of Object.values(node)) {
+        const hit = walk(child, path);
+        if (hit !== undefined) return hit;
+      }
+      return undefined;
+    }
+    if (seg === '*') {
+      for (const child of Object.values(node)) {
+        const hit = walk(child, rest);
+        if (hit !== undefined) return hit;
+      }
+      return undefined;
+    }
+    return seg in node ? walk(node[seg], rest) : undefined;
+  };
+  return walk(doc, String(spec).slice(2).split('.')) ?? '';
+}
+
+/**
+ * Resolve one label source.
+ *
+ * Sources are `kind:key`, optionally followed by `|<regex>` whose single
+ * capture group narrows the value — that is how `header:X-Region|^([a-z]{2})-`
+ * turns eu-west-1 into eu. The engines must agree here, or the same optic.yaml
+ * produces different Prometheus series depending on which runtime served the
+ * request.
+ */
+function labelValue(src, { headers = {}, query = {}, path = '', requestBody, responseBody }) {
+  const spec = String(src);
+  const bar = spec.indexOf('|');
+  const head = bar < 0 ? spec : spec.slice(0, bar);
+  const regex = bar < 0 ? null : spec.slice(bar + 1);
+
+  const colon = head.indexOf(':');
+  const kind = colon < 0 ? head : head.slice(0, colon);
+  const key = colon < 0 ? '' : head.slice(colon + 1);
+
+  let value = '';
+  switch (kind) {
+    case 'header':
+      value = String(headers[key.toLowerCase()] ?? '');
+      break;
+    case 'query':
+      value = String(query[key] ?? '');
+      break;
+    case 'static':
+      value = key;
+      break;
+    case 'path': {
+      const segs = splitPath(path);
+      const idx = Number(key);
+      value = Number.isInteger(idx) && idx >= 1 && idx <= segs.length ? segs[idx - 1] : '';
+      break;
+    }
+    case 'json':
+      value = firstString(requestBody, key);
+      break;
+    case 'json_response':
+      value = firstString(responseBody, key);
+      break;
+    default:
+      value = '';
+  }
+
+  if (!regex || !value) return value;
+  const m = new RegExp(regex).exec(value);
+  if (!m) return '';
+  // One capture group narrows the value; no group means "matched, keep it all".
+  return m.length > 1 ? (m[1] ?? '') : value;
+}
+
+module.exports = {
+  Engine,
+  sanitizeHeaders,
+  sanitizeQuery,
+  redactBody,
+  redactPath,
+  matchSegments,
+  splitPath,
+  extractMeters,
+  labelValue,
+  firstString,
+  REDACTED,
+};

@@ -23,9 +23,20 @@ rules:
     match: { path: "/payments/**" }
     redact:
       headers: [Authorization]
+      query_params: [api_key]
       json_fields: ["$.**.card.number"]
     labels:
       tenant: "header:X-Tenant-ID"
+      region: "header:X-Region|^([a-z]{2})-"
+      channel: "static:direct"
+      area: "path:1"
+      partner: "json:$.**.source"
+      outcome: "json_response:$.status"
+  - name: meter-ai
+    match: { path: "/ai/**" }
+    restrict: [response_body]
+    meter:
+      tokens: "$.usage.total_tokens"
 `;
 
 // --- unit checks: engine parity with Go -------------------------------------
@@ -62,16 +73,29 @@ async function main() {
 
   app.use(optictrace({ configPath: cfgFile, agentUrl, consoleLog: true }));
   app.use(express.json());
-  app.post('/payments/charge', (req, res) => res.status(201).json({ ok: true, echo: req.body }));
+
+  let seenSpan = null;
+  app.post('/payments/charge', (req, res) => {
+    // What a handler would do to propagate the trace to a downstream call.
+    seenSpan = optictrace.currentSpan()?.spanId ?? null;
+    res.status(201).json({ status: 'captured', echo: req.body });
+  });
   app.post('/auth/login', (_req, res) => res.json({ token: 'secret-token' }));
+  app.post('/ai/complete', (_req, res) =>
+    res.json({ completion: 'hi', usage: { prompt_tokens: 86, total_tokens: 128 } }));
 
   const server = app.listen(0);
   const base = `http://127.0.0.1:${server.address().port}`;
 
-  const r1 = await fetch(`${base}/payments/charge`, {
+  const r1 = await fetch(`${base}/payments/charge?api_key=live_sk_1&page=2`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok', 'X-Tenant-ID': 'acme' },
-    body: JSON.stringify({ card: { number: '4111111111111111' }, amount: 5 }),
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer tok',
+      'X-Tenant-ID': 'acme',
+      'X-Region': 'ap-south-1',
+    },
+    body: JSON.stringify({ source: 'flipkart', card: { number: '4111111111111111' }, amount: 5 }),
   });
   assert.strictEqual(r1.status, 201);
   const body1 = await r1.json();
@@ -81,6 +105,12 @@ async function main() {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ password: 'hunter2' }),
+  });
+
+  await fetch(`${base}/ai/complete`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt: 'hi' }),
   });
 
   await new Promise((r) => setTimeout(r, 300));
@@ -104,8 +134,50 @@ async function main() {
   assert.ok(!auth.request_headers, 'restricted headers leaked');
   assert.strictEqual(auth.status, 200);
 
+  // --- parity with the Go engine, added because these were all missing ----
+  assert.ok(pay.trace_id && pay.trace_id.length === 32, 'no trace id on the record');
+  assert.ok(pay.span_id && pay.span_id.length === 16, 'no span id on the record');
+  assert.notStrictEqual(pay.trace_id, auth.trace_id, 'separate requests share a trace id');
+
+  assert.strictEqual(pay.labels.region, 'ap', 'regex capture label');
+  assert.strictEqual(pay.labels.channel, 'direct', 'static label');
+  assert.strictEqual(pay.labels.area, 'payments', 'path label is 1-based');
+  assert.strictEqual(pay.labels.partner, 'flipkart', 'label read from the request payload');
+  assert.strictEqual(pay.labels.outcome, 'captured', 'label read from the response');
+  assert.ok(
+    !JSON.stringify(pay.labels).includes('4111111111111111'),
+    'a label must never carry a value the policy masked',
+  );
+
+  assert.ok(pay.query && pay.query.includes(`api_key=${REDACTED}`), 'query credential not masked');
+  assert.ok(pay.query.includes('page=2'), 'unnamed query params must survive');
+
+  const ai = emitted.find((e) => e.path === '/ai/complete');
+  assert.ok(ai, 'metered record emitted');
+  assert.strictEqual(ai.meters?.tokens, 128, 'meters not extracted');
+  assert.ok(!ai.response_body, 'restricted response body was stored');
+
+  // Trace context must be visible to the handler, which is what makes an
+  // outbound call nest under this request instead of starting a new tree.
+  assert.ok(seenSpan && seenSpan === pay.span_id, 'handler could not see its own span');
+
   console.log('✓ middleware integration checks passed');
-  if (agentUrl) console.log(`✓ records shipped to agent at ${agentUrl}`);
+
+  // Delivery. Offline checks cannot tell you whether a real agent ACCEPTS what
+  // this SDK produces — the Python SDK passed all of its own tests while a
+  // live agent rejected 100% of its records.
+  if (agentUrl) {
+    const logs = new optictrace.LogShipper(agentUrl, 'express-test');
+    logs.info('express selftest line');
+    logs.warn('careless debug: Bearer topsecret123');
+    await logs.close();
+    assert.strictEqual(logs.failed, 0, `log delivery failed: ${logs.lastError}`);
+
+    await new Promise((r) => setTimeout(r, 1200));
+    const stored = await (await fetch(`${agentUrl}/api/logs?window=5m&limit=50`)).text();
+    assert.ok(stored.includes('"source":"express"'), 'a live agent did not accept a record');
+    console.log(`✓ a live agent accepted records and ${logs.sent} log line(s) from this SDK`);
+  }
   fs.unlinkSync(cfgFile);
 }
 

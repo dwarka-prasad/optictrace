@@ -80,6 +80,55 @@ def _parse_meters(spec: dict, rule_name: str) -> dict:
     return out
 
 
+def first_string(doc: Any, spec: str) -> str:
+    """First value at a dotted path, read from the ALREADY-REDACTED body.
+
+    Supports `*` and `**` like the redaction grammar, so a label and a
+    redaction can name the same shape of field.
+    """
+    if doc is None or not str(spec).startswith("$."):
+        return ""
+
+    def walk(node: Any, path: list):
+        if node is None:
+            return None
+        if not path:
+            return None if isinstance(node, (dict, list)) else node
+        if isinstance(node, list):
+            for child in node:
+                hit = walk(child, path)
+                if hit is not None:
+                    return hit
+            return None
+        if not isinstance(node, dict):
+            return None
+        seg, rest = path[0], path[1:]
+        if seg == "**":
+            if rest:
+                here = walk(node, rest)
+                if here is not None:
+                    return here
+            for child in node.values():
+                hit = walk(child, path)
+                if hit is not None:
+                    return hit
+            return None
+        if seg == "*":
+            for child in node.values():
+                hit = walk(child, rest)
+                if hit is not None:
+                    return hit
+            return None
+        return walk(node[seg], rest) if seg in node else None
+
+    found = walk(doc, str(spec)[2:].split("."))
+    if found is None:
+        return ""
+    if isinstance(found, bool):
+        return "true" if found else "false"
+    return str(found)
+
+
 def sum_numeric(node: Any, path: list, acc: list) -> None:
     """Walk a dotted path summing numbers, supporting `*` and `**`.
 

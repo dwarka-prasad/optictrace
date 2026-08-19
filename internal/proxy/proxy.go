@@ -177,6 +177,10 @@ func (ic *Interceptor) Wrap(next http.Handler) http.Handler {
 		if ic.responseHeader != "" {
 			w.Header().Set(ic.responseHeader, tc.TraceID)
 		}
+		// Publish the span on the request context so an embedded handler — and
+		// anything it calls, including a log handler — can name the request it
+		// is serving without reading headers back out.
+		r = r.WithContext(tracectx.NewContext(r.Context(), tc))
 		// Full attrs, not just the request line: match.headers and match.query
 		// rules can only be decided with them, and a rule that cannot be
 		// decided does not apply.

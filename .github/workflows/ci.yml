@@ -95,6 +95,24 @@ jobs:
       - name: FastAPI SDK tests
         working-directory: sdks/fastapi
         run: pip install pyyaml && python test_middleware.py
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Java SDK tests
+        working-directory: sdks/java
+        # The suite is a plain main(), so it needs no test framework — but it
+        # does need the dependencies, which is what dependency:build-classpath
+        # resolves. Set OPTIC_AGENT_URL in an environment that has an agent to
+        # also assert a live one ACCEPTS what the SDK produces; offline checks
+        # cannot catch a record the agent rejects, which is exactly how the
+        # FastAPI SDK shipped nothing for weeks.
+        run: |
+          mvn -q -B dependency:build-classpath -Dmdep.outputFile=cp.txt
+          mvn -q -B compile
+          javac -d target/test-classes -cp "target/classes:$(cat cp.txt)"             src/test/java/io/github/dwarkaprasad/optictrace/SelfTest.java
+          java -cp "target/classes:target/test-classes:$(cat cp.txt)"             io.github.dwarkaprasad.optictrace.SelfTest
 
   assets:
     runs-on: ubuntu-latest

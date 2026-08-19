@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.github.dwarka-prasad</groupId>
+  <artifactId>optictrace-servlet</artifactId>
+  <version>0.9.0</version>
+  <packaging>jar</packaging>
+
+  <name>OpticTrace Servlet SDK</name>
+  <description>
+    Declarative API telemetry and governance for Jakarta Servlet applications.
+    Evaluates the same optic.yaml as the OpticTrace agent, in-process, so
+    sensitive payloads are masked before they leave the service.
+  </description>
+  <url>https://github.com/dwarka-prasad/optictrace</url>
+
+  <licenses>
+    <license>
+      <name>Apache-2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+    </license>
+  </licenses>
+
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <jackson.version>2.17.1</jackson.version>
+  </properties>
+
+  <dependencies>
+    <!-- Provided by the container: the SDK must not pull a servlet API into
+         an application that already has one, or the filter ends up loaded by
+         a different classloader than the one serving requests. -->
+    <dependency>
+      <groupId>jakarta.servlet</groupId>
+      <artifactId>jakarta.servlet-api</artifactId>
+      <version>6.0.0</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+
+    <!-- optic.yaml parsing. -->
+    <dependency>
+      <groupId>org.yaml</groupId>
+      <artifactId>snakeyaml</artifactId>
+      <version>2.2</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+      </plugin>
+      <plugin>
+        <!-- The suite is a plain main() with no test framework, so it can be
+             run anywhere: `mvn compile exec:java` or javac + java directly.
+             Set OPTIC_AGENT_URL to also assert that a live agent ACCEPTS what
+             this SDK produces — the check that offline tests cannot make. -->
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.2.0</version>
+        <configuration>
+          <mainClass>io.github.dwarkaprasad.optictrace.SelfTest</mainClass>
+        </configuration>
+      </plugin>
+    </plugins>
+    <testSourceDirectory>src/test/java</testSourceDirectory>
+  </build>
+</project>

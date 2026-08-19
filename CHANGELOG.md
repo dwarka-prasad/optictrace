@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 `0.7.0` is the first public release and contains all of that work.
 
+## [Unreleased]
+
+### Added
+
+- **A Java SDK** (`sdks/java`) for anything on Jakarta Servlet 5+ — Spring Boot 3, Quarkus, Jetty, Tomcat. A servlet filter that evaluates the same `optic.yaml` in-process, plus `OpticTraceLogHandler` for application logs and `TraceContext.outboundHeaders()` for downstream calls. The response is teed as it is written, so a streaming response still streams and the client receives exactly the bytes the application produced.
+
+  Its suite is a plain `main()` with no test framework — 57 checks — and asserts against a **live agent** when `OPTIC_AGENT_URL` is set. That check exists because offline tests cannot catch a record the agent rejects, which is precisely how the FastAPI SDK shipped nothing for weeks.
+
+- **Application logs from Go and Express.** `optictrace.NewLogHandler` is an `slog.Handler`, and `optictrace.LogShipper` its Express counterpart; both correlate a line to the span being served with nothing at the call site knowing about OpticTrace. Go also gained `SpanFromContext` and `OutboundHeaders`, and the interceptor now publishes the span on the request context — an embedded handler previously had no way to name the request it was serving.
+
+### Fixed
+
+- **Every SDK is now at parity on the rule engine**, which the README claimed but was not true. Express gained trace correlation, meters, query-parameter redaction, tail-based `keep_errors`/`keep_slower_than`, and the `static:` / `path:` / `json:` / `json_response:` label sources with `|<regex>` capture; FastAPI gained `json:` and `json_response:`. The same `optic.yaml` producing different Prometheus series depending on which runtime served the request is worse than a missing label.
+
+- **Express did not buffer response bytes when the body was restricted**, so `restrict: [response_body]` silently zeroed the meters — the same bug the Python SDK had. Metering is independent of capture, which is what lets a rule keep a prompt private while still counting the tokens in it.
+
+- **A derived Go log handler shipped nothing.** `logger.With(...)` cloned the handler by value, giving each derived logger its own queue with no goroutine draining it — so most logging silently vanished. `go vet` caught the copied mutex; the queue is now shared. Test added.
+
 ## [0.9.0] — 2026-08-19
 
 ### Added

@@ -28,7 +28,7 @@ from typing import Optional
 
 import yaml
 
-from .engine import Engine, Policy, REDACTED  # noqa: F401 (public API)
+from .engine import Engine, Policy, REDACTED, first_string  # noqa: F401 (public API)
 from .logs import OpticTraceLogHandler
 from .trace import HEADER as TRACEPARENT, TraceContext, current as current_span, from_header, outbound_headers
 
@@ -186,15 +186,17 @@ class OpticTraceMiddleware:
             )
             if state["req_trunc"]:
                 record["req_truncated"] = True
+        governed_response = None
         if state["resp_body"]:
             meters = policy.extract_meters(bytes(state["resp_body"]))
             if meters:
                 record["meters"] = meters
             # Buffered for metering is not the same as allowed to be stored.
             if policy.capture_response_body:
-                record["response_body"] = policy.redact_body(
+                governed_response = policy.redact_body(
                     bytes(state["resp_body"]), state["resp_headers"].get("content-type", "")
                 )
+                record["response_body"] = governed_response
                 if state["resp_trunc"]:
                     record["resp_truncated"] = True
         if policy.labels:
@@ -204,9 +206,25 @@ class OpticTraceMiddleware:
                 if "=" in pair:
                     k, v = pair.split("=", 1)
                     query.setdefault(k, v)
+            # Labels read the GOVERNED bodies, so a label can never copy a
+            # value the policy just masked into a Prometheus dimension.
+            def _parse(text):
+                try:
+                    return json.loads(text) if text else None
+                except (ValueError, TypeError):
+                    return None
+
+            req_doc = _parse(record.get("request_body"))
+            if req_doc is None and state["req_body"]:
+                governed = policy.redact_body(
+                    bytes(state["req_body"]), req_headers.get("content-type", "")
+                )
+                req_doc = _parse(governed) if not governed.startswith("<") else None
+            res_doc = _parse(governed_response)
+
             labels = {}
             for name, src in policy.labels.items():
-                labels[name] = _label_value(str(src), req_headers, query, path)
+                labels[name] = _label_value(str(src), req_headers, query, path, req_doc, res_doc)
             record["labels"] = labels
         return record
 
@@ -243,7 +261,8 @@ def _rfc3339(epoch: float) -> str:
     )
 
 
-def _label_value(src: str, headers: dict, query: dict, path: str) -> str:
+def _label_value(src: str, headers: dict, query: dict, path: str,
+                 request_body=None, response_body=None) -> str:
     """Resolve one label source, mirroring the Go engine.
 
     Sources are `kind:key`, optionally followed by `|<regex>` whose single
@@ -251,10 +270,8 @@ def _label_value(src: str, headers: dict, query: dict, path: str) -> str:
     turns ap-south-1 into ap, and the two engines have to agree on it or the
     same optic.yaml produces different series depending on which one ran.
 
-    `json:` / `json_response:` are deliberately NOT handled here: this
-    middleware resolves labels from the request line, and reading the body
-    would mean re-parsing a payload the policy has already redacted. A config
-    using them gets an empty label from this SDK rather than a wrong one.
+    `json:` and `json_response:` read the ALREADY-REDACTED bodies, so a label
+    can never carry a value the policy just masked.
     """
     spec, sep, pattern = src.partition("|")
     kind, _, key = spec.partition(":")
@@ -265,6 +282,10 @@ def _label_value(src: str, headers: dict, query: dict, path: str) -> str:
         value = query.get(key, "")
     elif kind == "static":
         value = key
+    elif kind == "json":
+        return _narrow(first_string(request_body, key), sep, pattern)
+    elif kind == "json_response":
+        return _narrow(first_string(response_body, key), sep, pattern)
     elif kind == "path":
         # path:<n> is 1-based, matching the Go engine.
         segs = [s for s in path.split("/") if s]
@@ -274,11 +295,15 @@ def _label_value(src: str, headers: dict, query: dict, path: str) -> str:
             return ""
         if 1 <= idx <= len(segs):
             value = segs[idx - 1]
-    if sep and value:
-        m = re.search(pattern, value)
-        if not m:
-            return ""
-        # One capture group narrows the value; no group means "matched, keep
-        # the whole thing".
-        return m.group(1) if m.groups() else value
-    return value
+    return _narrow(value, sep, pattern)
+
+
+def _narrow(value: str, sep: str, pattern: str) -> str:
+    """Apply a `|<regex>` suffix: one capture group narrows the value, no group
+    means "matched, keep the whole thing"."""
+    if not sep or not value:
+        return value
+    m = re.search(pattern, value)
+    if not m:
+        return ""
+    return m.group(1) if m.groups() else value
