@@ -559,6 +559,28 @@ func (a *AppLogsCfg) validate() error {
 	return nil
 }
 
+// validate checks a per-rule logs block at load time. A redaction pattern that
+// does not compile must fail startup: the alternative is an agent that runs
+// happily while the rule meant to mask credentials never applies.
+func (l *RuleLogs) validate() error {
+	if l == nil {
+		return nil
+	}
+	if l.LevelMin != "" && LevelRankKnown(l.LevelMin) < 0 {
+		return fmt.Errorf("logs.level_min %q is not a level (debug, info, warn, error, fatal)", l.LevelMin)
+	}
+	if l.MaxLinesPerSpan < 0 {
+		return fmt.Errorf("logs.max_lines_per_span %d must be >= 0 "+
+			"(a per-rule block can only lower the global cap, never remove it)", l.MaxLinesPerSpan)
+	}
+	for i, pat := range l.Redact.Patterns {
+		if _, err := regexp.Compile(pat); err != nil {
+			return fmt.Errorf("logs.redact.patterns[%d] (%q): %w", i, pat, err)
+		}
+	}
+	return nil
+}
+
 // LevelRankKnown returns the severity rank of a level, or -1 if it is not one
 // of the recognised names. Used to reject a typo in level_min at load time —
 // "warining" would otherwise silently keep everything.
@@ -644,6 +666,41 @@ type Rule struct {
 	// summed per consumer for usage/cost attribution. Metering is
 	// independent of capture rules: a restricted route can still meter.
 	Meter map[string]string `yaml:"meter"`
+	// Logs narrows the application-log policy for requests this rule matches.
+	//
+	// telemetry.app_logs sets the floor for every route; this tightens it per
+	// route, which is the shape the risk actually has. A payments handler
+	// deserves a stricter level floor and extra redaction than a health check,
+	// and expressing that globally means applying the strictest setting
+	// everywhere — which in practice means people set it loosely.
+	//
+	// Only ever tightens. A rule cannot raise a cap or lower a level floor
+	// below the global one: a per-route override that could weaken the global
+	// policy would make the global setting a suggestion rather than a
+	// guarantee, and reviewing one file would no longer tell you what is
+	// enforced.
+	Logs *RuleLogs `yaml:"logs"`
+}
+
+// RuleLogs is the per-rule application-log policy. Every field is optional;
+// an omitted field inherits telemetry.app_logs.
+type RuleLogs struct {
+	// LevelMin raises the severity floor for this route. Ignored if it would
+	// LOWER the global floor.
+	LevelMin string `yaml:"level_min"`
+	// MaxLinesPerSpan lowers the per-request line cap for this route. Ignored
+	// if it would raise the global cap. -1 is not accepted here: removing the
+	// cap is a global decision.
+	MaxLinesPerSpan int `yaml:"max_lines_per_span"`
+	// Redact adds patterns and field names on top of the global set. Additive
+	// only — there is no way to remove a global redaction, because a rule that
+	// could unmask something would make the global list unreviewable.
+	Redact AppLogRedact `yaml:"redact"`
+	// Drop discards application log lines for this route entirely. The
+	// honest way to say "never store what this handler logs" — a debug
+	// endpoint, or a route whose logs are known to carry secrets nothing can
+	// pattern-match reliably.
+	Drop bool `yaml:"drop"`
 }
 
 // Match selects requests by path glob and (optionally) HTTP methods.
@@ -913,6 +970,12 @@ func (c *Config) Validate() error {
 	if err := c.Telemetry.AppLogs.validate(); err != nil {
 		return err
 	}
+	for _, r := range c.Rules {
+		if r.Logs != nil && (c.Telemetry.AppLogs == nil || !c.Telemetry.AppLogs.Enabled) {
+			return fmt.Errorf("rule %q has a `logs:` block but telemetry.app_logs.enabled is not true — "+
+				"the block would be silently ignored", r.Name)
+		}
+	}
 	for _, o := range c.Telemetry.CORSOrigins {
 		if o == "*" {
 			// A wildcard means any page the operator visits can read the
@@ -1169,6 +1232,9 @@ func (r *Rule) validate() error {
 	}
 	if r.Sample != nil && (*r.Sample <= 0 || *r.Sample > 1) {
 		return fmt.Errorf("sample %v must be in (0, 1]", *r.Sample)
+	}
+	if err := r.Logs.validate(); err != nil {
+		return err
 	}
 	for name, path := range r.Meter {
 		if !strings.HasPrefix(path, "$.") || len(path) <= 2 {

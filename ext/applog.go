@@ -38,6 +38,15 @@ type AppLog struct {
 	// redacted under the same policy as the message — a token pasted into a
 	// field is exactly as leaked as one in the message text.
 	Fields map[string]string `json:"fields,omitempty"`
+	// Route is the rule pattern the request matched, when the producer knows
+	// it. It lets a per-rule `logs:` block apply to this line.
+	//
+	// Client-supplied and therefore untrusted — which is safe here only
+	// because a per-rule log policy can exclusively TIGHTEN the global one. A
+	// producer that lies about its route, or omits it, gets the global policy:
+	// the floor, never less. If per-rule blocks could ever loosen, this field
+	// would have to be verified instead of trusted.
+	Route string `json:"route,omitempty"`
 	// Source names the producer: an SDK name, or "ingest" for a direct POST.
 	Source string `json:"source,omitempty"`
 	// Truncated reports that Message was cut to the configured byte cap.

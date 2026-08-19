@@ -132,6 +132,11 @@ func (h *LogHandler) Handle(ctx context.Context, r slog.Record) error {
 	if c, ok := tracectx.FromContext(ctx); ok {
 		line["trace_id"] = c.TraceID
 		line["span_id"] = c.SpanID
+		if c.Route != "" {
+			// Lets a per-rule `logs:` block apply to this line. Safe to send
+			// because such a block can only tighten the global policy.
+			line["route"] = c.Route
+		}
 	}
 
 	fields := map[string]string{}

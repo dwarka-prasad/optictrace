@@ -337,6 +337,12 @@ func reviewChanges(a reviewArgs) {
 	}
 
 	opts := review.Options{Records: records, Head: headCfg, Window: a.window.String()}
+	// Application log lines from the same window, when the local store has
+	// them. A remote or file-based review has records only, which is reported
+	// rather than hidden: the report prints how many lines it read.
+	if a.from == "" && a.fromFile == "" {
+		opts.AppLogs = loadAppLogs(headCfg, a.window)
+	}
 	if a.baseConfig != "" {
 		// A missing base config is not fatal: on the first PR that adds
 		// optic.yaml there is nothing to diff against, and failing there
@@ -471,6 +477,40 @@ func scannedSummary(r *scan.Report) string {
 // scanAppLogs feeds stored application log lines to the scanner. A store
 // driver without app-log support, or a config with the feature off, simply
 // contributes nothing — this is an optional surface, not a required one.
+// loadAppLogs reads stored application log lines for a window. Returns nothing
+// when the feature is off or the driver has no app-log support — this is an
+// optional surface, not a required one.
+func loadAppLogs(cfg *config.Config, window time.Duration) []ext.AppLog {
+	if cfg == nil || cfg.Telemetry.AppLogs == nil || !cfg.Telemetry.AppLogs.Enabled {
+		return nil
+	}
+	st, err := openStore(&cfg.Telemetry.Store)
+	if err != nil {
+		return nil
+	}
+	defer st.Close()
+	als, ok := st.(store.AppLogStore)
+	if !ok {
+		return nil
+	}
+	var out []ext.AppLog
+	limit := store.AnalysisLimit(cfg.Telemetry.Store.AnalysisMaxRows)
+	since := time.Now().Add(-window)
+	for len(out) < limit {
+		lines, total, err := als.QueryAppLogs(context.Background(), store.AppLogFilter{
+			Since: since, Limit: 500, Offset: len(out),
+		})
+		if err != nil || len(lines) == 0 {
+			break
+		}
+		out = append(out, lines...)
+		if int64(len(out)) >= total {
+			break
+		}
+	}
+	return out
+}
+
 func scanAppLogs(sc *scan.Scanner, cfg *config.Config, window time.Duration) {
 	if cfg == nil || cfg.Telemetry.AppLogs == nil || !cfg.Telemetry.AppLogs.Enabled {
 		return
@@ -824,6 +864,12 @@ func run(configPath, uiDir string) {
 	appLogs, err := applog.New(cfg.Telemetry.AppLogs)
 	if err != nil {
 		logger.Error("invalid app-log policy", "error", err)
+		os.Exit(1)
+	}
+	// Per-rule `logs:` blocks tighten the global policy for the routes they
+	// match. Compiled here rather than per line, and only ever narrowing.
+	if err := appLogs.WithRules(cfg.Rules); err != nil {
+		logger.Error("invalid per-rule app-log policy", "error", err)
 		os.Exit(1)
 	}
 	var appLogStore store.AppLogStore

@@ -35,6 +35,10 @@ type Context struct {
 	// Sampled carries the caller's sampling decision, so OpticTrace does not
 	// export spans for traces the application already decided to drop.
 	Sampled bool
+	// Route is the rule pattern this request matched, resolved by the engine.
+	// Carried here because it is what a per-rule `logs:` block keys on, and a
+	// log handler has the context but not the policy.
+	Route string
 	// Inherited reports whether a usable traceparent arrived. False means the
 	// ids here were generated, and this hop is the root of a new trace.
 	Inherited bool

@@ -28,8 +28,8 @@ func (s *PostgresStore) SaveAppLogs(ctx context.Context, lines []ext.AppLog) err
 	// One multi-row INSERT rather than a prepared statement in a loop: the
 	// round trips dominate, not the parsing.
 	var b strings.Builder
-	b.WriteString(`INSERT INTO app_logs (ts, service, trace_id, span_id, level, message, fields, source, truncated) VALUES `)
-	args := make([]any, 0, len(lines)*9)
+	b.WriteString(`INSERT INTO app_logs (ts, service, trace_id, span_id, route, level, message, fields, source, truncated) VALUES `)
+	args := make([]any, 0, len(lines)*10)
 	for i := range lines {
 		l := &lines[i]
 		if l.Time.IsZero() {
@@ -46,11 +46,12 @@ func (s *PostgresStore) SaveAppLogs(ctx context.Context, lines []ext.AppLog) err
 		if i > 0 {
 			b.WriteByte(',')
 		}
-		n := i * 9
+		n := i * 10
 		b.WriteString("($" + strconv.Itoa(n+1) + ",$" + strconv.Itoa(n+2) + ",$" + strconv.Itoa(n+3) +
 			",$" + strconv.Itoa(n+4) + ",$" + strconv.Itoa(n+5) + ",$" + strconv.Itoa(n+6) +
-			",$" + strconv.Itoa(n+7) + "::jsonb,$" + strconv.Itoa(n+8) + ",$" + strconv.Itoa(n+9) + ")")
-		args = append(args, l.Time.UnixMilli(), l.Service, l.TraceID, l.SpanID,
+			",$" + strconv.Itoa(n+7) + ",$" + strconv.Itoa(n+8) + "::jsonb,$" + strconv.Itoa(n+9) +
+			",$" + strconv.Itoa(n+10) + ")")
+		args = append(args, l.Time.UnixMilli(), l.Service, l.TraceID, l.SpanID, l.Route,
 			l.Level, l.Message, fields, l.Source, l.Truncated)
 	}
 	_, err := s.db.ExecContext(ctx, b.String(), args...)
@@ -121,7 +122,7 @@ func (s *PostgresStore) QueryAppLogs(ctx context.Context, f ext.AppLogFilter) ([
 	if limit <= 0 {
 		limit = 200
 	}
-	q := `SELECT id, ts, service, trace_id, span_id, level, message, fields, source, truncated
+	q := `SELECT id, ts, service, trace_id, span_id, route, level, message, fields, source, truncated
 		FROM app_logs` + clause + ` ORDER BY ts ASC, id ASC LIMIT ` + arg(limit) + ` OFFSET ` + arg(f.Offset)
 
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -137,7 +138,7 @@ func (s *PostgresStore) QueryAppLogs(ctx context.Context, f ext.AppLogFilter) ([
 			ts     int64
 			fields []byte
 		)
-		if err := rows.Scan(&l.ID, &ts, &l.Service, &l.TraceID, &l.SpanID,
+		if err := rows.Scan(&l.ID, &ts, &l.Service, &l.TraceID, &l.SpanID, &l.Route,
 			&l.Level, &l.Message, &fields, &l.Source, &l.Truncated); err != nil {
 			return nil, 0, err
 		}

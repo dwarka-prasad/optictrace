@@ -91,6 +91,11 @@ func (r *Report) Markdown() string {
 		b.WriteString("### Sensitive values already in stored telemetry\n\n")
 		fmt.Fprintf(&b, "%d critical · %d high · %d medium — pre-existing, not introduced by this PR. Samples are masked.\n\n",
 			crit, high, med)
+		if r.LogLinesReviewed > 0 {
+			fmt.Fprintf(&b, "<sub>Includes %d application log line(s). A log line is free text, "+
+				"so its fix is a pattern or field name under `app_logs.redact` rather than a JSON path.</sub>\n\n",
+				r.LogLinesReviewed)
+		}
 		b.WriteString("| | Where | Field | Seen | Fix |\n|---|---|---|--:|---|\n")
 		for _, f := range r.Leaks {
 			if len(b.String()) > 40000 {

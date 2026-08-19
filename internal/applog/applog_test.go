@@ -166,3 +166,124 @@ func TestConcurrentAdmitIsSafe(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// The whole safety argument for trusting a producer-supplied route is that a
+// per-rule block can only TIGHTEN. If it could loosen, telemetry.app_logs
+// would be a suggestion rather than a guarantee, and a lying client could ask
+// for less protection than the floor.
+func TestPerRuleLogsOnlyTightens(t *testing.T) {
+	g := newGov(t, &config.AppLogsCfg{
+		Enabled:         true,
+		LevelMin:        "info",
+		MaxLinesPerSpan: 100,
+		Redact:          config.AppLogRedact{Patterns: []string{`GLOBAL-\d+`}},
+	})
+	if err := g.WithRules([]config.Rule{
+		{
+			Name:  "strict-payments",
+			Match: config.Match{Path: "/api/v1/payments/**"},
+			Logs: &config.RuleLogs{
+				LevelMin:        "error",
+				MaxLinesPerSpan: 2,
+				Redact:          config.AppLogRedact{Patterns: []string{`RULE-\d+`}, Fields: []string{"pan"}},
+			},
+		},
+		{
+			// Tries to loosen every setting. All of it must be ignored.
+			Name:  "loose-health",
+			Match: config.Match{Path: "/healthz"},
+			Logs: &config.RuleLogs{
+				LevelMin:        "debug", // lower than the global floor
+				MaxLinesPerSpan: 9000,    // higher than the global cap
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// --- the strict route ------------------------------------------------
+	if ok, r := g.Admit(&ext.AppLog{SpanID: "s1", Route: "/api/v1/payments/**",
+		Level: "warn", Message: "noise"}); ok || r != ReasonLevel {
+		t.Errorf("a rule raising the floor to error kept a warn: ok=%v r=%q", ok, r)
+	}
+	l := &ext.AppLog{SpanID: "s1", Route: "/api/v1/payments/**", Level: "error",
+		Message: "failed with RULE-123 and GLOBAL-456",
+		Fields:  map[string]string{"pan": "4111111111111111", "amount": "42"}}
+	if ok, r := g.Admit(l); !ok {
+		t.Fatalf("an error line on the strict route was dropped: %q", r)
+	}
+	if strings.Contains(l.Message, "RULE-123") {
+		t.Errorf("the rule's own pattern did not apply: %q", l.Message)
+	}
+	if strings.Contains(l.Message, "GLOBAL-456") {
+		t.Errorf("a rule block must ADD to the global patterns, not replace them: %q", l.Message)
+	}
+	if l.Fields["pan"] != "[REDACTED]" {
+		t.Errorf("the rule's field redaction did not apply: %v", l.Fields)
+	}
+	if l.Fields["amount"] != "42" {
+		t.Errorf("redaction ate an innocent field: %v", l.Fields)
+	}
+
+	// The rule's cap of 2 applies, not the global 100. One line is already in.
+	kept := 1
+	for i := 0; i < 5; i++ {
+		if ok, _ := g.Admit(&ext.AppLog{SpanID: "s1", Route: "/api/v1/payments/**",
+			Level: "error", Message: "more"}); ok {
+			kept++
+		}
+	}
+	if kept != 2 {
+		t.Errorf("the rule cap of 2 kept %d lines", kept)
+	}
+
+	// --- the route that tried to loosen ----------------------------------
+	if ok, r := g.Admit(&ext.AppLog{SpanID: "s2", Route: "/healthz",
+		Level: "debug", Message: "chatty"}); ok || r != ReasonLevel {
+		t.Errorf("a rule lowered the global floor: ok=%v r=%q", ok, r)
+	}
+	// And its inflated cap must not beat the global one.
+	allowed := 0
+	for i := 0; i < 150; i++ {
+		if ok, _ := g.Admit(&ext.AppLog{SpanID: "s3", Route: "/healthz",
+			Level: "info", Message: "tick"}); ok {
+			allowed++
+		}
+	}
+	if allowed != 100 {
+		t.Errorf("a rule raised the global cap: %d lines allowed, want 100", allowed)
+	}
+
+	// --- an unknown or absent route gets the global policy ---------------
+	// Safe precisely because rules only tighten: the worst a producer can do
+	// by lying is land on the floor.
+	unknown := &ext.AppLog{SpanID: "s4", Route: "/who/knows", Level: "info",
+		Message: "GLOBAL-999 and RULE-999"}
+	if ok, r := g.Admit(unknown); !ok {
+		t.Fatalf("an unknown route was dropped: %q", r)
+	}
+	if strings.Contains(unknown.Message, "GLOBAL-999") {
+		t.Error("the global pattern did not apply to an unknown route")
+	}
+	if !strings.Contains(unknown.Message, "RULE-999") {
+		t.Error("another rule's pattern leaked onto an unrelated route")
+	}
+}
+
+func TestRuleLogsDropDiscardsWithItsOwnReason(t *testing.T) {
+	g := newGov(t, &config.AppLogsCfg{Enabled: true})
+	if err := g.WithRules([]config.Rule{{
+		Name:  "no-logs-here",
+		Match: config.Match{Path: "/debug/**"},
+		Logs:  &config.RuleLogs{Drop: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, r := g.Admit(&ext.AppLog{SpanID: "s", Route: "/debug/pprof", Level: "info", Message: "x"}); ok || r != ReasonRuleDrop {
+		t.Errorf("want drop/rule_drop, got ok=%v r=%q", ok, r)
+	}
+	// Everything else is unaffected.
+	if ok, _ := g.Admit(&ext.AppLog{SpanID: "s", Route: "/api/v1/orders", Level: "info", Message: "x"}); !ok {
+		t.Error("logs.drop on one route silenced another")
+	}
+}
