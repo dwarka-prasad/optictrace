@@ -987,6 +987,28 @@ OpticTrace already hands your app the span: the `traceparent` on the forwarded
 request carries the span id it recorded. Ship your log lines with that id and
 they are filed under the exact request that produced them.
 
+You can also collect what the application **already writes**, with no code
+change at all — which matters, because the services whose logs you most want
+are usually the ones nobody wants to modify:
+
+```bash
+optictrace run -config optic.yaml -exec "python app.py"     # its stdout/stderr
+```
+
+```yaml
+telemetry:
+  app_logs:
+    sources:
+      - { type: file, path: /var/log/app.jsonl }   # rotation followed
+```
+
+Collected output is **echoed through untouched**: collecting a service's logs
+must not stop them reaching wherever its operators already read them. Tailing
+starts at the end of an existing file, because replaying a large log on every
+restart floods the store with history nobody asked for.
+
+Or post them explicitly:
+
 ```bash
 curl -X POST localhost:9095/api/applogs/ingest -d '[
   {"trace_id":"4bf92f35…","span_id":"512227e3…","level":"info","message":"charge received"},
@@ -1044,7 +1066,13 @@ Three consequences worth knowing before you turn it on:
   `optictrace_app_logs_dropped_total{reason="orphan"}` — data discarded
   silently is data nobody knows they are missing. Set `drop_orphans: false` to
   keep them unattributed.
-- **`optictrace scan` reads them too.** A payload is structured and can be
+- **Policy can narrow per route.** `telemetry.app_logs` is the floor; a
+  `logs:` block on a rule tightens it — a stricter level, a lower line cap,
+  extra redaction, or `drop: true` for a route whose output nothing can
+  pattern-match safely. It can only ever *tighten*, which is what makes it safe
+  to key on a route the producer reports without verifying it: the worst a
+  silent or lying client can do is land on the global floor.
+- **`optictrace scan` and `review` read them too.** A payload is structured and can be
   masked by JSON path; a log line is free text. A leak detector that only reads
   payloads looks where the data is easiest to protect rather than where it
   escapes, so scan reports on both and the suggested fix differs — a pattern or
@@ -1219,13 +1247,15 @@ telemetry:
 | Labels — all six sources, `\|regex` capture | ✅ | ✅ | ✅ | ✅ |
 | Meters | ✅ | ✅ | ✅ | ✅ |
 | Trace correlation | ✅ | ✅ | ✅ | ✅ |
-| Tail-based `keep_errors` / `keep_slower_than` | ✅ | — | ✅ | ✅ |
+| Tail-based `keep_errors` / `keep_slower_than` | ✅ | ✅ | ✅ | ✅ |
 | Application logs | ✅ | ✅ | ✅ | ✅ |
 
 <sub>Gin and net/http route through the same Go interceptor as the proxy, so
 they inherit everything it does. Every SDK's suite can assert that a **live
 agent accepts** what it produces — set `OPTIC_AGENT_URL` and run it that way in
-CI, because offline tests cannot catch a record the agent rejects.</sub>
+CI, because offline tests cannot catch a record the agent rejects. The Java SDK
+also ships a generated `javax.servlet` variant for Spring Boot 2, compiled *and
+run* in CI.</sub>
 
 ### Node.js / Express
 

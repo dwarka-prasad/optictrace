@@ -185,6 +185,13 @@ func (ic *Interceptor) Wrap(next http.Handler) http.Handler {
 		// rules can only be decided with them, and a rule that cannot be
 		// decided does not apply.
 		policy := ic.engine.Load().EvaluateAttrs(engine.AttrsOf(r))
+		// Re-publish with the resolved route now that the policy is known: a
+		// per-rule `logs:` block keys on it, and the handler's log lines need
+		// to carry it.
+		if policy.RoutePattern != "" {
+			tc.Route = policy.RoutePattern
+			r = r.WithContext(tracectx.NewContext(r.Context(), tc))
+		}
 
 		// Uniform sampling draw, made up front. Tail-based rules can rescue
 		// a request this draw discarded, but only once the outcome is known

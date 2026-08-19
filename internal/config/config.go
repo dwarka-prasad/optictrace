@@ -519,6 +519,39 @@ type AppLogsCfg struct {
 	// applied to the message and to every structured field value; each match
 	// is replaced with [REDACTED].
 	Redact AppLogRedact `yaml:"redact"`
+	// Sources collect lines the application already writes, instead of
+	// requiring it to POST them. An app that logs JSON to stdout needs no code
+	// change at all — which matters, because the services whose logs you most
+	// want are usually the ones nobody wants to modify.
+	Sources []AppLogSource `yaml:"sources"`
+}
+
+// AppLogSource is one place to read application log lines from.
+type AppLogSource struct {
+	// Type is "stdout" (the child process started with `optictrace run -exec`)
+	// or "file".
+	Type string `yaml:"type"`
+	// Path is the file to tail, for type: file. Rotation is followed.
+	Path string `yaml:"path"`
+	// Service overrides the service name attributed to these lines. Defaults
+	// to service.name.
+	Service string `yaml:"service"`
+	// Format is "json" (the default) or "text". A text line has no fields and
+	// no span of its own unless SpanPattern finds one, so text sources mostly
+	// produce orphans — which is worth knowing before choosing the format
+	// rather than after seeing an empty dashboard.
+	Format string `yaml:"format"`
+	// Field names to read a JSON line's parts from. Empty values fall back to
+	// the conventional names, so a structured logger usually needs no mapping.
+	TraceField   string `yaml:"trace_field"`   // default: trace_id
+	SpanField    string `yaml:"span_field"`    // default: span_id
+	LevelField   string `yaml:"level_field"`   // default: level
+	MessageField string `yaml:"message_field"` // default: message, then msg
+	RouteField   string `yaml:"route_field"`   // default: route
+	// SpanPattern extracts a span id from a line that has no structured field
+	// for it — a regex with one capture group. The escape hatch for text logs
+	// and for loggers that only interpolate the id into the message.
+	SpanPattern string `yaml:"span_pattern"`
 }
 
 // AppLogRedact is the log-line equivalent of a rule's redact block.
@@ -542,6 +575,11 @@ func (a *AppLogsCfg) validate() error {
 			return fmt.Errorf("telemetry.app_logs.redact.patterns[%d] (%q): %w", i, pat, err)
 		}
 	}
+	for i := range a.Sources {
+		if err := a.Sources[i].validate(i); err != nil {
+			return err
+		}
+	}
 	if a.LevelMin != "" && LevelRankKnown(a.LevelMin) < 0 {
 		return fmt.Errorf("telemetry.app_logs.level_min %q is not a level "+
 			"(debug, info, warn, error, fatal)", a.LevelMin)
@@ -555,6 +593,28 @@ func (a *AppLogsCfg) validate() error {
 	}
 	if a.RetentionMaxAge < 0 {
 		return fmt.Errorf("telemetry.app_logs.retention_max_age %s must not be negative", a.RetentionMaxAge)
+	}
+	return nil
+}
+
+// validate checks a per-rule logs block at load time. A redaction pattern that
+// does not compile must fail startup: the alternative is an agent that runs
+// happily while the rule meant to mask credentials never applies.
+func (l *RuleLogs) validate() error {
+	if l == nil {
+		return nil
+	}
+	if l.LevelMin != "" && LevelRankKnown(l.LevelMin) < 0 {
+		return fmt.Errorf("logs.level_min %q is not a level (debug, info, warn, error, fatal)", l.LevelMin)
+	}
+	if l.MaxLinesPerSpan < 0 {
+		return fmt.Errorf("logs.max_lines_per_span %d must be >= 0 "+
+			"(a per-rule block can only lower the global cap, never remove it)", l.MaxLinesPerSpan)
+	}
+	for i, pat := range l.Redact.Patterns {
+		if _, err := regexp.Compile(pat); err != nil {
+			return fmt.Errorf("logs.redact.patterns[%d] (%q): %w", i, pat, err)
+		}
 	}
 	return nil
 }
@@ -578,6 +638,38 @@ func LevelRankKnown(level string) int {
 		return 5
 	}
 	return -1
+}
+
+// validate checks one source at load time.
+func (s *AppLogSource) validate(i int) error {
+	switch s.Type {
+	case "stdout":
+		if s.Path != "" {
+			return fmt.Errorf("telemetry.app_logs.sources[%d]: type stdout takes no path", i)
+		}
+	case "file":
+		if s.Path == "" {
+			return fmt.Errorf("telemetry.app_logs.sources[%d]: type file requires a path", i)
+		}
+	default:
+		return fmt.Errorf("telemetry.app_logs.sources[%d]: type %q is not stdout or file", i, s.Type)
+	}
+	switch s.Format {
+	case "", "json", "text":
+	default:
+		return fmt.Errorf("telemetry.app_logs.sources[%d]: format %q is not json or text", i, s.Format)
+	}
+	if s.SpanPattern != "" {
+		re, err := regexp.Compile(s.SpanPattern)
+		if err != nil {
+			return fmt.Errorf("telemetry.app_logs.sources[%d].span_pattern: %w", i, err)
+		}
+		if re.NumSubexp() != 1 {
+			return fmt.Errorf("telemetry.app_logs.sources[%d].span_pattern needs exactly one "+
+				"capture group (it is what identifies the span), got %d", i, re.NumSubexp())
+		}
+	}
+	return nil
 }
 
 // DropOrphanLines reports whether uncorrelated lines are discarded.
@@ -644,6 +736,41 @@ type Rule struct {
 	// summed per consumer for usage/cost attribution. Metering is
 	// independent of capture rules: a restricted route can still meter.
 	Meter map[string]string `yaml:"meter"`
+	// Logs narrows the application-log policy for requests this rule matches.
+	//
+	// telemetry.app_logs sets the floor for every route; this tightens it per
+	// route, which is the shape the risk actually has. A payments handler
+	// deserves a stricter level floor and extra redaction than a health check,
+	// and expressing that globally means applying the strictest setting
+	// everywhere — which in practice means people set it loosely.
+	//
+	// Only ever tightens. A rule cannot raise a cap or lower a level floor
+	// below the global one: a per-route override that could weaken the global
+	// policy would make the global setting a suggestion rather than a
+	// guarantee, and reviewing one file would no longer tell you what is
+	// enforced.
+	Logs *RuleLogs `yaml:"logs"`
+}
+
+// RuleLogs is the per-rule application-log policy. Every field is optional;
+// an omitted field inherits telemetry.app_logs.
+type RuleLogs struct {
+	// LevelMin raises the severity floor for this route. Ignored if it would
+	// LOWER the global floor.
+	LevelMin string `yaml:"level_min"`
+	// MaxLinesPerSpan lowers the per-request line cap for this route. Ignored
+	// if it would raise the global cap. -1 is not accepted here: removing the
+	// cap is a global decision.
+	MaxLinesPerSpan int `yaml:"max_lines_per_span"`
+	// Redact adds patterns and field names on top of the global set. Additive
+	// only — there is no way to remove a global redaction, because a rule that
+	// could unmask something would make the global list unreviewable.
+	Redact AppLogRedact `yaml:"redact"`
+	// Drop discards application log lines for this route entirely. The
+	// honest way to say "never store what this handler logs" — a debug
+	// endpoint, or a route whose logs are known to carry secrets nothing can
+	// pattern-match reliably.
+	Drop bool `yaml:"drop"`
 }
 
 // Match selects requests by path glob and (optionally) HTTP methods.
@@ -913,6 +1040,12 @@ func (c *Config) Validate() error {
 	if err := c.Telemetry.AppLogs.validate(); err != nil {
 		return err
 	}
+	for _, r := range c.Rules {
+		if r.Logs != nil && (c.Telemetry.AppLogs == nil || !c.Telemetry.AppLogs.Enabled) {
+			return fmt.Errorf("rule %q has a `logs:` block but telemetry.app_logs.enabled is not true — "+
+				"the block would be silently ignored", r.Name)
+		}
+	}
 	for _, o := range c.Telemetry.CORSOrigins {
 		if o == "*" {
 			// A wildcard means any page the operator visits can read the
@@ -1169,6 +1302,9 @@ func (r *Rule) validate() error {
 	}
 	if r.Sample != nil && (*r.Sample <= 0 || *r.Sample > 1) {
 		return fmt.Errorf("sample %v must be in (0, 1]", *r.Sample)
+	}
+	if err := r.Logs.validate(); err != nil {
+		return err
 	}
 	for name, path := range r.Meter {
 		if !strings.HasPrefix(path, "$.") || len(path) <= 2 {

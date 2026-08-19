@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dwarka-prasad/optictrace/ext"
 	"github.com/dwarka-prasad/optictrace/internal/config"
 	"github.com/dwarka-prasad/optictrace/internal/engine"
 	"github.com/dwarka-prasad/optictrace/internal/scan"
@@ -82,18 +83,28 @@ func (c Coverage) FieldPct() float64 {
 
 // Report is a complete review.
 type Report struct {
-	Window        string               `json:"window"`
-	Coverage      Coverage             `json:"coverage"`
-	PolicyChanges []PolicyChange       `json:"policy_changes"`
-	Leaks         []scan.Finding       `json:"leaks"`
-	Suggestions   []suggest.Suggestion `json:"suggestions"`
-	SpecFindings  []spec.Finding       `json:"spec_findings"`
-	ComparedBase  bool                 `json:"compared_base"`
+	Window        string         `json:"window"`
+	Coverage      Coverage       `json:"coverage"`
+	PolicyChanges []PolicyChange `json:"policy_changes"`
+	Leaks         []scan.Finding `json:"leaks"`
+	// LogLinesReviewed says how many application log lines were read. Printed
+	// because "no leaks" over zero lines means something very different from
+	// no leaks over forty thousand.
+	LogLinesReviewed int                  `json:"log_lines_reviewed"`
+	Suggestions      []suggest.Suggestion `json:"suggestions"`
+	SpecFindings     []spec.Finding       `json:"spec_findings"`
+	ComparedBase     bool                 `json:"compared_base"`
 }
 
 // Options configures a review.
 type Options struct {
 	Records []store.Record
+	// AppLogs are application log lines from the same window, optional.
+	// Reviewed alongside the records because they are the riskier surface: a
+	// payload is structured and can be masked by JSON path, a log line is free
+	// text. A PR check that reads only payloads passes the change that starts
+	// logging a card number.
+	AppLogs []ext.AppLog
 	Head    *config.Config // policy as of this PR (required)
 	Base    *config.Config // policy on the base branch (optional)
 	Spec    *spec.Spec     // optional: also run the breaking-change check
@@ -120,7 +131,12 @@ func Run(o Options) *Report {
 	for i := range o.Records {
 		sc.Add(&o.Records[i])
 	}
-	rep.Leaks = sc.Report().Findings
+	for i := range o.AppLogs {
+		sc.AddAppLog(&o.AppLogs[i])
+	}
+	report := sc.Report()
+	rep.Leaks = report.Findings
+	rep.LogLinesReviewed = report.LinesScanned
 	rep.Suggestions = suggest.Records(o.Records, head).Actionable()
 	if o.Spec != nil {
 		rep.SpecFindings = spec.Check(o.Spec, o.Records)

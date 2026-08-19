@@ -57,7 +57,13 @@ bench: ## Measure interceptor overhead vs a bare handler
 demo: dev ## Alias for `make dev`
 
 docker: ## Build the production image
-	docker build -t optictrace:dev .
+	# BuildKit is required: the build stages are pinned to $$BUILDPLATFORM so a
+	# multi-arch build cross-compiles instead of emulating, and the classic
+	# builder does not define it.
+	DOCKER_BUILDKIT=1 docker build -t optictrace:dev .
+
+docker-multiarch: ## Build for amd64 + arm64 exactly as the release does
+	docker buildx build --platform linux/amd64,linux/arm64 -t optictrace:dev .
 
 clean: ## Remove build output and the local store
 	rm -rf bin ui/out ui/.next optictrace.db*

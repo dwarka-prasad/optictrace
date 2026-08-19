@@ -35,6 +35,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -81,6 +82,7 @@ func Run(args []string, ver string) {
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	configPath := fs.String("config", "optic.yaml", "path to optic.yaml")
 	uiDir := fs.String("ui", "ui/out", "static dashboard directory (optional)")
+	execCmd := fs.String("exec", "", "run: start this command and collect its stdout/stderr as application logs")
 	specPath := fs.String("spec", "", "OpenAPI spec file (check/mock/sdk)")
 	outPath := fs.String("out", "", "output file (spec/sdk); default stdout")
 	window := fs.Duration("window", 24*time.Hour, "traffic window to analyze (spec/check)")
@@ -107,7 +109,7 @@ func Run(args []string, ver string) {
 
 	switch cmd {
 	case "run":
-		run(*configPath, *uiDir)
+		run(*configPath, *uiDir, *execCmd)
 	case "validate":
 		validate(*configPath)
 	case "spec":
@@ -337,6 +339,12 @@ func reviewChanges(a reviewArgs) {
 	}
 
 	opts := review.Options{Records: records, Head: headCfg, Window: a.window.String()}
+	// Application log lines from the same window, when the local store has
+	// them. A remote or file-based review has records only, which is reported
+	// rather than hidden: the report prints how many lines it read.
+	if a.from == "" && a.fromFile == "" {
+		opts.AppLogs = loadAppLogs(headCfg, a.window)
+	}
 	if a.baseConfig != "" {
 		// A missing base config is not fatal: on the first PR that adds
 		// optic.yaml there is nothing to diff against, and failing there
@@ -471,6 +479,40 @@ func scannedSummary(r *scan.Report) string {
 // scanAppLogs feeds stored application log lines to the scanner. A store
 // driver without app-log support, or a config with the feature off, simply
 // contributes nothing — this is an optional surface, not a required one.
+// loadAppLogs reads stored application log lines for a window. Returns nothing
+// when the feature is off or the driver has no app-log support — this is an
+// optional surface, not a required one.
+func loadAppLogs(cfg *config.Config, window time.Duration) []ext.AppLog {
+	if cfg == nil || cfg.Telemetry.AppLogs == nil || !cfg.Telemetry.AppLogs.Enabled {
+		return nil
+	}
+	st, err := openStore(&cfg.Telemetry.Store)
+	if err != nil {
+		return nil
+	}
+	defer st.Close()
+	als, ok := st.(store.AppLogStore)
+	if !ok {
+		return nil
+	}
+	var out []ext.AppLog
+	limit := store.AnalysisLimit(cfg.Telemetry.Store.AnalysisMaxRows)
+	since := time.Now().Add(-window)
+	for len(out) < limit {
+		lines, total, err := als.QueryAppLogs(context.Background(), store.AppLogFilter{
+			Since: since, Limit: 500, Offset: len(out),
+		})
+		if err != nil || len(lines) == 0 {
+			break
+		}
+		out = append(out, lines...)
+		if int64(len(out)) >= total {
+			break
+		}
+	}
+	return out
+}
+
 func scanAppLogs(sc *scan.Scanner, cfg *config.Config, window time.Duration) {
 	if cfg == nil || cfg.Telemetry.AppLogs == nil || !cfg.Telemetry.AppLogs.Enabled {
 		return
@@ -501,6 +543,82 @@ func scanAppLogs(sc *scan.Scanner, cfg *config.Config, window time.Duration) {
 			return
 		}
 	}
+}
+
+// hasStdoutSource reports whether the config already declares one, so -exec
+// does not add a duplicate.
+func hasStdoutSource(sources []config.AppLogSource) bool {
+	for _, s := range sources {
+		if s.Type == "stdout" {
+			return true
+		}
+	}
+	return false
+}
+
+// startChild runs a command with `sh -c`, collecting its output.
+//
+// The output is ALSO echoed to this process's own stdout/stderr: collecting a
+// service's logs must not stop them reaching wherever its operators already
+// read them. A collector that silently swallows logs is worse than no
+// collector.
+func startChild(command string, collector *applog.Collector, sources []config.AppLogSource,
+	logger *slog.Logger) <-chan int {
+
+	cmd := exec.Command("sh", "-c", command)
+	cmd.Stdin = os.Stdin
+
+	src := config.AppLogSource{Type: "stdout"}
+	for _, s := range sources {
+		if s.Type == "stdout" {
+			src = s
+			break
+		}
+	}
+
+	if collector == nil {
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	} else {
+		outPipe, err := cmd.StdoutPipe()
+		if err != nil {
+			logger.Error("cannot capture child stdout", "error", err)
+			return nil
+		}
+		errPipe, err := cmd.StderrPipe()
+		if err != nil {
+			logger.Error("cannot capture child stderr", "error", err)
+			return nil
+		}
+		go collector.Read(context.Background(), outPipe, src, os.Stdout)
+		go collector.Read(context.Background(), errPipe, src, os.Stderr)
+	}
+
+	if err := cmd.Start(); err != nil {
+		logger.Error("cannot start -exec command", "command", command, "error", err)
+		os.Exit(1)
+	}
+	logger.Info("started child process", "command", command, "pid", cmd.Process.Pid)
+
+	// The child is the reason this agent is running: if it exits, staying up
+	// would leave a proxy in front of nothing. But it must NOT exit from here.
+	// os.Exit in a goroutine skips the shutdown path, and the shutdown path is
+	// what drains collected log lines — so the last lines of a crashing
+	// process, which are the ones worth having, would be lost. Report the code
+	// and let the main loop shut down properly.
+	done := make(chan int, 1)
+	go func() {
+		err := cmd.Wait()
+		code := 0
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			code = ee.ExitCode()
+		} else if err != nil {
+			code = 1
+		}
+		logger.Info("child process exited", "code", code)
+		done <- code
+	}()
+	return done
 }
 
 func loadTraffic(configPath string, window time.Duration) (*config.Config, []store.Record) {
@@ -760,7 +878,7 @@ func resolveUIDir(flagValue string, logger *slog.Logger) string {
 	return ""
 }
 
-func run(configPath, uiDir string) {
+func run(configPath, uiDir, execCmd string) {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	uiDir = resolveUIDir(uiDir, logger)
 
@@ -826,6 +944,12 @@ func run(configPath, uiDir string) {
 		logger.Error("invalid app-log policy", "error", err)
 		os.Exit(1)
 	}
+	// Per-rule `logs:` blocks tighten the global policy for the routes they
+	// match. Compiled here rather than per line, and only ever narrowing.
+	if err := appLogs.WithRules(cfg.Rules); err != nil {
+		logger.Error("invalid per-rule app-log policy", "error", err)
+		os.Exit(1)
+	}
 	var appLogStore store.AppLogStore
 	if appLogs.Enabled() {
 		if als, ok := reader.(store.AppLogStore); ok {
@@ -838,6 +962,58 @@ func run(configPath, uiDir string) {
 				"lines will be refused",
 				"driver", cfg.Telemetry.Store.Driver)
 		}
+	}
+
+	// --- application-log collection ---------------------------------------
+	// Sources read what the application already writes, so a service that logs
+	// JSON to stdout needs no code change. Started before the child process so
+	// its first lines are not missed.
+	var logCollector *applog.Collector
+	// Closed when an -exec child exits, carrying its status so this process can
+	// mirror it after shutting down cleanly.
+	var childExit <-chan int
+	if appLogs.Enabled() && appLogStore != nil {
+		cfgSources := cfg.Telemetry.AppLogs.Sources
+		if execCmd != "" && !hasStdoutSource(cfgSources) {
+			// -exec without a declared stdout source is unambiguous: the point
+			// of -exec is to collect that process's output.
+			cfgSources = append(cfgSources, config.AppLogSource{Type: "stdout"})
+		}
+		if len(cfgSources) > 0 {
+			logCollector = applog.NewCollector(appLogs, appLogStore, cfg.Service.Name, logger)
+			if collector != nil {
+				// Same counters as the ingest endpoint, so a drop is visible
+				// however the line arrived.
+				logCollector.OnDrop(func(reason string) { collector.AppLogDropped(reason, 1) })
+				logCollector.OnKeep(collector.AppLogStored)
+			}
+			logCollector.Start(context.Background())
+			for _, src := range cfgSources {
+				// A line with no span is an orphan, and orphans are dropped by
+				// default. For a text source without a span_pattern that is
+				// EVERY line, which looks like a broken collector rather than a
+				// working policy — so say it at startup rather than leaving
+				// someone to find an empty dashboard and a drop counter.
+				if src.Format == "text" && src.SpanPattern == "" && cfg.Telemetry.AppLogs.DropOrphanLines() {
+					logger.Warn("app-log source has format: text with no span_pattern — "+
+						"its lines carry no span, so every one will be dropped as an orphan; "+
+						"set span_pattern, use format: json, or set drop_orphans: false",
+						"path", src.Path, "type", src.Type)
+				}
+				if src.Type == "file" {
+					logger.Info("collecting application logs", "source", "file", "path", src.Path)
+					logCollector.Tail(context.Background(), src)
+				}
+			}
+			if execCmd != "" {
+				childExit = startChild(execCmd, logCollector, cfgSources, logger)
+			}
+		}
+	} else if execCmd != "" {
+		logger.Warn("-exec given but application logs are not collectable — " +
+			"set telemetry.app_logs.enabled and a store driver that supports them; " +
+			"the command will still run, its output only echoed")
+		childExit = startChild(execCmd, nil, nil, logger)
 	}
 
 	// --- output exporters (custom plugins) --------------------------------
@@ -853,6 +1029,18 @@ func run(configPath, uiDir string) {
 			os.Exit(1)
 		}
 		logger.Info("exporters started", "count", len(cfg.Telemetry.Exporters))
+
+		// Collected lines fan out to exporters too. Wired here rather than
+		// where the collector is built, because the dispatcher does not exist
+		// until now — an audit trail holding the requests but not the lines
+		// those requests wrote is missing the riskier half.
+		if logCollector != nil && dispatcher.AcceptsAppLogs() {
+			logCollector.OnStored(func(lines []ext.AppLog) {
+				for i := range lines {
+					dispatcher.EnqueueAppLog(&lines[i])
+				}
+			})
+		}
 	}
 
 	// --- proxy ----------------------------------------------------------
@@ -1007,7 +1195,14 @@ func run(configPath, uiDir string) {
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	<-stop
+	exitCode := 0
+	select {
+	case <-stop:
+	case code := <-childExit:
+		// Mirror the child's status: a supervisor reads it, and reporting 0 for
+		// a crashed process would make the crash invisible.
+		exitCode = code
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1015,6 +1210,9 @@ func run(configPath, uiDir string) {
 		_ = proxySrv.Shutdown(ctx)
 	}
 	_ = adminSrv.Shutdown(ctx)
+	if logCollector != nil {
+		logCollector.Close() // drains collected log lines
+	}
 	if writer != nil {
 		_ = writer.Close() // drains the telemetry queue
 	}
@@ -1022,4 +1220,9 @@ func run(configPath, uiDir string) {
 		dispatcher.Shutdown() // flushes exporter batches
 	}
 	logger.Info("optictrace stopped")
+	if exitCode != 0 {
+		// Only after the drain above: the last lines of a crashing process are
+		// the ones worth having.
+		os.Exit(exitCode)
+	}
 }

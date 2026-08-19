@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS app_logs (
 	service   TEXT NOT NULL DEFAULT '',
 	trace_id  TEXT NOT NULL DEFAULT '',
 	span_id   TEXT NOT NULL DEFAULT '',
+	route     TEXT NOT NULL DEFAULT '',
 	level     TEXT NOT NULL DEFAULT '',
 	message   TEXT NOT NULL DEFAULT '',
 	fields    TEXT NOT NULL DEFAULT '',
@@ -109,6 +110,13 @@ func NewSQLite(dsn string) (*SQLiteStore, error) {
 			db.Close()
 			return nil, fmt.Errorf("migrate schema (%s): %w", m.col, err)
 		}
+	}
+	// app_logs shipped in v0.9.0 without a route column, so an existing store
+	// needs it added rather than only being in CREATE TABLE.
+	if _, err := db.Exec(`ALTER TABLE app_logs ADD COLUMN route TEXT NOT NULL DEFAULT ''`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		db.Close()
+		return nil, fmt.Errorf("migrate app_logs schema (route): %w", err)
 	}
 	return &SQLiteStore{db: db}, nil
 }

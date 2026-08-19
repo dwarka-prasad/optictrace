@@ -1,0 +1,33 @@
+# The build context is uploaded to the daemon in full, so anything not needed to
+# BUILD belongs here. Local dependency and artifact trees are the bulk of it —
+# and node_modules is also actively harmful: it can shadow the clean install the
+# ui stage does, with a tree built for a different architecture.
+.git
+.github
+
+# Dependency and build output
+node_modules
+ui/node_modules
+ui/.next
+ui/out
+bin
+dist
+sdks/express/node_modules
+
+# Local stores and run artifacts — telemetry from someone's laptop has no
+# business inside a published image.
+*.db
+*.db-wal
+*.db-shm
+examples/**/.run
+examples/**/.venv
+examples/python-shop/shop.db*
+__pycache__
+.venv
+
+# Java build output
+sdks/java/target
+
+# Editor and OS noise
+.DS_Store
+*.swp

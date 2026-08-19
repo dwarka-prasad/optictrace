@@ -29,8 +29,8 @@ func (s *SQLiteStore) SaveAppLogs(ctx context.Context, lines []ext.AppLog) error
 	defer tx.Rollback()
 
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO app_logs (ts, service, trace_id, span_id, level, message, fields, source, truncated)
-		VALUES (?,?,?,?,?,?,?,?,?)`)
+		INSERT INTO app_logs (ts, service, trace_id, span_id, route, level, message, fields, source, truncated)
+		VALUES (?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}
@@ -50,7 +50,7 @@ func (s *SQLiteStore) SaveAppLogs(ctx context.Context, lines []ext.AppLog) error
 			l.Time = time.Now()
 		}
 		if _, err := stmt.ExecContext(ctx, l.Time.UnixMilli(), l.Service, l.TraceID,
-			l.SpanID, l.Level, l.Message, fields, l.Source, boolInt(l.Truncated)); err != nil {
+			l.SpanID, l.Route, l.Level, l.Message, fields, l.Source, boolInt(l.Truncated)); err != nil {
 			return err
 		}
 	}
@@ -126,7 +126,7 @@ func (s *SQLiteStore) QueryAppLogs(ctx context.Context, f ext.AppLogFilter) ([]e
 	if limit <= 0 {
 		limit = 200
 	}
-	q := `SELECT id, ts, service, trace_id, span_id, level, message, fields, source, truncated
+	q := `SELECT id, ts, service, trace_id, span_id, route, level, message, fields, source, truncated
 		FROM app_logs` + clause + ` ORDER BY ts ASC, id ASC LIMIT ? OFFSET ?`
 	rows, err := s.db.QueryContext(ctx, q, append(args, limit, f.Offset)...)
 	if err != nil {
@@ -168,7 +168,7 @@ func scanAppLog(sc scannable) (*ext.AppLog, error) {
 		fields    string
 		truncated int
 	)
-	if err := sc.Scan(&l.ID, &ts, &l.Service, &l.TraceID, &l.SpanID,
+	if err := sc.Scan(&l.ID, &ts, &l.Service, &l.TraceID, &l.SpanID, &l.Route,
 		&l.Level, &l.Message, &fields, &l.Source, &truncated); err != nil {
 		return nil, err
 	}

@@ -62,6 +62,28 @@ def redact_path(node: Any, path: list[str]) -> Any:
     return node
 
 
+def _parse_duration(value) -> Optional[float]:
+    """Go-style durations ("250ms", "1s", "2m") in milliseconds.
+
+    optic.yaml is written for the Go agent, so the spellings it accepts are the
+    ones this has to understand — a config that works there and is silently
+    ignored here is the kind of divergence nobody goes looking for.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    try:
+        if text.endswith("ms"):
+            return float(text[:-2])
+        if text.endswith("s"):
+            return float(text[:-1]) * 1000
+        if text.endswith("m"):
+            return float(text[:-1]) * 60_000
+        return float(text)
+    except ValueError as exc:
+        raise ValueError(f"optic.yaml: cannot parse duration {value!r}") from exc
+
+
 def _parse_meters(spec: dict, rule_name: str) -> dict:
     """`meter: {name: "$.usage.total_tokens"}` -> {name: [["usage","total_tokens"]]}.
 
@@ -173,7 +195,30 @@ class Policy:
     matched_rules: list[str] = field(default_factory=list)
     route_pattern: str = ""
     sample_rate: float = 1.0
+    # Tail-based keeps. `sample` is a draw made up front; these rescue a
+    # request AFTER the outcome is known, because a coin flip that discards
+    # your 500s is worse than no sampling at all.
+    keep_errors: bool = False
+    keep_slower_than_ms: Optional[float] = None
     meters: dict = field(default_factory=dict)  # name -> [path segments]
+
+    def keep_body(self, drew: bool, status: int, elapsed_ms: float) -> bool:
+        """Whether the BODY may be stored for this exchange.
+
+        Mirrors engine.Policy.KeepBody. Two details matter for parity: the
+        record is ALWAYS emitted — metrics and metadata are never sampled — and
+        keep_errors means 5xx, not 4xx. A 404 is usually the client's problem,
+        and rescuing it would defeat the sampling it works alongside.
+        """
+        if drew:
+            return True
+        if self.keep_errors and status >= 500:
+            return True
+        return self.keep_slower_than_ms is not None and elapsed_ms >= self.keep_slower_than_ms
+
+    def tail_sampled(self) -> bool:
+        """Whether any tail rule applies, so bytes must be buffered up front."""
+        return self.keep_errors or self.keep_slower_than_ms is not None
 
     def extract_meters(self, raw: bytes) -> dict:
         """Pull numeric usage out of a response body.
@@ -229,6 +274,8 @@ class _Rule:
     redact_paths: list[list[str]]
     labels: dict[str, str]
     sample: Optional[float]
+    keep_errors: bool
+    keep_slower_than_ms: Optional[float]
     meters: dict[str, list[list[str]]]
 
 
@@ -268,6 +315,8 @@ class Engine:
                     redact_paths=paths,
                     labels=r.get("labels") or {},
                     sample=r.get("sample"),
+                    keep_errors=r.get("keep_errors") is True,
+                    keep_slower_than_ms=_parse_duration(r.get("keep_slower_than")),
                     meters=_parse_meters(r.get("meter") or {}, r.get("name") or f"#{i}"),
                 )
             )
@@ -289,6 +338,14 @@ class Engine:
             policy.route_pattern = r.raw_pattern
             if r.sample is not None:
                 policy.sample_rate = r.sample
+            if r.keep_errors:
+                policy.keep_errors = True
+            if r.keep_slower_than_ms is not None:
+                policy.keep_slower_than_ms = (
+                    r.keep_slower_than_ms
+                    if policy.keep_slower_than_ms is None
+                    else min(policy.keep_slower_than_ms, r.keep_slower_than_ms)
+                )
             if "request_body" in r.restrict:
                 policy.capture_request_body = False
             if "response_body" in r.restrict:

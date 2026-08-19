@@ -181,6 +181,25 @@ function redactBody(raw, contentType, policy) {
   return `<${contentType || 'unknown'} body, ${Buffer.byteLength(raw)} bytes captured>`;
 }
 
+/**
+ * Whether the BODY may be stored for this exchange.
+ *
+ * Mirrors engine.Policy.KeepBody. Two details matter for parity: the record is
+ * ALWAYS emitted — metrics and metadata are never sampled — and keep_errors
+ * means 5xx, not 4xx. A 404 is usually the client's problem, and rescuing it
+ * would defeat the sampling it is meant to work alongside.
+ */
+function keepBody(policy, drew, status, elapsedMs) {
+  if (drew) return true;
+  if (policy.keepErrors && status >= 500) return true;
+  return policy.keepSlowerThanMs !== null && elapsedMs >= policy.keepSlowerThanMs;
+}
+
+/** Whether any tail rule applies, so bytes must be buffered up front. */
+function tailSampled(policy) {
+  return policy.keepErrors || policy.keepSlowerThanMs !== null;
+}
+
 /** `meter: {name: "$.usage.total_tokens"}` -> {name: [["usage","total_tokens"]]}. */
 function parseMeters(spec, ruleName) {
   const out = {};
@@ -371,6 +390,8 @@ function labelValue(src, { headers = {}, query = {}, path = '', requestBody, res
 
 module.exports = {
   Engine,
+  keepBody,
+  tailSampled,
   sanitizeHeaders,
   sanitizeQuery,
   redactBody,

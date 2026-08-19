@@ -77,7 +77,12 @@ class OpticTraceMiddleware:
         method = scope["method"]
         path = scope["path"]
         policy = self.engine.evaluate(method, path)
-        sampled = policy.sample_rate >= 1.0 or random.random() < policy.sample_rate
+        # The up-front draw. Tail-based rules can rescue a request this draw
+        # discarded, but only once the outcome is known — so when they are
+        # configured the bytes are buffered regardless and the decision is made
+        # at the end, in Policy.keep_body().
+        drew = policy.sample_rate >= 1.0 or random.random() < policy.sample_rate
+        buffer_bytes = drew or policy.tail_sampled()
 
         req_headers = {
             k.decode("latin-1"): v.decode("latin-1") for k, v in scope.get("headers", [])
@@ -100,8 +105,8 @@ class OpticTraceMiddleware:
             "resp_trunc": False,
         }
 
-        capture_req = sampled and policy.capture_request_body
-        capture_resp = sampled and policy.capture_response_body
+        capture_req = buffer_bytes and policy.capture_request_body
+        capture_resp = buffer_bytes and policy.capture_response_body
         # Meters read the response bytes even when the body is not STORED:
         # metering is independent of capture, which is what lets a rule keep a
         # prompt private while still counting the tokens in it. Without this,
@@ -143,8 +148,12 @@ class OpticTraceMiddleware:
         finally:
             current_span.reset(token)
             duration_ms = (time.perf_counter() - start) * 1000
+            # The record is ALWAYS built: a request that produced none is
+            # invisible to every count and percentile. Sampling decides whether
+            # the BODY is stored.
+            keep_body = policy.keep_body(drew, state["status"], duration_ms)
             record = self._build_record(
-                scope, method, path, policy, req_headers, state, duration_ms, ctx
+                scope, method, path, policy, req_headers, state, duration_ms, ctx, keep_body
             )
             if self.console_log or not self.ingest_url:
                 print(json.dumps({"msg": "http_exchange", **record}), flush=True)
@@ -152,7 +161,8 @@ class OpticTraceMiddleware:
                 # Fire-and-forget in a worker thread — urllib is blocking.
                 asyncio.get_running_loop().run_in_executor(None, self._ship, record)
 
-    def _build_record(self, scope, method, path, policy, req_headers, state, duration_ms, ctx=None):
+    def _build_record(self, scope, method, path, policy, req_headers, state, duration_ms,
+                      ctx=None, keep_body=True):
         client = scope.get("client") or ("", 0)
         record = {
             # RFC3339. `%z` renders "+0530", which the agent's strict RFC3339
@@ -180,7 +190,7 @@ class OpticTraceMiddleware:
         if policy.capture_headers:
             record["request_headers"] = policy.sanitize_headers(req_headers)
             record["response_headers"] = policy.sanitize_headers(state["resp_headers"])
-        if state["req_body"]:
+        if state["req_body"] and keep_body:
             record["request_body"] = policy.redact_body(
                 bytes(state["req_body"]), req_headers.get("content-type", "")
             )
@@ -192,7 +202,9 @@ class OpticTraceMiddleware:
             if meters:
                 record["meters"] = meters
             # Buffered for metering is not the same as allowed to be stored.
-            if policy.capture_response_body:
+            # Buffered for metering is not the same as allowed to be stored,
+            # and neither is buffered for a tail rule that did not fire.
+            if policy.capture_response_body and keep_body:
                 governed_response = policy.redact_body(
                     bytes(state["resp_body"]), state["resp_headers"].get("content-type", "")
                 )

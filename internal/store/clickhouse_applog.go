@@ -26,8 +26,8 @@ func (s *ClickHouseStore) SaveAppLogs(ctx context.Context, lines []ext.AppLog) e
 		return err
 	}
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO app_logs (id, ts, service, trace_id, span_id, level, message, fields, source, truncated)
-		VALUES (?,?,?,?,?,?,?,?,?,?)`)
+		INSERT INTO app_logs (id, ts, service, trace_id, span_id, route, level, message, fields, source, truncated)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		tx.Rollback()
 		return err
@@ -47,7 +47,7 @@ func (s *ClickHouseStore) SaveAppLogs(ctx context.Context, lines []ext.AppLog) e
 			fields = string(raw)
 		}
 		if _, err := stmt.ExecContext(ctx, s.nextID(l.Time), l.Time.UnixMilli(), l.Service,
-			l.TraceID, l.SpanID, l.Level, l.Message, fields, l.Source,
+			l.TraceID, l.SpanID, l.Route, l.Level, l.Message, fields, l.Source,
 			uint8(boolInt(l.Truncated))); err != nil {
 			tx.Rollback()
 			return err
@@ -121,7 +121,7 @@ func (s *ClickHouseStore) QueryAppLogs(ctx context.Context, f ext.AppLogFilter) 
 		limit = 200
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, ts, service, trace_id, span_id, level, message, fields, source, truncated
+		`SELECT id, ts, service, trace_id, span_id, route, level, message, fields, source, truncated
 		 FROM app_logs`+clause+` ORDER BY ts ASC, id ASC LIMIT ? OFFSET ?`,
 		append(args, limit, f.Offset)...)
 	if err != nil {
@@ -137,7 +137,7 @@ func (s *ClickHouseStore) QueryAppLogs(ctx context.Context, f ext.AppLogFilter) 
 			fields    string
 			truncated uint8
 		)
-		if err := rows.Scan(&l.ID, &ts, &l.Service, &l.TraceID, &l.SpanID,
+		if err := rows.Scan(&l.ID, &ts, &l.Service, &l.TraceID, &l.SpanID, &l.Route,
 			&l.Level, &l.Message, &fields, &l.Source, &truncated); err != nil {
 			return nil, 0, err
 		}

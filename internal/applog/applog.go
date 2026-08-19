@@ -9,12 +9,14 @@
 package applog
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"sync"
 
 	"github.com/dwarka-prasad/optictrace/ext"
 	"github.com/dwarka-prasad/optictrace/internal/config"
+	"github.com/dwarka-prasad/optictrace/internal/engine"
 )
 
 // Defaults chosen so that turning the feature on without tuning it cannot
@@ -31,11 +33,12 @@ const (
 type Reason string
 
 const (
-	ReasonOrphan   Reason = "orphan"   // no span id — belongs to no request
-	ReasonLevel    Reason = "level"    // below level_min
-	ReasonSpanCap  Reason = "span_cap" // span already at max_lines_per_span
-	ReasonDisabled Reason = "disabled" // feature off
-	ReasonEmpty    Reason = "empty"    // nothing left after trimming
+	ReasonOrphan   Reason = "orphan"    // no span id — belongs to no request
+	ReasonLevel    Reason = "level"     // below level_min
+	ReasonSpanCap  Reason = "span_cap"  // span already at max_lines_per_span
+	ReasonDisabled Reason = "disabled"  // feature off
+	ReasonEmpty    Reason = "empty"     // nothing left after trimming
+	ReasonRuleDrop Reason = "rule_drop" // a rule's logs.drop discarded it
 )
 
 // Governor applies the app-log policy. Safe for concurrent use: ingest is an
@@ -59,6 +62,31 @@ type Governor struct {
 	cur      map[string]int
 	prev     map[string]int
 	maxSpans int
+
+	// routes are per-rule overrides, checked in config order so that later
+	// rules win the same way they do everywhere else in optic.yaml.
+	routes []routePolicy
+}
+
+// routePolicy is one rule's compiled `logs:` block.
+type routePolicy struct {
+	name     string
+	segs     []string
+	minRank  int // -1 = no override
+	maxLines int // 0 = no override
+	drop     bool
+	patterns []*regexp.Regexp
+	fields   map[string]bool
+}
+
+// effective is the policy actually applied to one line: the global settings,
+// tightened by every rule whose path matches.
+type effective struct {
+	minRank  int
+	maxLines int
+	drop     bool
+	patterns []*regexp.Regexp
+	fields   map[string]bool
 }
 
 // New builds a Governor from config. A nil or disabled config yields a
@@ -107,6 +135,97 @@ func New(cfg *config.AppLogsCfg) (*Governor, error) {
 	return g, nil
 }
 
+// WithRules compiles the per-rule `logs:` blocks. Call after New.
+//
+// These can only TIGHTEN what New established. A per-route override able to
+// weaken the global policy would make telemetry.app_logs a suggestion rather
+// than a guarantee, and reviewing one file would stop telling you what is
+// enforced.
+func (g *Governor) WithRules(rules []config.Rule) error {
+	for _, r := range rules {
+		if r.Logs == nil {
+			continue
+		}
+		rp := routePolicy{
+			name:     r.Name,
+			segs:     engine.SplitPath(r.Match.Path),
+			minRank:  -1,
+			maxLines: r.Logs.MaxLinesPerSpan,
+			drop:     r.Logs.Drop,
+			fields:   map[string]bool{},
+		}
+		if r.Logs.LevelMin != "" {
+			rp.minRank = ext.LevelRank(r.Logs.LevelMin)
+		}
+		for _, pat := range r.Logs.Redact.Patterns {
+			re, err := regexp.Compile(pat)
+			if err != nil {
+				return fmt.Errorf("rule %q logs.redact: %w", r.Name, err)
+			}
+			rp.patterns = append(rp.patterns, re)
+		}
+		for _, f := range r.Logs.Redact.Fields {
+			rp.fields[strings.ToLower(f)] = true
+		}
+		g.routes = append(g.routes, rp)
+	}
+	return nil
+}
+
+// resolve merges the global policy with every rule matching this line's route.
+//
+// A line with no route — or an unrecognised one — gets the global policy. That
+// is safe precisely because rules only tighten: an unknown route can never end
+// up with less protection than the floor, which is why the route may be taken
+// from the producer without verifying it.
+func (g *Governor) resolve(route string) effective {
+	eff := effective{
+		minRank:  g.minRank,
+		maxLines: g.maxLines,
+		patterns: g.patterns,
+		fields:   g.redactField,
+	}
+	if route == "" || len(g.routes) == 0 {
+		return eff
+	}
+	segs := engine.SplitPath(route)
+	for i := range g.routes {
+		rp := &g.routes[i]
+		// Exact pattern match first: a governed record's Route IS the rule's
+		// glob, so the common case needs no globbing at all.
+		if !(route == "/"+strings.Join(rp.segs, "/") || engine.MatchSegments(rp.segs, segs)) {
+			continue
+		}
+		if rp.drop {
+			eff.drop = true
+		}
+		// Tighten only: a HIGHER floor and a LOWER cap.
+		if rp.minRank > eff.minRank {
+			eff.minRank = rp.minRank
+		}
+		if rp.maxLines > 0 && (eff.maxLines <= 0 || rp.maxLines < eff.maxLines) {
+			eff.maxLines = rp.maxLines
+		}
+		if len(rp.patterns) > 0 {
+			merged := make([]*regexp.Regexp, 0, len(eff.patterns)+len(rp.patterns))
+			merged = append(merged, eff.patterns...)
+			merged = append(merged, rp.patterns...)
+			eff.patterns = merged
+		}
+		if len(rp.fields) > 0 {
+			merged := make(map[string]bool, len(eff.fields)+len(rp.fields))
+			for k := range eff.fields {
+				merged[k] = true
+			}
+			for k := range rp.fields {
+				merged[k] = true
+			}
+			eff.fields = merged
+		}
+	}
+	return eff
+}
+
 // Enabled reports whether app-log ingestion is turned on.
 func (g *Governor) Enabled() bool { return g.enabled }
 
@@ -125,13 +244,21 @@ func (g *Governor) Admit(l *ext.AppLog) (bool, Reason) {
 	if l.SpanID == "" && g.dropOrphans {
 		return false, ReasonOrphan
 	}
-	if g.minRank >= 0 && ext.LevelRank(l.Level) < g.minRank {
+
+	// The route decides which per-rule block applies. Resolved per line rather
+	// than cached per span, because a producer may report a different route on
+	// the same span and the tighter answer must win either way.
+	eff := g.resolve(l.Route)
+	if eff.drop {
+		return false, ReasonRuleDrop
+	}
+	if eff.minRank >= 0 && ext.LevelRank(l.Level) < eff.minRank {
 		return false, ReasonLevel
 	}
 
 	// Redaction BEFORE the cap check, so that a line dropped by the cap was
 	// never held in memory in its raw form any longer than one that is kept.
-	g.scrub(l)
+	g.scrub(l, eff)
 
 	l.Message = strings.TrimSpace(l.Message)
 	if l.Message == "" && len(l.Fields) == 0 {
@@ -142,24 +269,25 @@ func (g *Governor) Admit(l *ext.AppLog) (bool, Reason) {
 		l.Truncated = true
 	}
 
-	if l.SpanID != "" && g.maxLines > 0 && !g.allow(l.SpanID) {
+	if l.SpanID != "" && eff.maxLines > 0 && !g.allow(l.SpanID, eff.maxLines) {
 		return false, ReasonSpanCap
 	}
 	return true, ""
 }
 
-// scrub applies redaction to the message and every field value.
-func (g *Governor) scrub(l *ext.AppLog) {
-	for _, re := range g.patterns {
+// scrub applies redaction to the message and every field value, using the
+// resolved policy so a rule's extra patterns are honoured.
+func (g *Governor) scrub(l *ext.AppLog, eff effective) {
+	for _, re := range eff.patterns {
 		l.Message = re.ReplaceAllString(l.Message, "[REDACTED]")
 	}
 	for k, v := range l.Fields {
-		if g.redactField[strings.ToLower(k)] {
+		if eff.fields[strings.ToLower(k)] {
 			l.Fields[k] = "[REDACTED]"
 			continue
 		}
 		// A token in a field is exactly as leaked as one in the message.
-		for _, re := range g.patterns {
+		for _, re := range eff.patterns {
 			v = re.ReplaceAllString(v, "[REDACTED]")
 		}
 		l.Fields[k] = v
@@ -167,7 +295,8 @@ func (g *Governor) scrub(l *ext.AppLog) {
 }
 
 // allow reports whether this span may store another line, and counts it.
-func (g *Governor) allow(span string) bool {
+// maxLines is the resolved cap, which a per-rule block may have lowered.
+func (g *Governor) allow(span string, maxLines int) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -177,7 +306,7 @@ func (g *Governor) allow(span string) bool {
 			n = p
 		}
 	}
-	if n >= g.maxLines {
+	if n >= maxLines {
 		return false
 	}
 	if len(g.cur) >= g.maxSpans && !ok {

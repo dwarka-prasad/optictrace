@@ -43,6 +43,26 @@ public final class Policy {
         this.captureLimit = limit;
     }
 
+    /**
+     * Whether the BODY may be stored for this exchange.
+     *
+     * <p>Mirrors engine.Policy.KeepBody. Two details matter for parity: the
+     * record is always emitted — metrics and metadata are never sampled — and
+     * keep_errors means 5xx, not 4xx. A 404 is usually the client's problem and
+     * counting it as an error to rescue would defeat the sampling it is meant
+     * to work with.
+     */
+    public boolean keepBody(boolean drew, int status, double elapsedMs) {
+        if (drew) return true;
+        if (keepErrors && status >= 500) return true;
+        return keepSlowerThanMs != null && elapsedMs >= keepSlowerThanMs;
+    }
+
+    /** Whether any tail-based rule applies, so bytes must be buffered up front. */
+    public boolean tailSampled() {
+        return keepErrors || keepSlowerThanMs != null;
+    }
+
     public boolean hasMeters() {
         return !meters.isEmpty();
     }

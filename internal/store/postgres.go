@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS app_logs (
 	service   TEXT NOT NULL DEFAULT '',
 	trace_id  TEXT NOT NULL DEFAULT '',
 	span_id   TEXT NOT NULL DEFAULT '',
+	route     TEXT NOT NULL DEFAULT '',
 	level     TEXT NOT NULL DEFAULT '',
 	message   TEXT NOT NULL DEFAULT '',
 	fields    JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -89,6 +90,9 @@ CREATE TABLE IF NOT EXISTS app_logs (
 CREATE INDEX IF NOT EXISTS idx_app_logs_span  ON app_logs(span_id, ts);
 CREATE INDEX IF NOT EXISTS idx_app_logs_trace ON app_logs(trace_id, ts);
 CREATE INDEX IF NOT EXISTS idx_app_logs_ts    ON app_logs(ts);
+-- app_logs shipped in v0.9.0 without route, so an existing store needs it
+-- added. Postgres has IF NOT EXISTS for this, so no error matching is needed.
+ALTER TABLE app_logs ADD COLUMN IF NOT EXISTS route TEXT NOT NULL DEFAULT '';
 `
 
 // NewPostgres opens (and migrates) a Postgres-backed store. dsn is a standard

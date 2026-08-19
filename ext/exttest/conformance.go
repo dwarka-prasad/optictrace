@@ -95,6 +95,7 @@ func appLogStore(t *testing.T, s ext.Store) ext.AppLogStore {
 func AppLog(at time.Time, trace, span, level, message string) ext.AppLog {
 	return ext.AppLog{
 		Time: at, Service: "api", TraceID: trace, SpanID: span,
+		Route: "/api/v1/payments/**",
 		Level: level, Message: message, Source: "test",
 		Fields: map[string]string{"k": "v"},
 	}
@@ -139,6 +140,11 @@ func testAppLogs(t *testing.T, open OpenFunc) {
 	}
 	if got[0].TraceID != "t1" || got[0].Level != "info" {
 		t.Errorf("field round-trip: %+v", got[0])
+	}
+	// Route round-trips too. A field that is in the JSON but silently not
+	// persisted is a trap: it reads as empty for reasons nothing explains.
+	if got[0].Route != "/api/v1/payments/**" {
+		t.Errorf("route did not round-trip: %q", got[0].Route)
 	}
 
 	// Trace selects every hop's lines; span selects one hop's.

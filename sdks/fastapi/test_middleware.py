@@ -26,6 +26,15 @@ rules:
     meter:
       tokens: "$.usage.total_tokens"
 
+  - name: sample-hot-reads
+    match: { path: "/hot/**" }
+    sample: 0.0001
+    keep_errors: true
+    # Deliberately far above any in-process call. At 10ms the interpreter's own
+    # warm-up rescues requests for being slow, which would make the
+    # keep_errors assertions below pass or fail for the wrong reason.
+    keep_slower_than: 30s
+
   - name: no-capture-on-auth
     match: { path: "/auth/**" }
     restrict: [request_body, response_body, headers]
@@ -63,9 +72,13 @@ async def echo_app(scope, receive, send):
     if scope["path"].startswith("/ai/"):
         out["usage"] = {"prompt_tokens": 86, "completion_tokens": 42, "total_tokens": 128}
     payload = json.dumps(out).encode()
+    status = 201
+    for k, v in scope.get("headers", []):
+        if k == b"x-status":
+            status = int(v)
     await send({
         "type": "http.response.start",
-        "status": 201,
+        "status": status,
         "headers": [(b"content-type", b"application/json")],
     })
     await send({"type": "http.response.body", "body": payload})
@@ -191,6 +204,39 @@ async def main():
     ai = emitted[-1]
     assert ai.get("meters", {}).get("tokens") == 128, f"meters not extracted: {ai.get('meters')}"
     assert "response_body" not in ai, "restricted response body was stored"
+
+    # --- tail-based sampling ------------------------------------------------
+    # sample is a coin flip made up front; keep_errors and keep_slower_than
+    # rescue the requests worth having after the outcome is known. A coin flip
+    # that discards your 500s is worse than no sampling at all.
+    await call(mw, "GET", "/hot/ok", {"content-type": "application/json"}, b"{}")
+    sampled_out = emitted[-1]
+    assert "request_body" not in sampled_out, "sample: 0.0001 stored a body anyway"
+    assert sampled_out["status"] == 201, "the record itself must still be emitted"
+
+    # A 500 is rescued...
+    await call(mw, "GET", "/hot/boom", {"content-type": "application/json", "x-status": "500"}, b"{}")
+    rescued = emitted[-1]
+    assert rescued["status"] == 500
+    assert "response_body" in rescued, "keep_errors did not rescue a 5xx body"
+
+    # ...a 404 is not. keep_errors means 5xx: a 404 is usually the client's
+    # problem, and rescuing it would defeat the sampling it works alongside.
+    await call(mw, "GET", "/hot/missing", {"content-type": "application/json", "x-status": "404"}, b"{}")
+    not_rescued = emitted[-1]
+    assert not_rescued["status"] == 404
+    assert "response_body" not in not_rescued, "keep_errors rescued a 4xx, which is not an error here"
+
+    # keep_slower_than is asserted at the policy level rather than by timing a
+    # real call, so the check does not depend on how fast this machine is.
+    hot_policy = mw.engine.evaluate("GET", "/hot/reads")
+    assert hot_policy.tail_sampled(), "tail rules must force buffering"
+    assert not hot_policy.keep_body(False, 200, 1), "an unsampled fast 200 must keep no body"
+    assert hot_policy.keep_body(False, 500, 1), "keep_errors must rescue a 5xx"
+    assert not hot_policy.keep_body(False, 404, 1), "keep_errors must NOT rescue a 4xx"
+    assert hot_policy.keep_body(False, 200, 31_000), "keep_slower_than must rescue a slow request"
+    assert hot_policy.keep_body(True, 200, 1), "a drawn request always keeps its body"
+    assert hot_policy.keep_slower_than_ms == 30_000, "go-style duration not parsed"
 
     print("✓ ASGI middleware integration checks passed")
     if os.environ.get("OPTIC_AGENT_URL"):

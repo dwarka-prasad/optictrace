@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS app_logs (
 	service   String,
 	trace_id  String,
 	span_id   String,
+	route     String,
 	level     String,
 	message   String,
 	fields    String,
@@ -127,6 +128,8 @@ func NewClickHouse(dsn string) (*ClickHouseStore, error) {
 		`ALTER TABLE logs ADD COLUMN IF NOT EXISTS trace_id String DEFAULT ''`,
 		`ALTER TABLE logs ADD COLUMN IF NOT EXISTS span_id String DEFAULT ''`,
 		`ALTER TABLE logs ADD COLUMN IF NOT EXISTS parent_span String DEFAULT ''`,
+		// app_logs shipped in v0.9.0 without route.
+		`ALTER TABLE app_logs ADD COLUMN IF NOT EXISTS route String DEFAULT ''`,
 	} {
 		if _, err := db.ExecContext(ctx, decl); err != nil {
 			db.Close()
