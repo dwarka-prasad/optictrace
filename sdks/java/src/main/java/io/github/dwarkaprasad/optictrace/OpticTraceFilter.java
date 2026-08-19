@@ -76,7 +76,12 @@ public final class OpticTraceFilter implements Filter {
         String method = request.getMethod();
         String path = request.getRequestURI();
         Policy policy = engine.evaluate(method, path);
-        boolean sampled = policy.sampleRate >= 1.0 || ThreadLocalRandom.current().nextDouble() < policy.sampleRate;
+        // The up-front draw. Tail-based rules can rescue a request this draw
+        // discarded, but only once the outcome is known — so when they are
+        // configured the bytes are buffered regardless and the decision is
+        // made at the end.
+        boolean drew = policy.sampleRate >= 1.0 || ThreadLocalRandom.current().nextDouble() < policy.sampleRate;
+        boolean buffer = drew || policy.tailSampled();
 
         Map<String, String> requestHeaders = headersOf(request);
 
@@ -85,12 +90,12 @@ public final class OpticTraceFilter implements Filter {
         TraceContext ctx = TraceContext.fromHeader(request.getHeader(TraceContext.HEADER));
         TraceContext.set(ctx);
 
-        CapturingRequest wrappedReq = new CapturingRequest(request, sampled && policy.captureRequestBody, policy.captureLimit);
+        CapturingRequest wrappedReq = new CapturingRequest(request, buffer && policy.captureRequestBody, policy.captureLimit);
         // Response bytes are buffered when the body is stored OR when a meter
         // needs them: metering is independent of capture, so restricting the
         // body must not silently zero the billing.
         CapturingResponse wrappedRes = new CapturingResponse(response,
-                (sampled && policy.captureResponseBody) || policy.hasMeters(), policy.captureLimit);
+                (buffer && policy.captureResponseBody) || policy.hasMeters(), policy.captureLimit);
 
         long start = System.nanoTime();
         int status = 200;
@@ -102,27 +107,26 @@ public final class OpticTraceFilter implements Filter {
             double durationMs = (System.nanoTime() - start) / 1_000_000.0;
             TraceContext.clear();
 
-            // Tail-based keeps: rescue a request AFTER the outcome is known.
-            // A coin flip that discards your 500s is worse than no sampling.
-            boolean keep = sampled
-                    || (policy.keepErrors && status >= 400)
-                    || (policy.keepSlowerThanMs != null && durationMs >= policy.keepSlowerThanMs);
-
-            if (keep) {
-                Map<String, Object> record = buildRecord(
-                        request, wrappedReq, wrappedRes, policy, requestHeaders, method, path, status, durationMs, ctx);
-                if (consoleLog || shipper == null) {
-                    System.out.println(writeJson(record));
-                }
-                if (shipper != null) shipper.enqueue(record);
+            // The record is ALWAYS emitted: metrics and metadata are never
+            // sampled, and a request that produced no record at all is
+            // invisible to every count and percentile. Sampling decides
+            // whether the BODY is stored, and the tail-based rules rescue the
+            // bodies worth having after the outcome is known.
+            boolean keepBody = policy.keepBody(drew, status, durationMs);
+            Map<String, Object> record = buildRecord(request, wrappedReq, wrappedRes, policy,
+                    requestHeaders, method, path, status, durationMs, ctx, keepBody);
+            if (consoleLog || shipper == null) {
+                System.out.println(writeJson(record));
             }
+            if (shipper != null) shipper.enqueue(record);
         }
     }
 
     private Map<String, Object> buildRecord(HttpServletRequest request, CapturingRequest req,
                                             CapturingResponse res, Policy policy,
                                             Map<String, String> requestHeaders, String method, String path,
-                                            int status, double durationMs, TraceContext ctx) {
+                                            int status, double durationMs, TraceContext ctx,
+                                            boolean keepBody) {
         Map<String, Object> record = new LinkedHashMap<>();
         // RFC3339 with a 'Z'. The agent parses strictly; the FastAPI SDK once
         // sent "+0530" and had every record rejected with a 400.
@@ -152,7 +156,7 @@ public final class OpticTraceFilter implements Filter {
 
         byte[] reqBody = req.captured();
         String governedRequest = null;
-        if (reqBody.length > 0 && policy.captureRequestBody) {
+        if (reqBody.length > 0 && policy.captureRequestBody && keepBody) {
             governedRequest = policy.redactBody(reqBody, request.getContentType());
             record.put("request_body", governedRequest);
             if (req.truncated()) record.put("req_truncated", true);
@@ -163,8 +167,9 @@ public final class OpticTraceFilter implements Filter {
         if (respBody.length > 0) {
             Map<String, Double> meters = policy.extractMeters(respBody);
             if (!meters.isEmpty()) record.put("meters", meters);
-            // Buffered for metering is not the same as allowed to be stored.
-            if (policy.captureResponseBody) {
+            // Buffered for metering is not the same as allowed to be stored,
+            // and neither is buffered for a tail rule that did not fire.
+            if (policy.captureResponseBody && keepBody) {
                 governedResponse = policy.redactBody(respBody, res.getContentType());
                 record.put("response_body", governedResponse);
                 if (res.truncated()) record.put("resp_truncated", true);

@@ -46,6 +46,31 @@ assert.deepStrictEqual(
   redactPath({ echo: { card: { number: '4111' } }, card: { number: '2222' } }, ['**', 'card', 'number']),
   { echo: { card: { number: REDACTED } }, card: { number: REDACTED } },
 );
+// --- tail-based sampling parity --------------------------------------------
+{
+  const { keepBody, tailSampled } = require('../engine');
+  const tailCfg = require('js-yaml').load(`
+version: 1
+service: { name: t }
+rules:
+  - name: hot
+    match: { path: "/hot/**" }
+    sample: 0.0001
+    keep_errors: true
+    keep_slower_than: 10ms
+`);
+  const hot = new Engine(tailCfg).evaluate('GET', '/hot/reads');
+  assert.ok(tailSampled(hot), 'tail rules must force buffering');
+  assert.ok(!keepBody(hot, false, 200, 1), 'an unsampled fast 200 must keep no body');
+  assert.ok(keepBody(hot, false, 500, 1), 'keep_errors must rescue a 5xx');
+  // keep_errors means 5xx. A 404 is usually the client's problem, and rescuing
+  // it would defeat the sampling it works alongside.
+  assert.ok(!keepBody(hot, false, 404, 1), 'keep_errors must NOT rescue a 4xx');
+  assert.ok(keepBody(hot, false, 200, 25), 'keep_slower_than must rescue a slow request');
+  assert.ok(keepBody(hot, true, 200, 1), 'a drawn request always keeps its body');
+  assert.strictEqual(hot.keepSlowerThanMs, 10, 'go-style duration not parsed');
+}
+
 const eng = new Engine(require('js-yaml').load(CONFIG));
 const p = eng.evaluate('POST', '/auth/login');
 assert.strictEqual(p.captureRequestBody, false);

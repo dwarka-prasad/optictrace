@@ -78,6 +78,11 @@ public final class SelfTest {
                 restrict: [response_body]
                 meter:
                   tokens: "$.usage.total_tokens"
+              - name: sample-hot-reads
+                match: { path: "/hot/**" }
+                sample: 0.0001
+                keep_errors: true
+                keep_slower_than: 10ms
               - name: no-capture-on-auth
                 match: { path: "/auth/**" }
                 restrict: [request_body, response_body, headers]
@@ -142,6 +147,18 @@ public final class SelfTest {
         check("meters sum across arrays",
                 Double.valueOf(30.0).equals(e.evaluate("POST", "/ai/x")
                         .extractMeters("{\"usage\":[{\"total_tokens\":10},{\"total_tokens\":20}]}".getBytes()).get("tokens")));
+
+        // Tail-based sampling. sample is a draw made up front; keep_errors and
+        // keep_slower_than rescue what is worth having once the outcome is known.
+        Policy hot = e.evaluate("GET", "/hot/reads");
+        check("tail rules force buffering even at a tiny sample rate", hot.tailSampled());
+        check("an unsampled fast 200 keeps no body", !hot.keepBody(false, 200, 1));
+        check("keep_errors rescues a 5xx", hot.keepBody(false, 500, 1));
+        // keep_errors means 5xx. A 404 is usually the client's problem, and
+        // rescuing it would defeat the sampling it works alongside.
+        check("keep_errors does NOT rescue a 4xx", !hot.keepBody(false, 404, 1));
+        check("keep_slower_than rescues a slow request", hot.keepBody(false, 200, 25));
+        check("a drawn request always keeps its body", hot.keepBody(true, 200, 1));
 
         Policy auth = e.evaluate("POST", "/auth/login");
         check("restrict disables all capture", !auth.captureRequestBody && !auth.captureResponseBody && !auth.captureHeaders);

@@ -13,6 +13,8 @@ const fs = require('fs');
 const yaml = require('js-yaml');
 const {
   Engine,
+  keepBody,
+  tailSampled,
   sanitizeHeaders,
   sanitizeQuery,
   redactBody,
@@ -56,13 +58,18 @@ function optictrace(options = {}) {
     const ctx = trace.fromHeader(req.headers[trace.HEADER]);
     const start = process.hrtime.bigint();
     const policy = engine.evaluate(req.method, req.path ?? req.url.split('?')[0]);
-    const sampled = policy.sampleRate >= 1 || Math.random() < policy.sampleRate;
+    // The up-front draw. Tail-based rules can rescue a request this draw
+    // discarded, but only once the outcome is known — so when they are
+    // configured the bytes are buffered regardless and the call is made at the
+    // end, in keepBody().
+    const drew = policy.sampleRate >= 1 || Math.random() < policy.sampleRate;
+    const buffer = drew || tailSampled(policy);
 
     // --- request body capture: tee the raw stream, never consume it ------
     let reqChunks = null;
     let reqBytes = 0;
     let reqTruncated = false;
-    if (sampled && policy.captureRequestBody) {
+    if (buffer && policy.captureRequestBody) {
       reqChunks = [];
       req.on('data', (chunk) => {
         reqBytes += chunk.length;
@@ -98,7 +105,7 @@ function optictrace(options = {}) {
     // metering is independent of capture, which is what lets a rule keep a
     // prompt private while still counting the tokens in it. Without this,
     // `restrict: [response_body]` silently zeroes the billing.
-    if ((sampled && policy.captureResponseBody) || Object.keys(policy.meters).length > 0) {
+    if ((buffer && policy.captureResponseBody) || Object.keys(policy.meters).length > 0) {
       respChunks = [];
     }
     const origWrite = res.write.bind(res);
@@ -137,7 +144,12 @@ function optictrace(options = {}) {
         record.request_headers = sanitizeHeaders(req.headers, policy);
         record.response_headers = sanitizeHeaders(res.getHeaders(), policy);
       }
-      if (reqChunks && reqChunks.length) {
+      // The record is ALWAYS shipped: a request that produced no record is
+      // invisible to every count and percentile. Sampling decides whether the
+      // BODY is stored.
+      const keep = keepBody(policy, drew, res.statusCode, durationMs);
+
+      if (reqChunks && reqChunks.length && keep) {
         record.request_body = redactBody(
           Buffer.concat(reqChunks).toString('utf8'),
           req.headers['content-type'],
@@ -152,7 +164,9 @@ function optictrace(options = {}) {
         // still counting the tokens in it.
         const meters = extractMeters(rawResponse, policy);
         if (Object.keys(meters).length) record.meters = meters;
-        if (policy.captureResponseBody) {
+        // Buffered for metering is not the same as allowed to be stored, and
+        // neither is buffered for a tail rule that did not fire.
+        if (policy.captureResponseBody && keep) {
           governedResponse = redactBody(
             rawResponse,
             String(res.getHeader('content-type') ?? ''),
