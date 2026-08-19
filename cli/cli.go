@@ -1029,6 +1029,18 @@ func run(configPath, uiDir, execCmd string) {
 			os.Exit(1)
 		}
 		logger.Info("exporters started", "count", len(cfg.Telemetry.Exporters))
+
+		// Collected lines fan out to exporters too. Wired here rather than
+		// where the collector is built, because the dispatcher does not exist
+		// until now — an audit trail holding the requests but not the lines
+		// those requests wrote is missing the riskier half.
+		if logCollector != nil && dispatcher.AcceptsAppLogs() {
+			logCollector.OnStored(func(lines []ext.AppLog) {
+				for i := range lines {
+					dispatcher.EnqueueAppLog(&lines[i])
+				}
+			})
+		}
 	}
 
 	// --- proxy ----------------------------------------------------------

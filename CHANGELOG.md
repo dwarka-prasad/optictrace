@@ -12,6 +12,10 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 ### Added
 
+- **Exporters receive application log lines.** `scan` and `review` already read them; the file, webhook, command and OTLP exporters shipped records only, so anyone using the file exporter as their audit trail was missing the surface most likely to carry the personal data. `ext.AppLogExporter` is an OPTIONAL companion to `ext.Exporter`, discovered by type assertion for the same reason `AppLogStore` is separate from `Store` — adding a method to a published interface breaks every third-party exporter at compile time. An exporter without it still receives records, and says so at startup rather than leaving it to be discovered.
+
+  Both streams go to ONE file, with the log lines tagged `kind: app_log`. A consumer reading an audit trail wants the request and the lines it wrote in one place and in order; splitting them means reassembling by timestamp, which is the correlation problem this feature exists to avoid. Records stay untagged so existing consumers keep parsing them.
+
 - **Collect the logs an application already writes.** `optictrace run -exec "python app.py"` captures a child process's stdout and stderr, and `telemetry.app_logs.sources` tails files with rotation followed. Ingestion previously required every service to POST its lines, which means touching code in the services whose logs you most want — usually the ones nobody wants to modify.
 
   Collected output is echoed through untouched: collecting a service's logs must not stop them reaching wherever its operators already read them, and this process does not get to rewrite another program's output stream. Tailing starts at the END of an existing file, because replaying a large log on every restart floods the store with history nobody asked for and retention then discards the recent lines that were actually wanted. A text source with no `span_pattern` warns at startup, since every one of its lines would be dropped as an orphan.

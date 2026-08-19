@@ -1033,6 +1033,14 @@ func (s *Server) ingestAppLogs(w http.ResponseWriter, r *http.Request) {
 			s.Collector.AppLogDropped(reason, n)
 		}
 	}
+	// Fan out to exporters that accept lines. An audit trail that holds the
+	// requests but not the lines those requests wrote is missing the surface
+	// most likely to carry the personal data.
+	if s.Dispatcher != nil {
+		for i := range kept {
+			s.Dispatcher.EnqueueAppLog(&kept[i])
+		}
+	}
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"stored":  len(kept),
 		"dropped": dropped,

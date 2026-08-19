@@ -28,6 +28,28 @@ type Exporter interface {
 	Close() error
 }
 
+// AppLogExporter is an OPTIONAL companion to Exporter: an exporter may also
+// accept application log lines.
+//
+// Separate interface rather than a second method on Exporter, for the same
+// reason ext.AppLogStore is separate from ext.Store — Exporter is published and
+// implemented outside this module, so adding a method to it would break every
+// third-party exporter at compile time. Detect support with a type assertion:
+//
+//	if ale, ok := myExporter.(ext.AppLogExporter); ok { ... }
+//
+// An exporter without it still receives records; log lines simply do not fan
+// out to it. That is reported at startup rather than left to be discovered,
+// because an audit trail quietly missing the highest-risk surface is worse than
+// one that says it is records-only.
+type AppLogExporter interface {
+	Exporter
+	// ExportAppLogs delivers one batch of governed lines. Same contract as
+	// Export: an error marks the whole batch failed, and ctx is cancelled on
+	// shutdown.
+	ExportAppLogs(ctx context.Context, batch []*AppLog) error
+}
+
 // ExporterOptions is one entry from `telemetry.exporters` as an extension
 // sees it. The core owns batching, so BatchSize/FlushInterval/QueueSize are
 // informational — useful for sizing an internal buffer, not something the

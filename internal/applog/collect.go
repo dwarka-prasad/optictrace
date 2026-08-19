@@ -47,6 +47,9 @@ type Collector struct {
 	// counted rather than silent.
 	onDrop func(reason string)
 	onKeep func(n int)
+	// fanout receives every line that was stored, for the exporters. Separate
+	// from the sink so a slow exporter cannot stall persistence.
+	fanout func(lines []ext.AppLog)
 
 	mu     sync.Mutex
 	queue  []ext.AppLog
@@ -69,6 +72,11 @@ func NewCollector(gov *Governor, sink Sink, service string, logger *slog.Logger)
 // OnDrop and OnKeep install counters, normally the metrics collector's.
 func (c *Collector) OnDrop(f func(reason string)) { c.onDrop = f }
 func (c *Collector) OnKeep(f func(n int))         { c.onKeep = f }
+
+// OnStored installs a fan-out for lines that were persisted — the exporters.
+// Called after a successful save, so an exporter never sees a line the store
+// rejected.
+func (c *Collector) OnStored(f func(lines []ext.AppLog)) { c.fanout = f }
 
 // Start begins flushing. Sources are attached with Tail and Read.
 func (c *Collector) Start(ctx context.Context) {
@@ -117,6 +125,9 @@ func (c *Collector) flush(ctx context.Context) {
 	}
 	if c.onKeep != nil {
 		c.onKeep(len(batch))
+	}
+	if c.fanout != nil {
+		c.fanout(batch)
 	}
 }
 

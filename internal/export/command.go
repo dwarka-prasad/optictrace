@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dwarka-prasad/optictrace/ext"
 	"github.com/dwarka-prasad/optictrace/internal/config"
 	"github.com/dwarka-prasad/optictrace/internal/store"
 )
@@ -115,6 +116,27 @@ func (e *commandExporter) Export(_ context.Context, batch []*store.Record) error
 			// Broken pipe: mark dead so the next batch respawns.
 			e.cmd.Process.Kill() //nolint:errcheck
 			return fmt.Errorf("write to plugin: %w", err)
+		}
+	}
+	return nil
+}
+
+// ExportAppLogs streams governed log lines to the same executable's stdin,
+// tagged so the plugin can tell them apart from records.
+func (e *commandExporter) ExportAppLogs(_ context.Context, batch []*ext.AppLog) error {
+	if err := e.ensureRunning(); err != nil {
+		return err
+	}
+	for _, l := range batch {
+		line, err := json.Marshal(struct {
+			Kind string      `json:"kind"`
+			Log  *ext.AppLog `json:"app_log"`
+		}{Kind: "app_log", Log: l})
+		if err != nil {
+			return fmt.Errorf("marshal app log: %w", err)
+		}
+		if _, err := e.stdin.Write(append(line, '\n')); err != nil {
+			return err
 		}
 	}
 	return nil
