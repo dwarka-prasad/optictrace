@@ -7,8 +7,15 @@ export const API_BASE = process.env.NEXT_PUBLIC_OPTIC_API ?? '';
 export interface TimeBucket {
   time: string;
   count: number;
+  /** 5xx. Kept apart from client_errors because the two need opposite
+   *  responses: one is your fault, the other is the caller's. */
   errors: number;
+  client_errors: number;
   avg_latency_ms: number;
+  /** The tail inside this bucket. An average hides exactly the requests worth
+   *  looking at — a handful of 3s responses in a minute of 5ms ones barely
+   *  move the mean. Zero from a store driver that does not compute it. */
+  p95_latency_ms: number;
 }
 
 export interface RouteStat {
@@ -30,6 +37,12 @@ export interface Stats {
   status_counts: Record<string, number>;
   series: TimeBucket[];
   top_routes: RouteStat[];
+  /** Records that stored a body, against `total`. The only honest read on what
+   *  sampling is doing: a rule sampling at 0.05 that matches nothing looks
+   *  identical to one sampling at 1.0 in every other number on the page.
+   *  Zero from a driver that does not compute it — treat it as unknown. */
+  bodies_kept: number;
+  bytes_seen: number;
 }
 
 export interface LogRecord {
@@ -297,3 +310,136 @@ export interface AppLogSummary {
 
 export const fetchAppLogStats = (window: string) =>
   get<AppLogSummary>(`/api/applogs/stats?window=${window}`);
+
+/** One distributed trace rolled up to a row. */
+export interface TraceSummary {
+  trace_id: string;
+  method: string;
+  route: string;
+  path: string;
+  service: string;
+  /** The root hop's status: what the caller was actually told. */
+  status: number;
+  spans: number;
+  services: number;
+  /** 5xx across EVERY hop, including inner ones a retry rescued — which the
+   *  root status hides, and which is what someone scanning this list wants. */
+  errors: number;
+  /** The root hop's duration: what the caller waited. Concurrent inner hops
+   *  do not sum to a wall clock. */
+  duration_ms: number;
+  start: string;
+  end: string;
+  labels?: Record<string, string>;
+  /** -1 when the store cannot answer cheaply. */
+  log_lines: number;
+}
+
+export interface TraceQuery {
+  window?: string;
+  errors?: boolean;
+  service?: string;
+  q?: string;
+  labels?: Record<string, string>;
+  limit?: number;
+  offset?: number;
+}
+
+/** Recent traces, newest first.
+ *
+ *  Answers 501 on a store driver without trace support. That is not an error
+ *  worth a banner — correlation still works, only the list is missing — so the
+ *  caller gets a flag instead of an exception. */
+export async function fetchTraces(
+  query: TraceQuery,
+): Promise<{ traces: TraceSummary[]; total: number; supported: boolean }> {
+  const params = new URLSearchParams();
+  if (query.window) params.set('window', query.window);
+  if (query.errors) params.set('errors', '1');
+  if (query.service) params.set('service', query.service);
+  if (query.q) params.set('q', query.q);
+  if (query.limit) params.set('limit', String(query.limit));
+  if (query.offset) params.set('offset', String(query.offset));
+  Object.entries(query.labels ?? {}).forEach(([k, v]) => {
+    if (k && v) params.set(`label.${k}`, v);
+  });
+  const res = await fetch(`${API_BASE}/api/traces?${params}`, { cache: 'no-store' });
+  if (res.status === 501) return { traces: [], total: 0, supported: false };
+  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+  const body = (await res.json()) as { traces: TraceSummary[] | null; total: number };
+  return { traces: body.traces ?? [], total: body.total, supported: true };
+}
+
+export interface AppLogQuery {
+  window?: string;
+  /** Minimum severity — the agent filters, so a page of 200 debug lines
+   *  cannot crowd out the errors underneath them. */
+  level?: string;
+  service?: string;
+  q?: string;
+  trace?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/** Application log lines across requests.
+ *
+ *  Same 501-is-not-an-error treatment as fetchTraces: app logs are optional,
+ *  and a page that explodes because a feature is off is worse than one that
+ *  says so. */
+export async function fetchAppLogs(
+  query: AppLogQuery,
+): Promise<{ lines: AppLogLine[]; total: number; supported: boolean }> {
+  const params = new URLSearchParams();
+  Object.entries(query).forEach(([k, v]) => {
+    if (v !== undefined && v !== '' && v !== 0) params.set(k, String(v));
+  });
+  const res = await fetch(`${API_BASE}/api/applogs?${params}`, { cache: 'no-store' });
+  if (res.status === 501 || res.status === 404) return { lines: [], total: 0, supported: false };
+  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+  const body = (await res.json()) as { lines: AppLogLine[] | null; total: number };
+  return { lines: body.lines ?? [], total: body.total ?? 0, supported: true };
+}
+
+/** Inserts the buckets the store had no rows for.
+ *
+ *  The API returns only buckets that contain traffic, so a quiet ten minutes
+ *  arrives as two adjacent points and the chart draws a smooth line across
+ *  it — inventing traffic that never happened, which on a governance tool is
+ *  the wrong kind of wrong.
+ *
+ *  Counts fill with 0, because zero requests IS the measurement. Latencies
+ *  fill with null so the line BREAKS instead: an empty bucket has no latency,
+ *  and drawing it as 0ms would claim the service got instantaneously fast.
+ */
+export function fillGaps(series: TimeBucket[], bucketMs: number): TimeBucket[] {
+  if (series.length < 2 || bucketMs <= 0) return series;
+  const out: TimeBucket[] = [];
+  for (let i = 0; i < series.length; i++) {
+    out.push(series[i]);
+    const cur = new Date(series[i].time).getTime();
+    const next = i + 1 < series.length ? new Date(series[i + 1].time).getTime() : cur;
+    // Cap the fill: a 24h window at a 30m bucket can only be missing 48 of
+    // them, but a clock jump or a stale row should not spin here.
+    const missing = Math.min(Math.round((next - cur) / bucketMs) - 1, 512);
+    for (let k = 1; k <= missing; k++) {
+      out.push({
+        time: new Date(cur + k * bucketMs).toISOString(),
+        count: 0,
+        errors: 0,
+        client_errors: 0,
+        avg_latency_ms: null as unknown as number,
+        p95_latency_ms: null as unknown as number,
+      });
+    }
+  }
+  return out;
+}
+
+/** Parses "30s" / "5m" / "1h" into milliseconds. */
+export function bucketMillis(bucket: string): number {
+  const m = /^(\d+)(ms|s|m|h)$/.exec(bucket.trim());
+  if (!m) return 0;
+  const n = Number(m[1]);
+  return n * { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[m[2] as 'ms' | 's' | 'm' | 'h'];
+}

@@ -213,6 +213,18 @@ func (s *SQLiteStore) Stats(ctx context.Context, since time.Time, bucket time.Du
 		}
 	}
 
+	// What governance actually did to the window. `bodies_kept` against Total
+	// is the only honest read on sampling: a rule sampling at 0.05 that
+	// matches nothing looks exactly like one sampling at 1.0 in every other
+	// figure on the page.
+	err = s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(req_body <> '' OR resp_body <> ''), 0),
+		        COALESCE(SUM(req_bytes + resp_bytes), 0)
+		 FROM logs WHERE ts >= ?`, sinceMs).Scan(&st.BodiesKept, &st.BytesSeen)
+	if err != nil {
+		return nil, err
+	}
+
 	// Status class breakdown.
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT (status/100)*100, COUNT(*) FROM logs WHERE ts >= ? GROUP BY status/100`, sinceMs)
@@ -235,17 +247,40 @@ func (s *SQLiteStore) Stats(ctx context.Context, since time.Time, bucket time.Du
 	if bms <= 0 {
 		bms = 60_000
 	}
+	// The per-bucket p95 comes from the same pass, via a window function
+	// rather than one OFFSET subquery per bucket: at a 1m bucket over 24h
+	// that would be 1440 extra queries to draw one line.
+	//
+	// PERCENTILE semantics: NTILE-style bucketing would need a second sort;
+	// this takes the smallest duration whose running rank reaches 95% of the
+	// bucket, which is the same definition the window-level percentiles above
+	// use. Streams are excluded there and here — a 600s SSE connection is a
+	// connection lifetime, not a latency, and one of them owns the p95 of any
+	// bucket it lands in.
 	rows, err = s.db.QueryContext(ctx,
-		`SELECT (ts/?)*?, COUNT(*), COALESCE(SUM(status >= 500), 0), COALESCE(AVG(duration_ms), 0)
-		 FROM logs WHERE ts >= ? GROUP BY ts/? ORDER BY 1`,
-		bms, bms, sinceMs, bms)
+		`WITH b AS (
+		     SELECT (ts/?)*? AS bt, status, duration_ms, stream FROM logs WHERE ts >= ?
+		 ), ranked AS (
+		     SELECT bt, duration_ms,
+		            ROW_NUMBER() OVER (PARTITION BY bt ORDER BY duration_ms) AS rn,
+		            COUNT(*)     OVER (PARTITION BY bt)                      AS n
+		     FROM b WHERE stream = 0
+		 )
+		 SELECT b.bt, COUNT(*),
+		        COALESCE(SUM(b.status >= 500), 0),
+		        COALESCE(SUM(b.status >= 400 AND b.status < 500), 0),
+		        COALESCE(AVG(b.duration_ms), 0),
+		        COALESCE((SELECT MIN(duration_ms) FROM ranked r
+		                  WHERE r.bt = b.bt AND r.rn >= CAST(0.95 * r.n AS INTEGER)), 0)
+		 FROM b GROUP BY b.bt ORDER BY 1`,
+		bms, bms, sinceMs)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var t int64
 		var b TimeBucket
-		if err := rows.Scan(&t, &b.Count, &b.Errors, &b.AvgLatency); err != nil {
+		if err := rows.Scan(&t, &b.Count, &b.Errors, &b.ClientErrors, &b.AvgLatency, &b.P95Latency); err != nil {
 			rows.Close()
 			return nil, err
 		}

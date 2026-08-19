@@ -220,6 +220,15 @@ func (s *PostgresStore) Stats(ctx context.Context, since time.Time, bucket time.
 	}
 	rows.Close()
 
+	// What governance did to the window: see the note on Stats.BodiesKept.
+	err = s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(CASE WHEN req_body <> '' OR resp_body <> '' THEN 1 ELSE 0 END), 0),
+		        COALESCE(SUM(req_bytes + resp_bytes), 0)
+		 FROM logs WHERE ts >= $1`, sinceMs).Scan(&st.BodiesKept, &st.BytesSeen)
+	if err != nil {
+		return nil, err
+	}
+
 	bms := bucket.Milliseconds()
 	if bms <= 0 {
 		bms = 60_000
@@ -227,7 +236,10 @@ func (s *PostgresStore) Stats(ctx context.Context, since time.Time, bucket time.
 	rows, err = s.db.QueryContext(ctx,
 		`SELECT (ts/$1)*$1 AS b, COUNT(*),
 		        COALESCE(SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END), 0),
-		        COALESCE(AVG(duration_ms), 0)
+		        COALESCE(SUM(CASE WHEN status >= 400 AND status < 500 THEN 1 ELSE 0 END), 0),
+		        COALESCE(AVG(duration_ms), 0),
+		        COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms)
+		                 FILTER (WHERE NOT stream), 0)
 		 FROM logs WHERE ts >= $2 GROUP BY b ORDER BY b`, bms, sinceMs)
 	if err != nil {
 		return nil, err
@@ -235,7 +247,7 @@ func (s *PostgresStore) Stats(ctx context.Context, since time.Time, bucket time.
 	for rows.Next() {
 		var t int64
 		var b TimeBucket
-		if err := rows.Scan(&t, &b.Count, &b.Errors, &b.AvgLatency); err != nil {
+		if err := rows.Scan(&t, &b.Count, &b.Errors, &b.ClientErrors, &b.AvgLatency, &b.P95Latency); err != nil {
 			rows.Close()
 			return nil, err
 		}

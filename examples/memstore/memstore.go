@@ -165,6 +165,12 @@ func percentile(recs []ext.Record, q float64) float64 {
 			d = append(d, recs[i].DurationMS)
 		}
 	}
+	return quantileOf(d, q)
+}
+
+// quantileOf sorts in place and returns the q-th value. Same definition the
+// bundled drivers use, so a bucket p95 from this driver lands where theirs do.
+func quantileOf(d []float64, q float64) float64 {
 	if len(d) == 0 {
 		return 0
 	}
@@ -188,6 +194,14 @@ func (s *Store) Stats(_ context.Context, from time.Time, bucket time.Duration) (
 			st.Errors++
 		}
 		st.StatusCounts[fmt.Sprintf("%dxx", recs[i].Status/100)]++
+		// What governance did to the window. A driver that leaves these at zero
+		// still works — the dashboard reads zero as "unknown" and hides the
+		// panel — but then nobody can tell a sampling rule that matches
+		// nothing from one that samples everything.
+		if recs[i].RequestBody != "" || recs[i].ResponseBody != "" {
+			st.BodiesKept++
+		}
+		st.BytesSeen += recs[i].ReqBytes + recs[i].RespBytes
 	}
 	if st.Total > 0 {
 		st.ErrorRate = float64(st.Errors) / float64(st.Total)
@@ -200,8 +214,12 @@ func (s *Store) Stats(_ context.Context, from time.Time, bucket time.Duration) (
 		bucket = time.Minute
 	}
 	type acc struct {
-		count, errs int64
-		sum         float64
+		count, errs, clientErrs int64
+		sum                     float64
+		// Durations kept per bucket so the tail can be reported. An average
+		// alone hides the requests worth investigating: a few 3s responses
+		// inside a minute of 5ms ones barely move the mean.
+		durations []float64
 	}
 	buckets := map[int64]*acc{}
 	for i := range recs {
@@ -215,6 +233,16 @@ func (s *Store) Stats(_ context.Context, from time.Time, bucket time.Duration) (
 		a.sum += recs[i].DurationMS
 		if recs[i].Status >= 500 {
 			a.errs++
+		} else if recs[i].Status >= 400 {
+			// 4xx counted apart from 5xx: a caller sending bad requests and a
+			// service falling over need opposite responses.
+			a.clientErrs++
+		}
+		if !recs[i].Stream {
+			// Streams excluded, as they are from the window percentiles: a
+			// 600s SSE connection is a connection lifetime, not a latency, and
+			// one of them owns the p95 of any bucket it lands in.
+			a.durations = append(a.durations, recs[i].DurationMS)
 		}
 	}
 	keys := make([]int64, 0, len(buckets))
@@ -225,10 +253,12 @@ func (s *Store) Stats(_ context.Context, from time.Time, bucket time.Duration) (
 	for _, k := range keys {
 		a := buckets[k]
 		st.Series = append(st.Series, ext.TimeBucket{
-			Time:       time.UnixMilli(k * bucket.Milliseconds()),
-			Count:      a.count,
-			Errors:     a.errs,
-			AvgLatency: a.sum / float64(a.count),
+			Time:         time.UnixMilli(k * bucket.Milliseconds()),
+			Count:        a.count,
+			Errors:       a.errs,
+			ClientErrors: a.clientErrs,
+			AvgLatency:   a.sum / float64(a.count),
+			P95Latency:   quantileOf(a.durations, 0.95),
 		})
 	}
 
