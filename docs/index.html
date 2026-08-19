@@ -1012,7 +1012,9 @@ docker compose up --build
         Want to see the SDK, traces and application logs working together?
         <code>examples/python-shop</code> is three FastAPI services making real calls to
         each other, with a 25-assertion suite that checks the claims on this page
-        against a live stack.
+        against a live stack. <code>examples/springboot-shop</code> does the same on the
+        JVM — one checkout that fans out to a catalog read and a payment charge over
+        real HTTP, so a single request produces three correlated spans.
       </p>
       <p class="prose" style="margin-top:1rem;font-size:0.93rem;color:var(--ink-3)">
         Prefer just the binary? <code>brew install dwarka-prasad/tap/optictrace</code> covers
