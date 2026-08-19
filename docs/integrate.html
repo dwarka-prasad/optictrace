@@ -407,6 +407,11 @@ kubectl get secret optictrace-admin-token -o jsonpath=<span class="s">'{.data.to
         <strong>collector mode</strong>: leave <code>service.listen</code> and
         <code>service.upstream</code> out of the config entirely and it starts admin-only.
       </p>
+      <p class="note">
+        <b>None of the SDKs are on a public registry yet</b> — not npm, not PyPI, not
+        Maven Central. Each install step below is the real one: from the repository. The
+        agent itself is published, on Homebrew, <code>go install</code> and ghcr.io.
+      </p>
     </div>
 
 <pre><span class="c"># the agent for an SDK fleet — no listen, no upstream</span>
@@ -415,7 +420,9 @@ optictrace run -config optic.yaml</pre>
 
     <div class="stack">
       <header><h3>Node.js — Express</h3><span class="badge">@optictrace/express</span></header>
-<pre>npm install @optictrace/express</pre>
+<pre><span class="c"># not on npm yet — install from the repository</span>
+git clone https://github.com/dwarka-prasad/optictrace
+npm install ./optictrace/sdks/express</pre>
 <pre><span class="k">const</span> express = require(<span class="s">'express'</span>);
 <span class="k">const</span> optictrace = require(<span class="s">'@optictrace/express'</span>);
 
@@ -443,7 +450,8 @@ log.info(<span class="s">'charge captured'</span>, { amount: <span class="k">129
 
     <div class="stack">
       <header><h3>Python — FastAPI, Starlette, any ASGI app</h3><span class="badge">optictrace-fastapi</span></header>
-<pre>pip install optictrace-fastapi</pre>
+<pre><span class="c"># not on PyPI yet — pip installs it straight from the subdirectory</span>
+pip install <span class="s">"git+https://github.com/dwarka-prasad/optictrace#subdirectory=sdks/fastapi"</span></pre>
 <pre><span class="k">from</span> fastapi <span class="k">import</span> FastAPI
 <span class="k">from</span> optictrace_fastapi <span class="k">import</span> OpticTraceMiddleware
 
