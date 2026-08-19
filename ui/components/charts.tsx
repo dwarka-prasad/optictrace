@@ -13,6 +13,10 @@ import {
 } from 'recharts';
 import type { TimeBucket } from '@/lib/api';
 
+// Series animation is off everywhere in this file. These charts re-poll every
+// five seconds, and Recharts replays its enter animation whenever the data
+// changes — so a live dashboard spends its time redrawing itself, and a chart
+// captured or glanced at mid-animation shows nothing at all.
 const tickStyle = { fill: '#7c8cad', fontSize: 11 };
 const tooltipStyle = {
   backgroundColor: '#111a2e',
@@ -46,8 +50,8 @@ export function TrafficChart({ series }: { series: TimeBucket[] }) {
           contentStyle={tooltipStyle}
           labelFormatter={(v) => new Date(v as string).toLocaleString()}
         />
-        <Area type="monotone" dataKey="count" name="requests" stroke="#38bdf8" fill="url(#reqFill)" strokeWidth={2} />
-        <Area type="monotone" dataKey="errors" name="5xx errors" stroke="#f87171" fill="url(#errFill)" strokeWidth={2} />
+        <Area type="monotone" dataKey="count" name="requests" stroke="#38bdf8" fill="url(#reqFill)" strokeWidth={2} isAnimationActive={false} />
+        <Area type="monotone" dataKey="errors" name="5xx errors" stroke="#f87171" fill="url(#errFill)" strokeWidth={2} isAnimationActive={false} />
       </AreaChart>
     </ResponsiveContainer>
   );
@@ -65,7 +69,7 @@ export function LatencyChart({ series }: { series: TimeBucket[] }) {
           labelFormatter={(v) => new Date(v as string).toLocaleString()}
           formatter={(v) => [`${Number(v).toFixed(2)} ms`, 'avg latency']}
         />
-        <Line type="monotone" dataKey="avg_latency_ms" stroke="#34d399" strokeWidth={2} dot={false} />
+        <Line type="monotone" dataKey="avg_latency_ms" stroke="#34d399" strokeWidth={2} dot={false} isAnimationActive={false} />
       </LineChart>
     </ResponsiveContainer>
   );
@@ -92,8 +96,8 @@ export function StatusMixChart({ series }: { series: TimeBucket[] }) {
         <XAxis dataKey="time" tickFormatter={fmtTime} tick={tickStyle} axisLine={false} tickLine={false} />
         <YAxis tick={tickStyle} axisLine={false} tickLine={false} allowDecimals={false} />
         <Tooltip contentStyle={tooltipStyle} labelFormatter={(v) => new Date(v as string).toLocaleString()} />
-        <Area type="monotone" dataKey="ok" stackId="1" name="succeeded" stroke="#34d399" fill="#34d399" fillOpacity={0.25} strokeWidth={1.5} />
-        <Area type="monotone" dataKey="errors" stackId="1" name="failed" stroke="#f87171" fill="#f87171" fillOpacity={0.4} strokeWidth={1.5} />
+        <Area type="monotone" dataKey="ok" stackId="1" name="succeeded" stroke="#34d399" fill="#34d399" fillOpacity={0.25} strokeWidth={1.5} isAnimationActive={false} />
+        <Area type="monotone" dataKey="errors" stackId="1" name="failed" stroke="#f87171" fill="#f87171" fillOpacity={0.4} strokeWidth={1.5} isAnimationActive={false} />
       </AreaChart>
     </ResponsiveContainer>
   );

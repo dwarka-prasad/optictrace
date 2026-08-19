@@ -20,6 +20,8 @@ Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 
 ### Fixed
 
+- **Dashboard charts re-ran their entry animation on every poll.** The overview refreshes every five seconds and Recharts replays its enter animation whenever the data changes, so the charts spent their time redrawing themselves — and anything glancing at or capturing them mid-animation saw an empty panel with correctly-scaled axes. Animation is off across the chart components now.
+
 - **`card.number` was not recognised as a card number.** The sensitive-name heuristics matched `card_number` but not the `card: { number: ... }` shape every payment API actually uses, so the single most important field to mask was missed — by `optictrace suggest` on live traffic as well as by the new scaffolder. Nested parent/leaf pairs are now matched for card and bank-account numbers, deliberately as a *pair* so that `order.number` and `page.number` stay unflagged: a heuristic that flags every number field gets muted, and a muted heuristic protects nothing.
 
 ## [0.11.0] — 2026-08-19

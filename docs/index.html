@@ -399,6 +399,7 @@
     <div class="nav-links">
       <a href="#how">How it works</a>
       <a href="#config">Config</a>
+      <a href="#init">Start from a spec</a>
       <a href="#trace">Traces &amp; logs</a>
       <a href="#tooling">Tooling</a>
       <a href="#performance">Performance</a>
@@ -621,19 +622,21 @@
     <div class="shots">
       <figure class="shot-item">
         <img class="shot" src="assets/dashboard-inspector.png" loading="lazy"
-             alt="Request Inspector with a payment selected: the card number, CVV, email and Authorization header are highlighted as [REDACTED], the matched rule is named, and tenant and region labels are shown.">
+             alt="Request Inspector with a payment selected: the card number and CVV show as [REDACTED] in the request body, the matched rules and tenant, region and tier tags are listed, the request trace is drawn, and the application log lines that request wrote appear beneath it.">
         <figcaption>
           <h3>Request Inspector</h3>
-          Redacted values are highlighted so you can see governance working, the rule
-          responsible is named, and every non-sensitive field is still there.
+          Redacted values are highlighted so you can see governance working, the rules
+          responsible are named, and every non-sensitive field is still there — with the
+          request&rsquo;s own trace and the log lines its handler wrote underneath it.
         </figcaption>
       </figure>
 
       <div class="split" style="margin-top:0">
         <figure class="shot-item">
           <img class="shot" src="assets/dashboard-overview.png" loading="lazy"
-               alt="Overview page with request volume, error rate, P95 and P99 latency, live charts and a top-routes table.">
-          <figcaption><h3>Overview</h3>Golden signals and per-route latency.</figcaption>
+               alt="Overview page: request volume, error rate, P95 and P99 latency, how many rules are firing, application log line counts, a warning naming rules that matched nothing, live charts, traffic by tenant, logs by level, top routes and governance in effect.">
+          <figcaption><h3>Overview</h3>Golden signals, traffic by tenant — and which rules
+          are actually firing. A rule that matched nothing is called out by name.</figcaption>
         </figure>
         <figure class="shot-item">
           <img class="shot" src="assets/dashboard-usage.png" loading="lazy"
@@ -653,6 +656,64 @@
           recording is worse than none.
         </figcaption>
       </figure>
+    </div>
+  </section>
+
+  <!-- ================== START FROM A SPEC ================== -->
+  <section id="init" class="band">
+    <div class="wrap">
+      <div class="redact-rule"></div>
+      <div class="eyebrow">Getting started</div>
+      <div class="prose">
+        <h2>Start from the spec you already have</h2>
+        <p>
+          Writing governance by hand against an API you may not have written means
+          finding out what you missed once traffic flows. A specification already lists
+          the routes and the shape of every payload, so most of the first draft can be
+          derived rather than guessed.
+        </p>
+      </div>
+
+      <div class="split">
+        <div>
+          <div class="code-label">OpenAPI 3.x or Swagger 2.0, YAML or JSON</div>
+<pre>optictrace init -spec openapi.yaml -out optic.yaml
+
+<span class="c">✓ wrote optic.yaml — 4 route(s), 4 rule(s), 10 field(s) masked</span></pre>
+        </div>
+        <div>
+          <div class="code-label">what it derives</div>
+<pre>  - name: redact-api-v1-payments-charge
+    match:
+      path: <span class="s">"/api/v1/payments/charge"</span>
+    redact:
+      query_params: [<span class="s">"api_key"</span>]
+      json_fields:
+        - <span class="s">"$.**.card.number"</span>   <span class="c"># high · PCI-DSS scope</span>
+        - <span class="s">"$.**.card.cvv"</span>      <span class="c"># high · PCI-DSS scope</span>
+        - <span class="s">"$.**.customer.email"</span> <span class="c"># medium · personal data</span></pre>
+        </div>
+      </div>
+
+      <div class="prose" style="margin-top:1.6rem">
+        <p>
+          Credential headers come from the document&rsquo;s <code>securitySchemes</code> —
+          the one thing a specification states outright rather than implies. Routes that
+          look like credential exchanges get metadata-only capture, because there no
+          redaction rule is as reliable as not recording the body at all.
+        </p>
+      </div>
+
+      <ul class="ticks">
+        <li><strong>It is a starting point, and the file says so.</strong> A spec describes
+          what an API claims; governance has to hold for what it does</li>
+        <li>A field the document does not model cannot be masked by a rule derived from
+          it — and a field called <code>ref</code> can hold a card number, which is what
+          <code>optictrace scan</code> finds on real traffic and no name heuristic will</li>
+        <li>Caveats print to stderr, so <code>init -spec x.yaml &gt; optic.yaml</code>
+          still gives you a clean file; it refuses to overwrite an existing policy, and
+          validates what it generated before handing it over</li>
+      </ul>
     </div>
   </section>
 
