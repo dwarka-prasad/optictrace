@@ -70,6 +70,173 @@ func RunStoreSuite(t *testing.T, open OpenFunc) {
 	t.Run("retention_by_rows", func(t *testing.T) { testPrune(t, open) })
 	t.Run("recent_func", func(t *testing.T) { testRecentFunc(t, open) })
 	t.Run("streams_excluded_from_percentiles", func(t *testing.T) { testStreams(t, open) })
+
+	// App logs are OPTIONAL: a driver that does not implement ext.AppLogStore
+	// is a complete driver, and these sub-tests skip rather than fail. What
+	// they must not do is silently not run for a driver that DOES implement
+	// it — which is why the assertion lives here rather than in one driver's
+	// own tests.
+	t.Run("app_logs", func(t *testing.T) { testAppLogs(t, open) })
+	t.Run("app_logs_erasure", func(t *testing.T) { testAppLogErasure(t, open) })
+}
+
+// appLogStore returns the driver's app-log side, or skips the sub-test.
+func appLogStore(t *testing.T, s ext.Store) ext.AppLogStore {
+	t.Helper()
+	als, ok := s.(ext.AppLogStore)
+	if !ok {
+		t.Skip("driver does not implement ext.AppLogStore (optional)")
+	}
+	return als
+}
+
+// AppLog builds a representative line, exported so a driver's own tests can
+// reuse the shape the suite exercises.
+func AppLog(at time.Time, trace, span, level, message string) ext.AppLog {
+	return ext.AppLog{
+		Time: at, Service: "api", TraceID: trace, SpanID: span,
+		Level: level, Message: message, Source: "test",
+		Fields: map[string]string{"k": "v"},
+	}
+}
+
+func testAppLogs(t *testing.T, open OpenFunc) {
+	ctx := context.Background()
+	s := open(t)
+	als := appLogStore(t, s)
+
+	base := time.Now().Add(-time.Minute).UTC().Truncate(time.Millisecond)
+	// Written out of order deliberately: reading what a request did means
+	// reading it in the order it happened, not the order it was stored.
+	lines := []ext.AppLog{
+		AppLog(base.Add(2*time.Second), "t1", "s1", "error", "third"),
+		AppLog(base, "t1", "s1", "info", "first"),
+		AppLog(base.Add(time.Second), "t1", "s1", "warn", "second"),
+		AppLog(base, "t2", "s2", "info", "another request"),
+	}
+	if err := als.SaveAppLogs(ctx, lines); err != nil {
+		t.Fatalf("SaveAppLogs: %v", err)
+	}
+
+	got, total, err := als.QueryAppLogs(ctx, ext.AppLogFilter{SpanID: "s1"})
+	if err != nil {
+		t.Fatalf("QueryAppLogs: %v", err)
+	}
+	if total != 3 || len(got) != 3 {
+		t.Fatalf("span s1: %d line(s), total %d, want 3", len(got), total)
+	}
+	for i, want := range []string{"first", "second", "third"} {
+		if got[i].Message != want {
+			t.Errorf("position %d = %q, want %q — lines must come back oldest-first",
+				i, got[i].Message, want)
+		}
+	}
+	if got[0].Fields["k"] != "v" {
+		t.Errorf("structured fields lost in round-trip: %v", got[0].Fields)
+	}
+	if !got[0].Time.Equal(base) {
+		t.Errorf("timestamp round-trip: got %s want %s", got[0].Time, base)
+	}
+	if got[0].TraceID != "t1" || got[0].Level != "info" {
+		t.Errorf("field round-trip: %+v", got[0])
+	}
+
+	// Trace selects every hop's lines; span selects one hop's.
+	if _, total, err := als.QueryAppLogs(ctx, ext.AppLogFilter{TraceID: "t1"}); err != nil || total != 3 {
+		t.Errorf("trace filter: total=%d err=%v, want 3", total, err)
+	}
+
+	// Level is compared by SEVERITY, not alphabetically — "error" sorts before
+	// "warn" as text and after it as severity, so a lexical comparison returns
+	// the wrong set here.
+	sev, _, err := als.QueryAppLogs(ctx, ext.AppLogFilter{SpanID: "s1", LevelMin: "warn"})
+	if err != nil {
+		t.Fatalf("level filter: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, l := range sev {
+		seen[l.Level] = true
+	}
+	if !seen["warn"] || !seen["error"] || seen["info"] {
+		t.Errorf("level_min=warn selected %v, want warn+error and not info", seen)
+	}
+
+	if n, err := als.CountAppLogs(ctx); err != nil || n != 4 {
+		t.Errorf("CountAppLogs = %d (err %v), want 4", n, err)
+	}
+
+	sum, err := als.AppLogStats(ctx, base.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("AppLogStats: %v", err)
+	}
+	if sum.Total != 4 || sum.ByLevel["info"] != 2 || sum.SpansWithLogs != 2 {
+		t.Errorf("stats = %+v, want total 4, info 2, spans 2", sum)
+	}
+
+	// Retention is separate from the record horizon: app logs outgrow records
+	// by orders of magnitude and are rarely wanted for as long.
+	removed, err := als.PruneAppLogsBefore(ctx, base.Add(500*time.Millisecond))
+	if err != nil {
+		t.Fatalf("PruneAppLogsBefore: %v", err)
+	}
+	if removed != 2 {
+		t.Errorf("pruned %d line(s), want 2", removed)
+	}
+	if n, _ := als.CountAppLogs(ctx); n != 2 {
+		t.Errorf("%d line(s) survived, want 2", n)
+	}
+}
+
+// testAppLogErasure is the reason this suite covers app logs at all.
+//
+// Erasure that deletes a tenant's requests but leaves the lines those requests
+// wrote is not erasure — and a log line is the LIKELIER place for the personal
+// data to be sitting, because nobody redacts a log as carefully as a payload.
+// A driver implementing both Store and AppLogStore must handle this in Purge;
+// it is the one part of the contract that cannot be inferred from the
+// interface signatures.
+func testAppLogErasure(t *testing.T, open OpenFunc) {
+	ctx := context.Background()
+	s := open(t)
+	als := appLogStore(t, s)
+
+	save := func(trace, tenant string) {
+		t.Helper()
+		rec := Record(200, 5, "/api/v1/payments/charge", tenant)
+		rec.TraceID = trace
+		rec.SpanID = trace + "-span"
+		mustSave(t, s, rec)
+		if err := als.SaveAppLogs(ctx, []ext.AppLog{
+			AppLog(time.Now().UTC(), trace, trace+"-span", "info", "processing for "+tenant),
+		}); err != nil {
+			t.Fatalf("SaveAppLogs: %v", err)
+		}
+	}
+	save("trace-acme", "acme")
+	save("trace-globex", "globex")
+
+	if _, err := s.Purge(ctx, "tenant", "acme", time.Time{}); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+
+	gone, _, err := als.QueryAppLogs(ctx, ext.AppLogFilter{TraceID: "trace-acme"})
+	if err != nil {
+		t.Fatalf("QueryAppLogs: %v", err)
+	}
+	if len(gone) != 0 {
+		t.Errorf("purge left %d app log line(s) behind — erasure that keeps the "+
+			"lines a purged tenant's requests wrote is not erasure: %+v", len(gone), gone)
+	}
+
+	// And it must not take a bystander's data with it, the same way Purge
+	// itself must match the label value literally.
+	kept, _, err := als.QueryAppLogs(ctx, ext.AppLogFilter{TraceID: "trace-globex"})
+	if err != nil {
+		t.Fatalf("QueryAppLogs: %v", err)
+	}
+	if len(kept) != 1 {
+		t.Errorf("purge destroyed a bystander's log lines: %d remain, want 1", len(kept))
+	}
 }
 
 func testRoundtrip(t *testing.T, open OpenFunc) {

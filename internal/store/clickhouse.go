@@ -70,6 +70,28 @@ ENGINE = MergeTree
 ORDER BY (ts, id)
 SETTINGS index_granularity = 8192`
 
+// chAppLogSchema is a separate table, not more columns on logs: many lines per
+// exchange is a different cardinality entirely, and app logs want their own
+// retention horizon.
+const chAppLogSchema = `
+CREATE TABLE IF NOT EXISTS app_logs (
+	id        Int64,
+	ts        Int64,
+	service   String,
+	trace_id  String,
+	span_id   String,
+	level     String,
+	message   String,
+	fields    String,
+	source    String,
+	truncated UInt8
+)
+ENGINE = MergeTree
+-- span_id leads: "what did this request log" is the point, and it is the only
+-- lookup that has to be fast on the fastest-growing table in the store.
+ORDER BY (span_id, ts, id)
+SETTINGS index_granularity = 8192`
+
 // NewClickHouse opens (and migrates) a ClickHouse-backed store. dsn is a
 // clickhouse-go URL: clickhouse://user:pass@host:9000/database
 func NewClickHouse(dsn string) (*ClickHouseStore, error) {
@@ -93,6 +115,10 @@ func NewClickHouse(dsn string) (*ClickHouseStore, error) {
 	if _, err := db.ExecContext(ctx, chSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, chAppLogSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("apply app-log schema: %w", err)
 	}
 	// Columns added after the initial release. ClickHouse has IF NOT EXISTS
 	// for this, so no error-string matching is needed.
@@ -602,6 +628,49 @@ func (s *ClickHouseStore) Purge(ctx context.Context, label, value string, before
 	if n == 0 {
 		return 0, nil
 	}
+	// Erasure has to take the application log lines with it. A tenant's
+	// requests deleted while the lines those requests wrote survive is not
+	// erasure, and a log is the likelier place for the personal data to be.
+	//
+	// ClickHouse has no transactions across these two mutations, so the log
+	// lines go FIRST: if the second delete fails, the caller sees an error and
+	// retries, and a retry is safe. The other order could report failure while
+	// having already removed the records, leaving orphaned lines nothing will
+	// ever match again.
+	var traceIDs []string
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT DISTINCT trace_id FROM logs WHERE `+where+` AND trace_id != ''`, args...)
+	if err != nil {
+		return 0, err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		traceIDs = append(traceIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+
+	if len(traceIDs) > 0 {
+		ids := make([]any, len(traceIDs))
+		placeholders := make([]string, len(traceIDs))
+		for i, id := range traceIDs {
+			ids[i] = id
+			placeholders[i] = "?"
+		}
+		if _, err := s.db.ExecContext(ctx,
+			`ALTER TABLE app_logs DELETE WHERE trace_id IN (`+
+				strings.Join(placeholders, ",")+`)`+syncMutations, ids...); err != nil {
+			return 0, fmt.Errorf("purge app logs: %w", err)
+		}
+	}
+
 	if _, err := s.db.ExecContext(ctx,
 		`ALTER TABLE logs DELETE WHERE `+where+syncMutations, args...); err != nil {
 		return 0, err

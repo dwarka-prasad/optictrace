@@ -1044,10 +1044,19 @@ Three consequences worth knowing before you turn it on:
   `optictrace_app_logs_dropped_total{reason="orphan"}` — data discarded
   silently is data nobody knows they are missing. Set `drop_orphans: false` to
   keep them unattributed.
+- **`optictrace scan` reads them too.** A payload is structured and can be
+  masked by JSON path; a log line is free text. A leak detector that only reads
+  payloads looks where the data is easiest to protect rather than where it
+  escapes, so scan reports on both and the suggested fix differs — a pattern or
+  a field name under `app_logs.redact`, not a `json_fields` path that could not
+  work here. The count is reported as "N record(s) and M log line(s)", because
+  no findings over zero lines means something very different from no findings
+  over forty thousand.
 - **Storage support is optional.** `ext.AppLogStore` is a separate interface
   from `ext.Store`, so a third-party driver that does not implement it is still
-  a complete driver. The endpoint says which of the two problems you have —
-  the feature is off, or your driver cannot store lines.
+  a complete driver — but a driver that DOES implement it must also erase log
+  lines in `Purge`, and `ext/exttest` asserts exactly that. All three built-in
+  drivers (SQLite, Postgres, ClickHouse) pass it.
 
 ---
 

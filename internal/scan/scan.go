@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dwarka-prasad/optictrace/ext"
 	"github.com/dwarka-prasad/optictrace/internal/store"
 )
 
@@ -21,7 +22,7 @@ type Finding struct {
 	Why      string    `json:"why"`
 	Method   string    `json:"method"`
 	Route    string    `json:"route"`
-	Location string    `json:"location"` // request_body | response_body | request_headers | response_headers
+	Location string    `json:"location"` // request_body | response_body | request_headers | response_headers | app_log
 	Field    string    `json:"field"`    // JSON path or header name
 	Count    int       `json:"count"`
 	FirstAt  time.Time `json:"first_seen"`
@@ -33,9 +34,13 @@ type Finding struct {
 
 // Report is a complete scan result.
 type Report struct {
-	Scanned  int       `json:"records_scanned"`
-	Since    time.Time `json:"since"`
-	Findings []Finding `json:"findings"`
+	Scanned int `json:"records_scanned"`
+	// LinesScanned counts application log lines examined. Reported separately
+	// from records because "0 findings" means something very different when
+	// no log lines were looked at than when thousands were.
+	LinesScanned int       `json:"log_lines_scanned"`
+	Since        time.Time `json:"since"`
+	Findings     []Finding `json:"findings"`
 }
 
 // Counts summarizes findings by severity.
@@ -77,10 +82,11 @@ type key struct{ kind, method, route, location, field string }
 // gigabytes resident before the first detector runs, on an endpoint that is
 // reachable without authentication. Folding incrementally costs one record.
 type Scanner struct {
-	agg       map[key]*Finding
-	scanned   int
-	since     time.Time
-	detectors []Detector
+	linesScanned int
+	agg          map[key]*Finding
+	scanned      int
+	since        time.Time
+	detectors    []Detector
 }
 
 // NewScanner scans with the built-in detector set.
@@ -149,6 +155,63 @@ func (s *Scanner) Add(rec *store.Record) {
 	}
 }
 
+// AddAppLog scans one application log line.
+//
+// This surface matters more than the payloads, not less. A payload is
+// structured and can be masked by JSON path; a log line is free text written by
+// whoever was debugging that day, and it routinely carries tokens and whole
+// request bodies inside stack traces. A leak detector that only reads payloads
+// is looking where the data is easiest to protect rather than where it escapes.
+//
+// Findings group by service and level rather than by route, because that is
+// what a log line has: the code that wrote it is identified by the service it
+// ran in, not by the request that happened to trigger it.
+func (s *Scanner) AddAppLog(l *ext.AppLog) {
+	s.linesScanned++
+
+	record := func(field, value string) {
+		for _, m := range FindWith(s.detectors, value) {
+			k := key{m.Kind, l.Service, "log:" + l.Level, "app_log", field}
+			f := s.agg[k]
+			if f == nil {
+				f = &Finding{
+					Kind: m.Kind, Severity: m.Severity, Why: m.Why,
+					Method: l.Service, Route: "log:" + l.Level,
+					Location: "app_log", Field: field,
+					Sample: m.Masked, FirstAt: l.Time,
+					Suggest: suggestAppLog(field),
+				}
+				s.agg[k] = f
+			}
+			f.Count++
+			if l.Time.Before(f.FirstAt) {
+				f.FirstAt = l.Time
+			}
+			if l.Time.After(f.LastAt) {
+				f.LastAt = l.Time
+			}
+		}
+	}
+
+	record("message", l.Message)
+	for name, val := range l.Fields {
+		record(name, val)
+	}
+}
+
+// suggestAppLog produces the fix for a value found in a log line.
+//
+// Deliberately different from the payload suggestion: there is no JSON path to
+// name, so the fix is a pattern (or a field name) under
+// telemetry.app_logs.redact. Suggesting `json_fields` here would be advice
+// that cannot work.
+func suggestAppLog(field string) string {
+	if field == "message" {
+		return "telemetry:\n  app_logs:\n    redact:\n      patterns: ['<a regex matching this value>']"
+	}
+	return fmt.Sprintf("telemetry:\n  app_logs:\n    redact:\n      fields: [%s]", field)
+}
+
 // Report finalises the accumulated findings, most severe first.
 func (s *Scanner) Report() *Report {
 	out := make([]Finding, 0, len(s.agg))
@@ -165,7 +228,7 @@ func (s *Scanner) Report() *Report {
 		}
 		return out[i].Field < out[j].Field
 	})
-	return &Report{Scanned: s.scanned, Since: s.since, Findings: out}
+	return &Report{Scanned: s.scanned, LinesScanned: s.linesScanned, Since: s.since, Findings: out}
 }
 
 // Records scans a slice of stored telemetry. Equivalent to feeding each record

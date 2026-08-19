@@ -68,6 +68,27 @@ CREATE INDEX IF NOT EXISTS idx_logs_labels  ON logs USING gin(labels);
 CREATE INDEX IF NOT EXISTS idx_logs_rules   ON logs USING gin(matched_rules);
 -- Same reasoning as SQLite: percentile_cont sorts within each route group.
 CREATE INDEX IF NOT EXISTS idx_logs_route_duration ON logs(route, method, duration_ms);
+
+-- Application log lines, correlated to a span. A separate table, not more
+-- columns: many lines per exchange is a different cardinality entirely, and
+-- they want their own retention horizon.
+CREATE TABLE IF NOT EXISTS app_logs (
+	id        BIGSERIAL PRIMARY KEY,
+	ts        BIGINT NOT NULL,
+	service   TEXT NOT NULL DEFAULT '',
+	trace_id  TEXT NOT NULL DEFAULT '',
+	span_id   TEXT NOT NULL DEFAULT '',
+	level     TEXT NOT NULL DEFAULT '',
+	message   TEXT NOT NULL DEFAULT '',
+	fields    JSONB NOT NULL DEFAULT '{}'::jsonb,
+	source    TEXT NOT NULL DEFAULT '',
+	truncated BOOLEAN NOT NULL DEFAULT false
+);
+-- "what did this request log" is the point, and it is a point lookup over the
+-- fastest-growing table in the store.
+CREATE INDEX IF NOT EXISTS idx_app_logs_span  ON app_logs(span_id, ts);
+CREATE INDEX IF NOT EXISTS idx_app_logs_trace ON app_logs(trace_id, ts);
+CREATE INDEX IF NOT EXISTS idx_app_logs_ts    ON app_logs(ts);
 `
 
 // NewPostgres opens (and migrates) a Postgres-backed store. dsn is a standard
@@ -441,11 +462,44 @@ func (s *PostgresStore) Purge(ctx context.Context, label, value string, before t
 		query += ` AND ts < $3`
 		args = append(args, before.UnixMilli())
 	}
-	res, err := s.db.ExecContext(ctx, query, args...)
+
+	// Erasure has to take the application log lines with it. A tenant's
+	// requests deleted while the lines those requests wrote survive is not
+	// erasure — and a log is the likelier place for the personal data to be
+	// sitting, because nobody redacts a log line as carefully as a payload.
+	//
+	// One transaction: a partial erasure that reports success is worse than a
+	// failed one, because nobody comes back to it.
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	defer tx.Rollback()
+
+	logQuery := `DELETE FROM app_logs WHERE trace_id IN (
+		SELECT trace_id FROM logs WHERE labels->>$1 = $2 AND trace_id <> ''`
+	if !before.IsZero() {
+		logQuery += ` AND ts < $3`
+	}
+	logQuery += `)`
+	if _, err := tx.ExecContext(ctx, logQuery, args...); err != nil {
+		return 0, fmt.Errorf("purge app logs: %w", err)
+	}
+
+	res, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	// Deliberately the RECORD count: the caller asked how many requests were
+	// erased, and inflating it with log lines would misreport the answer.
+	return n, nil
 }
 
 func (s *PostgresStore) Close() error { return s.db.Close() }
