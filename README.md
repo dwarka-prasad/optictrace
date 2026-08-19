@@ -10,7 +10,7 @@ Prometheus dimensions.
 
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/status-v0.8.0--dev-orange)](#roadmap)
+[![Status](https://img.shields.io/badge/status-v0.14.0-brightgreen)](#roadmap)
 
 **[optictrace product page →](https://dwarka-prasad.github.io/optictrace/)**
 
@@ -42,7 +42,7 @@ Prometheus dimensions.
 - [Developer dashboard](#developer-dashboard)
 - [Deployment](#deployment)
 - [Measured overhead](#measured-overhead) · [verified behavior](#verified-behavior)
-- [Roadmap](#roadmap) — what to build next, and why
+- [Roadmap](#roadmap) — what is left, what is deliberately not planned, and the known gaps
 - [Changelog](CHANGELOG.md)
 - [Contributing](#contributing)
 
@@ -295,7 +295,7 @@ telemetry:
     cert_file: /etc/optictrace/tls.crt
     key_file:  /etc/optictrace/tls.key
   store:
-    driver: sqlite                   # sqlite | postgres | clickhouse | none                   # sqlite | none
+    driver: sqlite                   # sqlite | postgres | clickhouse | none
     dsn: optictrace.db
     queue_size: 4096                 # async queue; overflow drops, never blocks
     retention_max_rows: 100000       # oldest rows pruned
@@ -394,7 +394,7 @@ rules stay live.
 | Retention & erasure | ✅ | Row-count *and* age-based pruning; `optictrace purge` deletes everything held for one consumer |
 | Label cardinality guard | ✅ | Caps distinct values per custom label (default 500); overflow collapses to `__over_limit__` and is counted |
 | Postgres driver | ✅ | Multi-node store with JSONB aggregation and `percentile_cont`; shares a conformance suite with SQLite |
-| ClickHouse driver | ⬜ | The interface is proven by two implementations now; a column store is the next natural driver |
+| ClickHouse driver | ✅ | Column store for high-volume retention; `quantileExact` and `argMin` aggregation, and it runs the same conformance suite as SQLite and Postgres |
 | OpenTelemetry export | ✅ | `type: otlp` exporter emits spans over OTLP/HTTP JSON; no SDK dependency |
 
 ### Storage at scale
@@ -1532,49 +1532,88 @@ on trust.
 ## Roadmap
 
 Ordered by value, not by ease. Each item states the problem it solves — if the rationale
-doesn't hold for your use case, the item shouldn't be built.
+does not hold for your use case, the item should not be built.
 
-### Tier 1 — ✅ shipped in v0.5.0
+**Everything originally on this roadmap has shipped.** Tiers 1–3 (the leak detector,
+tail-based sampling, rule unit tests, query capture, retention and erasure, admin auth,
+the Postgres driver, OTLP export, replay, suggestions, the fleet view, Grafana and
+release engineering) landed by `v0.7.0`; see the [changelog](CHANGELOG.md) for what each
+release since then added. What follows is what is *not* done.
 
-These closed the sharpest risks in the design and are all live now:
+### Next — ordered
 
-- **Leak detector** (`optictrace scan`) — governance is no longer only a deny-list you maintain; it has a safety net that catches the field you forgot and prints the rule that fixes it.
-- **Label cardinality guard** — custom label values come from arbitrary request headers, so one buggy client could previously have created unbounded series. Now capped, with overflow visible as a metric.
-- **Tail-based sampling** — uniform sampling discarded exactly the requests worth keeping. `keep_errors` and `keep_slower_than` rescue them after the outcome is known.
-- **Rule unit tests** (`optictrace test`) — governance rules are safe to refactor now that CI can prove they still redact.
+1. **Publish the SDKs to their registries.** The agent is on Homebrew, `go install` and
+   ghcr.io. None of the SDKs are on npm, PyPI or Maven Central, so every integration
+   starts with `git clone` — which is a real adoption tax and the reason the
+   [integration guide](https://dwarka-prasad.github.io/optictrace/integrate.html) has to
+   spell out three different install routes. The Java package namespace
+   (`io.github.dwarka-prasad`) is already chosen for Central's verification rules.
+   Blocked on publishing credentials, not on code.
 
-### Tier 2 — ✅ shipped in v0.6.0
+2. **Governance metrics and alerts.** Prometheus carries traffic and agent health but
+   nothing about the policy: no series for redactions applied, rules matched, or scan
+   findings. That means the one failure mode unique to this tool — *governance silently
+   stopping* — is the one thing you cannot alert on. A rule that matches nothing is
+   already surfaced on the dashboard; it should be able to page someone.
 
-- **Query-string capture** — with `redact.query_params` shipped alongside it, because capturing `?api_key=…` without a way to mask it would have been a governance regression. Query params now appear in inferred specs and are scanned for leaks.
-- **Time-based retention + per-consumer purge** — `retention_max_age` expresses a policy the way policies are written ("keep 30 days"), and `optictrace purge -value acme` answers erasure requests.
-- **Admin authentication + TLS** — bearer token (constant-time compare, `token_env` so secrets stay out of git) and optional HTTPS. Health probes stay open so orchestrators keep working.
-- **Published benchmarks** — see [Measured overhead](#measured-overhead). The "restricted routes are near-free" claim is now a number: +0.22 µs.
-- **Python and Go SDK generators** — `optictrace sdk -lang python|go`, both dependency-free.
+3. **A scheduled scan that opens an issue.** `optictrace scan` runs in CI against a diff.
+   Production traffic is where new fields actually appear, and nobody remembers to run a
+   scan by hand. A scheduled job against a live agent, filing an issue on a new finding,
+   turns the leak detector from something you invoke into something that tells you.
 
-### Tier 3 — ✅ shipped in v0.7.0
+4. **`optictrace test -from-traffic`.** Rule tests are hand-written fixtures today, so
+   they test the payloads someone thought of. Generating cases from captured traffic —
+   masked, so the fixture is safe to commit — would pin the behaviour against payloads
+   the API really produced.
 
-- **Postgres driver** — a second `LogStore` for multi-node deployments, with percentile and usage aggregation pushed into the database. Both drivers run the *same* conformance suite, so they can't drift apart.
-- **OTLP export** — governed records become OpenTelemetry spans, shipped as a fourth exporter type so it reuses the existing batching and isolation. Bodies are deliberately never attached to spans.
-- **Traffic replay** — `optictrace replay` re-issues captured traffic and diffs status codes, reporting what governance made unreplayable rather than faking it.
-- **Rule suggestions** — `optictrace suggest` reads field *names* where `scan` reads *values*; together they cover both halves.
-- **Fleet view** — `/api/services` aggregates across services when many SDKs report into one agent.
-- **Grafana + alerts** — a provisioned dashboard and 7 alert rules (validated with `promtool`), wired into `docker compose`.
-- **Release engineering** — goreleaser config (validated with `goreleaser check`) for signed, SBOM'd, multi-arch binaries, a Homebrew cask, and multi-platform images.
+5. **Subject-access export.** `purge` answers erasure requests; the *other* half of the
+   same regulation is "give me a copy of what you hold about me", and today that means
+   hand-writing a query. It is the same label filter and the same store scan as `purge`,
+   in the opposite direction.
+
+6. **Express application-log parity.** The Java, FastAPI and Go SDKs correlate log lines
+   with no call-site changes (a handler on the logging framework, span from a
+   thread-local or context). Express requires an explicit `LogShipper` because Node has
+   no ambient logger to hook — worth closing with an `AsyncLocalStorage`-based adapter
+   for pino and winston.
+
+7. **OTLP *ingest*.** OpticTrace exports to OTLP; it cannot receive it. Accepting OTLP
+   would let a service already instrumented with an OpenTelemetry SDK send spans here
+   and have governance applied to them, without adopting a second SDK.
+
+### Deliberately not planned
+
+- **gRPC interception.** Bodies are length-prefixed protobuf; without descriptors there
+  is nothing to redact or meter, so a proxy could only count bytes. Use the SDK
+  middleware inside the service, where the messages are typed.
+- **A rules UI.** The config is the interface, and it is reviewable in a pull request.
+  A form that generates YAML makes the file the second source of truth.
+- **Sampling that drops records.** Sampling gates the stored *body*; the record is always
+  written. A tool whose own counts move when you change a sampling rate cannot be used to
+  answer questions about traffic.
 
 ### Known gaps
 
 Documented so nobody discovers them the hard way:
 
-- Rule match counts use a `LIKE` scan over stored JSON — fine at the default 100k-row retention, worth an indexed join table beyond that.
 - The AI mock path is implemented but has never run against the live Anthropic API.
-- Hijacked connections (WebSockets) pass through; once upgraded, the bytes are
-  between client and upstream, so the record covers the exchange up to the `101`.
-  Their duration is a connection lifetime, so they are marked as streams and kept
-  out of latency percentiles.
-- Streaming responses (SSE, chunked) reach the client as they are produced, but
-  telemetry is emitted when the stream closes — a long-lived stream is invisible
-  until then, apart from `optictrace_streams_open`.
-- Admin authentication is available but **off by default**; enable `telemetry.auth` if the port is reachable.
+- Hijacked connections (WebSockets) pass through; once upgraded, the bytes are between
+  client and upstream, so the record covers the exchange up to the `101`. Their duration
+  is a connection lifetime, so they are marked as streams and kept out of latency
+  percentiles.
+- Streaming responses (SSE, chunked) reach the client as they are produced, but telemetry
+  is emitted when the stream closes — a long-lived stream is invisible until then, apart
+  from `optictrace_streams_open`.
+- Admin authentication is available but **off by default** for the binary; enable
+  `telemetry.auth` if the port is reachable. The Helm chart turns it on by default and
+  generates a token, because inside a cluster the admin port is reachable by anything
+  that can resolve the Service.
+- `record.time` is when an exchange **finished**, not when it started. Subtract
+  `duration_ms` for the start — a timeline built on it directly draws a parent beginning
+  after the children it called.
+- Trace listing needs a store driver implementing the optional `ext.TraceStore`. All
+  three bundled drivers do; a third-party driver without it loses the Traces page, not
+  correlation.
 
 ---
 
@@ -1584,7 +1623,7 @@ Bug reports, rule-engine edge cases, and new SDK targets are all welcome — see
 [CONTRIBUTING.md](CONTRIBUTING.md). Ground rules worth repeating:
 
 1. **Governance invariants are non-negotiable.** Proxied traffic is never mutated; telemetry never blocks a request. Any PR that could leak a restricted or redacted value needs a test proving it doesn't.
-2. **The rule engine is portable.** `internal/engine` (Go), `sdks/express/engine.js` and `sdks/fastapi/.../engine.py` must stay semantically identical.
+2. **The rule engine is portable.** `internal/engine` (Go), `sdks/express/engine.js`, `sdks/fastapi/.../engine.py` and `sdks/java/.../Engine.java` must stay semantically identical. A source one engine cannot resolve returns an EMPTY value, never a guessed one.
 
 ```bash
 make setup      # dependencies, dashboard, binaries
@@ -1596,13 +1635,14 @@ make help       # every target
 ## Project layout
 
 ```
-cmd/optictrace/     agent binary (run · validate · test · scan · suggest · purge ·
-                    replay · spec · check · sdk · mock · version)
+cmd/optictrace/     agent binary (run · init · validate · test · scan · suggest ·
+                    review · purge · replay · spec · check · sdk · mock · version)
 internal/config/    optic.yaml schema + strict validation
 internal/engine/    compiled rule engine: globs, policy merge, redaction, meters
 internal/proxy/     interception (reverse proxy + embeddable middleware)
 internal/metrics/   Prometheus collector with dynamic label schemas
-internal/store/     LogStore interface, SQLite driver, async writer, usage aggregation
+internal/store/     LogStore interface, SQLite · Postgres · ClickHouse drivers,
+                    async writer, usage aggregation, trace rollups
 internal/export/    output plugins: file · webhook · command (custom executables)
 internal/scan/      leak detector: structural detectors, masked findings, fix suggestions
 internal/suggest/   name-based rule proposals (complements scan's value checks)
@@ -1611,11 +1651,16 @@ internal/replay/    re-issue captured traffic against a target
 internal/ruletest/  optic.test.yaml runner (pure engine, no server)
 internal/spec/      traffic→OpenAPI inference, spec-vs-traffic linter, TS SDK gen
 internal/mock/      stateful mock server (+ optional Claude-generated responses)
+internal/applog/    application-log governance: level floor, caps, redaction
+internal/scaffold/  optic.yaml generation from an OpenAPI or Swagger document
 internal/admin/     admin API + dashboard hosting
 ui/                 Next.js dashboard (static export)
-sdks/               express · fastapi · gin
+ext/                published extension surface: Store · Exporter · auth hooks,
+                    plus the optional AppLogStore and TraceStore companions
+sdks/               express · fastapi · java · gin
 deploy/             compose bits, Helm chart, Grafana dashboard, Prometheus alerts
-examples/           exporter plugins, CI workflows, a traffic fixture
+examples/           exporter plugins, CI workflows, a traffic fixture, and two
+                    runnable apps: python-shop (FastAPI) and springboot-shop (Java)
 ```
 
 ## Changelog
