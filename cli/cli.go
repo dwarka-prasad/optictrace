@@ -386,12 +386,16 @@ func scanTraffic(configPath string, window time.Duration, failOn string) {
 	for i := range records {
 		sc.Add(&records[i])
 	}
+	// And the application log lines, which are the riskier surface: a payload
+	// is structured and can be masked by JSON path, a log line is free text
+	// written by whoever was debugging that day.
+	scanAppLogs(sc, cfg, window)
 	report := sc.Report()
 	crit, high, med := report.Counts()
 
 	if len(report.Findings) == 0 {
-		fmt.Printf("✓ scanned %d record(s) over %s — no sensitive values found outside your rules\n",
-			report.Scanned, window)
+		fmt.Printf("✓ scanned %s over %s — no sensitive values found outside your rules\n",
+			scannedSummary(report), window)
 		return
 	}
 
@@ -403,8 +407,8 @@ func scanTraffic(configPath string, window time.Duration, failOn string) {
 			f.Why, f.Count, ago(f.LastAt), f.Sample)
 		fmt.Printf("    fix: %s\n\n", strings.ReplaceAll(f.Suggest, "\n", "\n         "))
 	}
-	fmt.Printf("scanned %d record(s): %d critical, %d high, %d medium\n",
-		report.Scanned, crit, high, med)
+	fmt.Printf("scanned %s: %d critical, %d high, %d medium\n",
+		scannedSummary(report), crit, high, med)
 
 	if failOn != "never" && report.HasAtLeast(failOn) {
 		fmt.Fprintf(os.Stderr, "\n✗ sensitive data found at or above severity %q\n", failOn)
@@ -454,6 +458,51 @@ func ago(t time.Time) string {
 }
 
 // loadTraffic opens the configured store read-only and pulls the window.
+// scannedSummary names what was actually read. "0 findings" over 0 log lines
+// means something very different from 0 findings over 40,000 of them, and the
+// difference is invisible unless it is printed.
+func scannedSummary(r *scan.Report) string {
+	if r.LinesScanned == 0 {
+		return fmt.Sprintf("%d record(s)", r.Scanned)
+	}
+	return fmt.Sprintf("%d record(s) and %d log line(s)", r.Scanned, r.LinesScanned)
+}
+
+// scanAppLogs feeds stored application log lines to the scanner. A store
+// driver without app-log support, or a config with the feature off, simply
+// contributes nothing — this is an optional surface, not a required one.
+func scanAppLogs(sc *scan.Scanner, cfg *config.Config, window time.Duration) {
+	if cfg == nil || cfg.Telemetry.AppLogs == nil || !cfg.Telemetry.AppLogs.Enabled {
+		return
+	}
+	st, err := openStore(&cfg.Telemetry.Store)
+	if err != nil {
+		return
+	}
+	defer st.Close()
+	als, ok := st.(store.AppLogStore)
+	if !ok {
+		return
+	}
+	since := time.Now().Add(-window)
+	limit := store.AnalysisLimit(cfg.Telemetry.Store.AnalysisMaxRows)
+	for offset := 0; offset < limit; {
+		lines, total, err := als.QueryAppLogs(context.Background(), store.AppLogFilter{
+			Since: since, Limit: 500, Offset: offset,
+		})
+		if err != nil || len(lines) == 0 {
+			return
+		}
+		for i := range lines {
+			sc.AddAppLog(&lines[i])
+		}
+		offset += len(lines)
+		if int64(offset) >= total {
+			return
+		}
+	}
+}
+
 func loadTraffic(configPath string, window time.Duration) (*config.Config, []store.Record) {
 	cfg, err := config.Load(configPath)
 	if err != nil {

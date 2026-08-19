@@ -559,6 +559,30 @@ func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Application logs are the other half of the surface, and the riskier one:
+	// a payload is structured and can be masked by path, a log line is free
+	// text. Scanning records but not lines would look where the data is
+	// easiest to protect rather than where it escapes.
+	if s.AppLogStore != nil {
+		offset := 0
+		for {
+			lines, total, err := s.AppLogStore.QueryAppLogs(r.Context(), store.AppLogFilter{
+				Since: since, Limit: 500, Offset: offset,
+			})
+			if err != nil {
+				httpError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			for i := range lines {
+				sc.AddAppLog(&lines[i])
+			}
+			offset += len(lines)
+			if len(lines) == 0 || int64(offset) >= total || offset >= s.analysisRows() {
+				break
+			}
+		}
+	}
+
 	report := sc.Report()
 	ext.NoteAccess(r.Context(), ext.Accessed{Count: report.Scanned, Filter: auditableQuery(r)})
 	crit, high, med := report.Counts()
@@ -567,11 +591,14 @@ func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"records_scanned": report.Scanned,
-		"since":           report.Since,
-		"critical":        crit,
-		"high":            high,
-		"medium":          med,
-		"findings":        report.Findings,
+		// Reported so "0 findings" can be read honestly: none over zero log
+		// lines means something very different from none over forty thousand.
+		"log_lines_scanned": report.LinesScanned,
+		"since":             report.Since,
+		"critical":          crit,
+		"high":              high,
+		"medium":            med,
+		"findings":          report.Findings,
 	})
 }
 
@@ -1044,6 +1071,16 @@ func (s *Server) queryAppLogs(w http.ResponseWriter, r *http.Request) {
 		lines = []store.AppLog{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"lines": lines, "total": total})
+}
+
+// analysisRows is the row bound for the analysis endpoints, resolved. App logs
+// run orders of magnitude above request volume, so an unbounded scan of them
+// would read far more than the equivalent record scan.
+func (s *Server) analysisRows() int {
+	if s.AnalysisMaxRows > 0 {
+		return s.AnalysisMaxRows
+	}
+	return store.DefaultAnalysisMaxRows
 }
 
 // appLogStats returns aggregate counts for the dashboard. It exposes no

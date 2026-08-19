@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 `0.7.0` is the first public release and contains all of that work.
 
+## [Unreleased]
+
+### Added
+
+- **Postgres and ClickHouse store application logs.** Previously SQLite only, so the feature was unavailable on exactly the multi-node deployments most likely to want it. Both implement the full `ext.AppLogStore` and both erase log lines together with the records a `purge` removes — ClickHouse deletes the lines first, because it has no transaction across the two mutations and a retry is safe while an orphaned line nothing can match again is not.
+
+- **`ext/exttest` asserts the app-log contract**, including the erasure rule that `ext/applog.go` documents. That rule cannot be inferred from the interface signatures: a driver can implement `Store` and `AppLogStore` perfectly and still leave a purged tenant's log lines behind, and a log is the likelier place for the personal data to be sitting. The sub-tests skip for a driver without app-log support, so the interface stays genuinely optional. Verified by breaking each driver's purge in turn and watching the suite fail.
+
+- **`optictrace scan` reads application log lines**, not only payloads. It was looking where the data is easiest to protect rather than where it escapes — a record whose body is `{"amount":42}` scanned clean while a card number sat in a log line attached to it. Findings group by service and level, and the suggested fix is a pattern or field name under `app_logs.redact` rather than a `json_fields` path, which could not work on free text. Both `optictrace scan` and `GET /api/scan` now report how many log lines were read alongside the record count.
+
 ## [0.10.0] — 2026-08-19
 
 ### Added
