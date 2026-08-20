@@ -10,7 +10,7 @@ Prometheus dimensions.
 
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/status-v0.15.0-brightgreen)](#roadmap)
+[![Status](https://img.shields.io/badge/status-v0.15.1-brightgreen)](#roadmap)
 
 **[optictrace product page →](https://dwarka-prasad.github.io/optictrace/)**
 
@@ -547,7 +547,7 @@ for a complete workflow. This repo dogfoods it in
 | `GET /api/routes` | Per-route latency breakdown |
 | `GET /api/rules/stats` | Rules joined with live match counts |
 | `GET /api/usage` | Per-consumer usage and cost (`&format=csv`) |
-| `GET /api/scan` | Sensitive values found outside your rules (masked) |
+| `GET /api/scan` | Sensitive values found outside your rules, across payloads, log lines **and span attributes** (masked) |
 | `GET /api/services` | Per-service aggregates (fleet view) |
 | `GET /api/traces` | Recent traces, one row each (`?errors=1` / `?service=` / `?q=` / `?label.<k>=`) |
 | `GET /api/spec` | OpenAPI inferred from traffic |

@@ -38,7 +38,11 @@ type Report struct {
 	// LinesScanned counts application log lines examined. Reported separately
 	// from records because "0 findings" means something very different when
 	// no log lines were looked at than when thousands were.
-	LinesScanned int       `json:"log_lines_scanned"`
+	LinesScanned int `json:"log_lines_scanned"`
+	// SpansScanned counts inner spans examined, reported separately for the
+	// same reason: "0 findings" means something very different when no span
+	// attributes were looked at than when thousands were.
+	SpansScanned int       `json:"spans_scanned"`
 	Since        time.Time `json:"since"`
 	Findings     []Finding `json:"findings"`
 }
@@ -83,6 +87,7 @@ type key struct{ kind, method, route, location, field string }
 // reachable without authentication. Folding incrementally costs one record.
 type Scanner struct {
 	linesScanned int
+	spansScanned int
 	agg          map[key]*Finding
 	scanned      int
 	since        time.Time
@@ -199,6 +204,63 @@ func (s *Scanner) AddAppLog(l *ext.AppLog) {
 	}
 }
 
+// AddSpan scans one inner span's attributes and error text.
+//
+// This surface is easy to forget and easy to leak through. A payload has a JSON
+// path a rule can name; a statement is free text that a driver assembled, and
+// the parameter it interpolated is the customer's. A card number sitting in
+// `db.statement` was invisible to this scanner until it looked here, which
+// meant the leak detector reported clean on the one surface nobody had written
+// a rule for yet.
+func (s *Scanner) AddSpan(sp *ext.Span) {
+	s.spansScanned++
+
+	record := func(field, value string) {
+		for _, m := range FindWith(s.detectors, value) {
+			// Keyed by operation NAME rather than route: the span's route is a
+			// producer-supplied hint, and a figure someone reads as fact
+			// should not rest on it. The name is what identifies the operation
+			// to fix anyway.
+			k := key{m.Kind, sp.Service, "span:" + sp.Name, "span_attr", field}
+			f := s.agg[k]
+			if f == nil {
+				f = &Finding{
+					Kind: m.Kind, Severity: m.Severity, Why: m.Why,
+					Method: sp.Service, Route: "span:" + sp.Name,
+					Location: "span_attr", Field: field,
+					Sample: m.Masked, FirstAt: sp.Start,
+					Suggest: suggestSpanAttr(field),
+				}
+				s.agg[k] = f
+			}
+			f.Count++
+			if sp.Start.Before(f.FirstAt) {
+				f.FirstAt = sp.Start
+			}
+			if sp.Start.After(f.LastAt) {
+				f.LastAt = sp.Start
+			}
+		}
+	}
+
+	for name, val := range sp.Attrs {
+		record(name, val)
+	}
+	// A driver error quotes the statement that failed, parameters included.
+	record("error", sp.Error)
+}
+
+// suggestSpanAttr produces the fix for a value found in a span attribute.
+//
+// Deliberately not a json_fields suggestion: there is no JSON path here, so
+// the fix is a pattern, or the attribute key, under telemetry.spans.redact.
+func suggestSpanAttr(field string) string {
+	if field == "error" {
+		return "telemetry:\n  spans:\n    redact:\n      patterns: ['<a regex matching this value>']"
+	}
+	return fmt.Sprintf("telemetry:\n  spans:\n    redact:\n      fields: [%s]", field)
+}
+
 // suggestAppLog produces the fix for a value found in a log line.
 //
 // Deliberately different from the payload suggestion: there is no JSON path to
@@ -228,7 +290,8 @@ func (s *Scanner) Report() *Report {
 		}
 		return out[i].Field < out[j].Field
 	})
-	return &Report{Scanned: s.scanned, LinesScanned: s.linesScanned, Since: s.since, Findings: out}
+	return &Report{Scanned: s.scanned, LinesScanned: s.linesScanned,
+		SpansScanned: s.spansScanned, Since: s.since, Findings: out}
 }
 
 // Records scans a slice of stored telemetry. Equivalent to feeding each record

@@ -406,6 +406,7 @@ func scanTraffic(configPath string, window time.Duration, failOn string) {
 	// is structured and can be masked by JSON path, a log line is free text
 	// written by whoever was debugging that day.
 	scanAppLogs(sc, cfg, window)
+	scanSpans(sc, cfg, window)
 	report := sc.Report()
 	crit, high, med := report.Counts()
 
@@ -478,10 +479,21 @@ func ago(t time.Time) string {
 // means something very different from 0 findings over 40,000 of them, and the
 // difference is invisible unless it is printed.
 func scannedSummary(r *scan.Report) string {
-	if r.LinesScanned == 0 {
-		return fmt.Sprintf("%d record(s)", r.Scanned)
+	parts := []string{fmt.Sprintf("%d record(s)", r.Scanned)}
+	if r.LinesScanned > 0 {
+		parts = append(parts, fmt.Sprintf("%d log line(s)", r.LinesScanned))
 	}
-	return fmt.Sprintf("%d record(s) and %d log line(s)", r.Scanned, r.LinesScanned)
+	if r.SpansScanned > 0 {
+		parts = append(parts, fmt.Sprintf("%d span(s)", r.SpansScanned))
+	}
+	switch len(parts) {
+	case 1:
+		return parts[0]
+	case 2:
+		return parts[0] + " and " + parts[1]
+	default:
+		return strings.Join(parts[:len(parts)-1], ", ") + " and " + parts[len(parts)-1]
+	}
 }
 
 // scanAppLogs feeds stored application log lines to the scanner. A store
@@ -547,6 +559,44 @@ func scanAppLogs(sc *scan.Scanner, cfg *config.Config, window time.Duration) {
 			sc.AddAppLog(&lines[i])
 		}
 		offset += len(lines)
+		if int64(offset) >= total {
+			return
+		}
+	}
+}
+
+// scanSpans feeds stored inner spans to the scanner.
+//
+// The same shape as scanAppLogs, and needed for the same reason: a statement is
+// free text a driver assembled, and the parameter it interpolated is the
+// customer's. Without this the leak detector reported clean on the one surface
+// nobody had written a rule for yet.
+func scanSpans(sc *scan.Scanner, cfg *config.Config, window time.Duration) {
+	if cfg == nil || cfg.Telemetry.Spans == nil || !cfg.Telemetry.Spans.Enabled {
+		return
+	}
+	st, err := openStore(&cfg.Telemetry.Store)
+	if err != nil {
+		return
+	}
+	defer st.Close()
+	ss, ok := st.(store.SpanStore)
+	if !ok {
+		return
+	}
+	since := time.Now().Add(-window)
+	limit := store.AnalysisLimit(cfg.Telemetry.Store.AnalysisMaxRows)
+	for offset := 0; offset < limit; {
+		spans, total, err := ss.QuerySpans(context.Background(), store.SpanFilter{
+			Since: since, Limit: 500, Offset: offset,
+		})
+		if err != nil || len(spans) == 0 {
+			return
+		}
+		for i := range spans {
+			sc.AddSpan(&spans[i])
+		}
+		offset += len(spans)
 		if int64(offset) >= total {
 			return
 		}
