@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 `0.7.0` is the first public release and contains all of that work.
 
+## [0.15.2] — 2026-08-20
+
+### Fixed
+
+- **The Java SDK recorded async handlers as near-instant, with no response body.** A Spring MVC async handler — `Callable`, `DeferredResult`, `CompletableFuture`, `WebAsyncTask` — returns from the filter chain when the request is *parked*, not when it is finished. `OpticTraceFilter` emitted its record there, which measured **3ms for a 125ms request** and lost the response body entirely, because the body had not been written yet.
+
+  That is the worst way for a latency figure to be wrong: the endpoint looked fast rather than broken, and every percentile built on it was quietly understated.
+
+  The filter now checks `isAsyncStarted()` and, when it is, defers to the container's `AsyncListener.onComplete` — the only thing that knows when an async exchange is really over. `onTimeout` and `onError` emit too, since a timed-out async request is the interesting kind, and `onStartAsync` re-registers because listeners do not survive a re-dispatch. Emission is once-only: a record counted twice is worse than one counted late, because it doubles every count and drags the percentiles toward the duplicate.
+
+  The thread-local span is still cleared on the request thread regardless — it is pooled, and leaving a span on it would attribute the next request that thread serves to the wrong trace.
+
+  Found by pointing the question "how is this different from a Spring filter?" at a running app instead of at the source. `examples/springboot-shop` keeps `/api/v1/sync` and `/api/v1/async` as a live check: they do identical work on different threads, so their recorded durations should agree.
+
+  Java SDK `0.10.0` → `0.10.1`.
+
 ## [0.15.1] — 2026-08-20
 
 ### Fixed
@@ -387,7 +403,8 @@ Measured with `make bench` (12th Gen Intel i5-1235U, Go 1.25):
 - Control-plane authentication is available but **off by default**.
 - Homebrew publishing is configured but disabled until a `homebrew-tap` repository exists.
 
-[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.15.1...HEAD
+[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.15.2...HEAD
+[0.15.2]: https://github.com/dwarka-prasad/optictrace/compare/v0.15.1...v0.15.2
 [0.15.1]: https://github.com/dwarka-prasad/optictrace/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.13.0...v0.14.0

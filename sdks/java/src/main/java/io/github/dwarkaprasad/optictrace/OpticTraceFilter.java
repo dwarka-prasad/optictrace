@@ -1,6 +1,8 @@
 package io.github.dwarkaprasad.optictrace;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import jakarta.servlet.AsyncEvent;
+import jakarta.servlet.AsyncListener;
 import jakarta.servlet.Filter;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
@@ -21,6 +23,7 @@ import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * OpticTrace servlet filter — governance, correlation and telemetry for any
@@ -109,14 +112,20 @@ public final class OpticTraceFilter implements Filter {
                 (buffer && policy.captureResponseBody) || policy.hasMeters(), policy.captureLimit);
 
         long start = System.nanoTime();
-        int status = 200;
-        try {
-            chain.doFilter(wrappedReq, wrappedRes);
-            status = wrappedRes.getStatus();
-        } finally {
-            wrappedRes.flushCapture();
+        // Emitted exactly once, from whichever path finishes the exchange. A
+        // request that is recorded twice is worse than one recorded late: it
+        // doubles every count and drags the percentiles toward the duplicate.
+        AtomicBoolean emitted = new AtomicBoolean();
+        Runnable emit = () -> {
+            if (!emitted.compareAndSet(false, true)) return;
+            try {
+                wrappedRes.flushCapture();
+            } catch (IOException ignored) {
+                // The response is already gone; losing the captured copy is
+                // not a reason to fail the exchange that succeeded.
+            }
             double durationMs = (System.nanoTime() - start) / 1_000_000.0;
-            TraceContext.clear();
+            int status = wrappedRes.getStatus();
 
             // The record is ALWAYS emitted: metrics and metadata are never
             // sampled, and a request that produced no record at all is
@@ -130,6 +139,54 @@ public final class OpticTraceFilter implements Filter {
                 System.out.println(writeJson(record));
             }
             if (shipper != null) shipper.enqueue(record);
+        };
+
+        try {
+            chain.doFilter(wrappedReq, wrappedRes);
+        } finally {
+            // The thread-local is cleared on THIS thread regardless: it is
+            // pooled, and leaving a span on it attributes the next request
+            // served by this thread to the wrong trace.
+            TraceContext.clear();
+
+            if (request.isAsyncStarted()) {
+                // A Spring MVC async handler — Callable, DeferredResult,
+                // CompletableFuture — returns from the chain when the request
+                // is PARKED, not when it is finished. Emitting here recorded
+                // 5ms for a 125ms request and lost the response body entirely,
+                // because the body had not been written yet.
+                //
+                // So hand off to the container: onComplete fires once the
+                // response really is done, on whichever thread finished it.
+                request.getAsyncContext().addListener(new AsyncListener() {
+                    @Override
+                    public void onComplete(AsyncEvent event) {
+                        emit.run();
+                    }
+
+                    @Override
+                    public void onTimeout(AsyncEvent event) {
+                        // A timed-out async request still happened, and it is
+                        // the interesting kind. onComplete follows, and the
+                        // once-only guard makes the pair safe.
+                        emit.run();
+                    }
+
+                    @Override
+                    public void onError(AsyncEvent event) {
+                        emit.run();
+                    }
+
+                    @Override
+                    public void onStartAsync(AsyncEvent event) throws IOException {
+                        // Listeners do not carry across a re-dispatch, so
+                        // re-register or the second cycle records nothing.
+                        event.getAsyncContext().addListener(this);
+                    }
+                });
+            } else {
+                emit.run();
+            }
         }
     }
 
