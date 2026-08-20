@@ -605,6 +605,29 @@ func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// And the inner spans. A statement is free text a driver assembled, and
+	// the parameter it interpolated is the customer's — so it is exactly the
+	// surface a value-based scan exists for.
+	if s.SpanStore != nil {
+		offset := 0
+		for {
+			spans, total, err := s.SpanStore.QuerySpans(r.Context(), store.SpanFilter{
+				Since: since, Limit: 500, Offset: offset,
+			})
+			if err != nil {
+				httpError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			for i := range spans {
+				sc.AddSpan(&spans[i])
+			}
+			offset += len(spans)
+			if len(spans) == 0 || int64(offset) >= total || offset >= s.analysisRows() {
+				break
+			}
+		}
+	}
+
 	report := sc.Report()
 	ext.NoteAccess(r.Context(), ext.Accessed{Count: report.Scanned, Filter: auditableQuery(r)})
 	crit, high, med := report.Counts()
@@ -616,6 +639,7 @@ func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 		// Reported so "0 findings" can be read honestly: none over zero log
 		// lines means something very different from none over forty thousand.
 		"log_lines_scanned": report.LinesScanned,
+		"spans_scanned":     report.SpansScanned,
 		"since":             report.Since,
 		"critical":          crit,
 		"high":              high,

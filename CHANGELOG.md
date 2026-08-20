@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 `0.7.0` is the first public release and contains all of that work.
 
+## [0.15.1] — 2026-08-20
+
+### Fixed
+
+- **`optictrace scan` did not look at span attributes.** Inner spans shipped in `0.15.0` added a surface the leak detector could not see: a Luhn-valid card number sitting in a stored `db.statement` produced `✓ no sensitive values found` and exit code 0. Since `scan -fail-on high` is the CI gate, a team would have got a green build over stored card data — on the one surface nobody had written a rule for yet, which is precisely what a value-based scan exists for.
+
+  Found by testing the released binary against the Spring Boot example rather than by reading the code: the statement was planted with no `telemetry.spans.redact` pattern configured, standing in for an operator who has not yet realised their driver interpolates parameters.
+
+  Both the CLI and `GET /api/scan` now scan span attributes and the error text, and report `spans_scanned` alongside records and log lines — "0 findings" over zero spans means something very different from 0 over three hundred. The suggested fix points at `telemetry.spans.redact`, not at `json_fields`, because a span attribute has no JSON path and suggesting one would be advice that silently does nothing.
+
 ## [0.15.0] — 2026-08-20
 
 ### Added
@@ -377,7 +387,8 @@ Measured with `make bench` (12th Gen Intel i5-1235U, Go 1.25):
 - Control-plane authentication is available but **off by default**.
 - Homebrew publishing is configured but disabled until a `homebrew-tap` repository exists.
 
-[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.15.1...HEAD
+[0.15.1]: https://github.com/dwarka-prasad/optictrace/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.12.0...v0.13.0

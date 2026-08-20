@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dwarka-prasad/optictrace/ext"
 	"github.com/dwarka-prasad/optictrace/internal/store"
 )
 
@@ -148,5 +149,74 @@ func TestCleanTrafficProducesNoFindings(t *testing.T) {
 	}
 	if rep.HasAtLeast(SevMedium) {
 		t.Error("gate should not trip on clean traffic")
+	}
+}
+
+// A statement is free text a driver assembled, and the parameter it
+// interpolated is the customer's. The leak detector reported CLEAN on exactly
+// that surface until it looked there — and since `scan -fail-on high` is the CI
+// gate, a team got a green build over a stored card number.
+func TestScannerFindsSecretsInSpanAttributes(t *testing.T) {
+	sc := NewScanner(time.Now().Add(-time.Hour))
+	sc.AddSpan(&ext.Span{
+		Start: time.Now(), Service: "shop", Name: "db.query", Kind: "db",
+		Attrs: map[string]string{
+			"db.statement": "SELECT * FROM cards WHERE number = '4111111111111111'",
+			"db.rows":      "1",
+		},
+	})
+	sc.AddSpan(&ext.Span{
+		Start: time.Now(), Service: "shop", Name: "db.insert", Kind: "db",
+		// A driver error quotes the statement that failed, parameters included.
+		Error: "duplicate key for a@b.com",
+	})
+
+	rep := sc.Report()
+	if rep.SpansScanned != 2 {
+		t.Errorf("spans scanned = %d, want 2 — the count is what distinguishes "+
+			"'nothing found' from 'nothing looked at'", rep.SpansScanned)
+	}
+	if len(rep.Findings) == 0 {
+		t.Fatal("no findings: a Luhn-valid card number in db.statement must be caught")
+	}
+
+	var card, email *Finding
+	for i := range rep.Findings {
+		f := &rep.Findings[i]
+		if f.Location != "span_attr" {
+			t.Errorf("finding located in %q, want span_attr", f.Location)
+		}
+		switch f.Field {
+		case "db.statement":
+			card = f
+		case "error":
+			email = f
+		}
+	}
+	if card == nil {
+		t.Fatal("the card number in db.statement was not found")
+	}
+	if card.Severity != SevHigh && card.Severity != SevCritical {
+		t.Errorf("card severity = %q, want high or above", card.Severity)
+	}
+	if !strings.Contains(card.Sample, "••") {
+		t.Errorf("the sample must be masked, got %q", card.Sample)
+	}
+	if strings.Contains(card.Sample, "4111111111111111") {
+		t.Errorf("a finding must never quote the value it found: %q", card.Sample)
+	}
+	// The fix has to be one that can actually work. Suggesting json_fields for
+	// a span attribute is advice that silently does nothing.
+	if !strings.Contains(card.Suggest, "spans:") || !strings.Contains(card.Suggest, "redact") {
+		t.Errorf("suggestion does not point at telemetry.spans.redact: %q", card.Suggest)
+	}
+	if strings.Contains(card.Suggest, "json_fields") {
+		t.Errorf("a span attribute has no JSON path; suggestion was %q", card.Suggest)
+	}
+	if card.Route != "span:db.query" {
+		t.Errorf("route = %q, want the operation name so the fix is locatable", card.Route)
+	}
+	if email == nil {
+		t.Error("an email quoted in a driver error was not found")
 	}
 }
