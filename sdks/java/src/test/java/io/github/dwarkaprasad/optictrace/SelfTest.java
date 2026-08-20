@@ -1,6 +1,9 @@
 package io.github.dwarkaprasad.optictrace;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import jakarta.servlet.AsyncContext;
+import jakarta.servlet.AsyncEvent;
+import jakarta.servlet.AsyncListener;
 import jakarta.servlet.ReadListener;
 import jakarta.servlet.ServletInputStream;
 import jakarta.servlet.ServletOutputStream;
@@ -38,6 +41,7 @@ public final class SelfTest {
         engineChecks();
         traceChecks();
         filterChecks();
+        asyncChecks();
         logChecks();
 
         System.out.println();
@@ -184,6 +188,139 @@ public final class SelfTest {
                 TraceContext.outboundHeaders().get("traceparent").contains(adopted.spanId));
         TraceContext.clear();
         check("no span outside a request", TraceContext.outboundHeaders().isEmpty());
+    }
+
+    // ------------------------------------------------------------------
+    /**
+     * A Spring MVC async handler — Callable, DeferredResult, CompletableFuture
+     * — returns from the filter chain when the request is PARKED, not when it
+     * is finished. Emitting the record there measured 5ms for a 125ms request
+     * and lost the response body entirely, because the body had not been
+     * written yet. It looked like a fast endpoint rather than a broken one,
+     * which is the worst way for a latency figure to be wrong.
+     *
+     * The container is the only thing that knows when an async exchange is
+     * really over, so the record now comes from its onComplete callback.
+     */
+    @SuppressWarnings("unchecked")
+    private static void asyncChecks() throws Exception {
+        Map<String, Object> cfg = (Map<String, Object>) new Yaml().load(CONFIG);
+        OpticTraceFilter filter = new OpticTraceFilter(cfg, null, "java-test", false);
+
+        byte[] responseBody = "{\"where\":\"async thread\"}".getBytes();
+        Async out = invokeAsync(filter, "POST", "/payments/charge",
+                Map.of("content-type", "application/json", "x-tenant-id", "acme"),
+                "{\"amount\":1}".getBytes(), responseBody, 200, 40);
+
+        check("nothing is recorded while the request is still parked", out.beforeComplete == 0);
+        check("exactly one record once the container says the exchange is done",
+                out.records.size() == 1);
+        if (out.records.size() == 1) {
+            Map<String, Object> rec = out.records.get(0);
+            double dur = ((Number) rec.get("duration_ms")).doubleValue();
+            check("the duration covers the async work, not just the parking (" + dur + "ms)",
+                    dur >= 35);
+            check("the response body written on the async thread is captured",
+                    String.valueOf(rec.get("response_body")).contains("async thread"));
+            check("status read after completion", Integer.valueOf(200).equals(rec.get("status")));
+        }
+        check("a second onComplete cannot double count", out.afterSecondComplete == 1);
+    }
+
+    private record Async(java.util.List<Map<String, Object>> records, int beforeComplete,
+                         int afterSecondComplete) {
+    }
+
+    /**
+     * Drives the filter through an async lifecycle: the chain starts async and
+     * returns, the response is written afterwards, then the container fires
+     * onComplete — the same order Tomcat uses.
+     */
+    @SuppressWarnings("unchecked")
+    private static Async invokeAsync(OpticTraceFilter filter, String method, String path,
+                                     Map<String, String> headers, byte[] requestBody,
+                                     byte[] responseBody, int status, long workMillis) throws Exception {
+        ByteArrayOutputStream clientSink = new ByteArrayOutputStream();
+        Map<String, String> responseHeaders = new LinkedHashMap<>();
+        responseHeaders.put("content-type", "application/json");
+        int[] statusHolder = {status};
+        boolean[] traceHeaderBeforeBody = {false};
+        boolean[] asyncStarted = {false};
+        java.util.List<AsyncListener> listeners = new ArrayList<>();
+
+        HttpServletResponse response = (HttpServletResponse) Proxy.newProxyInstance(
+                SelfTest.class.getClassLoader(), new Class<?>[]{HttpServletResponse.class},
+                responseHandler(clientSink, responseHeaders, statusHolder, traceHeaderBeforeBody));
+
+        InvocationHandler base = requestHandler(method, path, null, headers, requestBody);
+        HttpServletRequest[] requestHolder = new HttpServletRequest[1];
+        // One AsyncContext for the whole lifecycle: AsyncEvent's constructor
+        // dereferences it, so it cannot be null, and re-registration in
+        // onStartAsync has to land back on the same list.
+        AsyncContext asyncCtx = (AsyncContext) Proxy.newProxyInstance(
+                SelfTest.class.getClassLoader(), new Class<?>[]{AsyncContext.class},
+                (p2, m2, a2) -> switch (m2.getName()) {
+                    case "addListener" -> {
+                        listeners.add((AsyncListener) a2[0]);
+                        yield null;
+                    }
+                    case "getRequest" -> requestHolder[0];
+                    default -> defaultValue(m2);
+                });
+        HttpServletRequest request = (HttpServletRequest) Proxy.newProxyInstance(
+                SelfTest.class.getClassLoader(), new Class<?>[]{HttpServletRequest.class},
+                (proxy, m, args) -> switch (m.getName()) {
+                    case "isAsyncStarted" -> asyncStarted[0];
+                    case "getAsyncContext" -> asyncCtx;
+                    default -> base.invoke(proxy, m, args);
+                });
+        requestHolder[0] = request;
+
+        java.io.PrintStream original = System.out;
+        ByteArrayOutputStream sink = new ByteArrayOutputStream();
+        System.setOut(new java.io.PrintStream(sink));
+        ServletOutputStream[] captured = new ServletOutputStream[1];
+        try {
+            filter.doFilter(request, response, (req, res) -> {
+                req.getInputStream().readAllBytes();
+                // The handler parks the request and returns without writing.
+                asyncStarted[0] = true;
+                captured[0] = res.getOutputStream();
+            });
+
+            int before = countRecords(sink);
+
+            // The async thread does the work and writes the response.
+            Thread.sleep(workMillis);
+            captured[0].write(responseBody);
+
+            // Only now does the container consider the exchange complete.
+            for (AsyncListener l : new ArrayList<>(listeners)) {
+                l.onComplete(new AsyncEvent(asyncCtx));
+            }
+            int after = countRecords(sink);
+            // A container that fires onComplete twice must not double count.
+            for (AsyncListener l : new ArrayList<>(listeners)) {
+                l.onComplete(new AsyncEvent(asyncCtx));
+            }
+            int afterSecond = countRecords(sink);
+
+            java.util.List<Map<String, Object>> records = new ArrayList<>();
+            for (String line : sink.toString().split("\n")) {
+                if (line.startsWith("{")) records.add(Policy.mapper().readValue(line, Map.class));
+            }
+            return new Async(records, before, afterSecond == after ? afterSecond : -1);
+        } finally {
+            System.setOut(original);
+        }
+    }
+
+    private static int countRecords(ByteArrayOutputStream sink) {
+        int n = 0;
+        for (String line : sink.toString().split("\n")) {
+            if (line.startsWith("{")) n++;
+        }
+        return n;
     }
 
     // ------------------------------------------------------------------

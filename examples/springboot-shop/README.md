@@ -52,6 +52,7 @@ Dashboard: <http://127.0.0.1:9095>
 | **Trace id to the caller** | Responses carry `X-Trace-Id`, so a support conversation can start from a screenshot instead of a timestamp. |
 | **Inner spans** | `ProductRepository` names every operation: an H2 query, a cache lookup, an index refresh nested inside an insert, and the acquirer call in `PaymentsController`. The waterfall shows all of them under the hop that ran them. |
 | **Governed attributes** | `saveOrder` deliberately records an *interpolated* statement, the way a driver logging its own SQL would. The customer's email is stored `[REDACTED]` — which is why span attributes are governed at all. |
+| **Async handlers** | `/api/v1/sync` and `/api/v1/async` do identical work on different threads. Their recorded durations agree — the filter defers to the container's `onComplete` rather than recording when an async request is merely parked. |
 | **An N+1, on purpose** | `stockFor` runs one query per sku. On the breakdown it shows as one named operation with a ×4 per-request multiplier — the shape no latency chart can show you. |
 
 ## Wiring

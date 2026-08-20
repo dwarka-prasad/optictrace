@@ -10,7 +10,7 @@ Prometheus dimensions.
 
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/status-v0.15.1-brightgreen)](#roadmap)
+[![Status](https://img.shields.io/badge/status-v0.15.2-brightgreen)](#roadmap)
 
 **[optictrace product page →](https://dwarka-prasad.github.io/optictrace/)**
 
