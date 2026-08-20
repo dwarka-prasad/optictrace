@@ -50,6 +50,9 @@ Dashboard: <http://127.0.0.1:9095>
 | **Attribution** | `X-Tenant-ID` / `X-Region` / `X-Plan` become labels, forwarded across the internal hops so the usage page bills the whole trace, not just its first leg. |
 | **Sampling** | Catalog reads are sampled at 0.4, with `keep_slower_than: 200ms`. The record is always written; only the body is sampled. |
 | **Trace id to the caller** | Responses carry `X-Trace-Id`, so a support conversation can start from a screenshot instead of a timestamp. |
+| **Inner spans** | `ProductRepository` names every operation: an H2 query, a cache lookup, an index refresh nested inside an insert, and the acquirer call in `PaymentsController`. The waterfall shows all of them under the hop that ran them. |
+| **Governed attributes** | `saveOrder` deliberately records an *interpolated* statement, the way a driver logging its own SQL would. The customer's email is stored `[REDACTED]` — which is why span attributes are governed at all. |
+| **An N+1, on purpose** | `stockFor` runs one query per sku. On the breakdown it shows as one named operation with a ×4 per-request multiplier — the shape no latency chart can show you. |
 
 ## Wiring
 
@@ -67,6 +70,11 @@ redaction was working when in fact nothing had been sent.
 ```bash
 ../../bin/optictrace scan    -config optic.yaml -window 1h   # inspects values
 ../../bin/optictrace suggest -config optic.yaml -window 1h   # inspects names
+```
+
+```bash
+../../bin/optictrace scan -config optic.yaml -window 1h              # values
+curl -s localhost:9095/api/spans/breakdown?window=1h | jq            # where the time went
 ```
 
 `scan` reports clean. `suggest` still proposes masking `$.customer.name` and

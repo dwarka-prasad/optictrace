@@ -102,6 +102,9 @@ type Collector struct {
 	ingested       prometheus.Counter
 	appLogsStored  prometheus.Counter
 	appLogsDropped *prometheus.CounterVec
+	spansStored    prometheus.Counter
+	spansDropped   *prometheus.CounterVec
+	spanDuration   *prometheus.HistogramVec
 
 	exported     *prometheus.CounterVec
 	exportFailed *prometheus.CounterVec
@@ -208,6 +211,30 @@ func New(service string, buckets []float64, customKeys []string, maxLabelValues 
 			Help:        "Application log lines discarded, by reason (orphan, level, span_cap, disabled, empty).",
 			ConstLabels: constLabels,
 		}, []string{"reason"}),
+		spansStored: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "optictrace_spans_stored_total", Help: "Inner spans stored against a request.",
+			ConstLabels: constLabels,
+		}),
+		spansDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "optictrace_spans_dropped_total",
+			Help:        "Inner spans discarded, by reason (orphan, too_fast, request_cap, disabled, empty).",
+			ConstLabels: constLabels,
+		}, []string{"reason"}),
+		// Kept by NAME and KIND, not by route: the question this answers is
+		// "how slow is this query", and the name is what stays stable while
+		// routes come and go. Cardinality is bounded by the same convention
+		// that keeps span names low-cardinality in the first place.
+		//
+		// No ConstLabels here, deliberately, and `service` is a VARIABLE label
+		// for the same reason the request metrics make it one: spans arrive
+		// from every SDK reporting into a shared agent, and a const label
+		// would attribute all of them to the collector's own service name.
+		// Passing both would also be a duplicate-label panic at registration.
+		spanDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "optictrace_span_duration_seconds",
+			Help:    "Duration of inner spans by operation name and kind.",
+			Buckets: []float64{0.001, 0.005, 0.025, 0.1, 0.5, 2.5},
+		}, []string{"name", "kind", "service"}),
 		exported: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "optictrace_exported_total", Help: "Records delivered by output exporters.",
 			ConstLabels: constLabels,
@@ -237,6 +264,7 @@ func New(service string, buckets []float64, customKeys []string, maxLabelValues 
 		c.streams, c.streamDuration, c.streamsOpen,
 		c.inflight, c.dropped, c.ingested,
 		c.appLogsStored, c.appLogsDropped,
+		c.spansStored, c.spansDropped, c.spanDuration,
 		c.exported, c.exportFailed, c.exportDrops,
 		c.labelCapped, c.labelDistinct,
 		collectors.NewGoCollector(),
@@ -391,6 +419,31 @@ func (c *Collector) AppLogDropped(reason string, n int) {
 	if n > 0 {
 		c.appLogsDropped.WithLabelValues(reason).Add(float64(n))
 	}
+}
+
+// SpansStored counts inner spans persisted against a request.
+func (c *Collector) SpansStored(n int) {
+	if n > 0 {
+		c.spansStored.Add(float64(n))
+	}
+}
+
+// SpansDropped counts discarded spans under the reason they were discarded.
+// request_cap being the reason is itself a finding — it means one request
+// produced more operations than the policy allows, which is usually an N+1.
+func (c *Collector) SpansDropped(reason string, n int) {
+	if n > 0 {
+		c.spansDropped.WithLabelValues(reason).Add(float64(n))
+	}
+}
+
+// SpanObserved records one operation's duration, so "which query is slow" can
+// be alerted on rather than only browsed.
+func (c *Collector) SpanObserved(name, kind, service string, seconds float64) {
+	if kind == "" {
+		kind = "unspecified"
+	}
+	c.spanDuration.WithLabelValues(name, kind, service).Observe(seconds)
 }
 
 // Exporter accounting — satisfies export.Metrics.

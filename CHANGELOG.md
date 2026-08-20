@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions `0.4.0`–`0.6.0` were development milestones that were never tagged;
 `0.7.0` is the first public release and contains all of that work.
 
+## [0.15.0] — 2026-08-20
+
+### Added
+
+- **Inner spans — the operations inside a request.** A hop told you a request took 300ms. It did not tell you that 280 of them were one query. Name an operation — a database call, a cache lookup, a call out, a stretch of computation — and it appears on the trace waterfall nested under the hop that ran it, with its own attributes and its own timing.
+
+  Two things make this different from any other tracing library:
+
+  **The attributes are governed.** A statement quotes its parameters, a cache key embeds an account id, an outbound URL carries a token in its query string. Span attributes run through redaction, byte caps and a duration floor *before* they are stored — the same treatment as an app log line, for the same reason: "clean it up later" is after the data is at rest. A driver that interpolates its SQL puts the customer's email in the one field a breakdown most wants to show, and it arrives `[REDACTED]`. Redaction runs *before* truncation, deliberately: the other order cuts a secret in half and stores the front of it, and a pattern anchored to the whole token stops matching what remains.
+
+  **The per-request multiplier is a first-class figure.** `GET /api/spans/breakdown` reports `count` and `requests` separately, so `count/requests` is visible. Four thousand calls to one query looks like busy traffic until you know it was a hundred requests — which is what an N+1 is, and what no latency chart can show.
+
+  A failed operation is kept however fast it was: "it returned in 200µs" and "it returned in 200µs with an error" are not the same event. Work outside a request is dropped by default and counted, because attaching it to whichever request happened to be in flight would cross-attribute tenants. `optictrace purge` deletes a tenant's spans with their records in one transaction — erasing the request while keeping the query it ran is not erasure.
+
+  Configured under `telemetry.spans`; ingested at `POST /api/spans/ingest`; readable at `GET /api/spans`, `/api/spans/breakdown` and `/api/spans/stats`. New metrics: `optictrace_spans_stored_total`, `optictrace_spans_dropped_total{reason}` and `optictrace_span_duration_seconds{name,kind,service}`, so "which query is slow" can be alerted on rather than only browsed.
+
+- **All four SDKs record them.** Go (`spans.Start` / `spans.Observe`), Java (`try (InnerSpan sp = spans.start(...))`), Python (`with spans.start(...)`) and Express (`spans.observe(...)`). Operations nest, so a query inside a transaction parents to the transaction rather than jumping to the request. Go additionally has `spans.Transport(nil)`, which wraps an `http.RoundTripper` so an outbound call is timed **and** propagated — a call that is timed but not propagated is a gap someone has to guess about, and one that is propagated but not timed leaves the caller's own view of it missing.
+
+  An empty agent URL makes every span inert, so instrumentation can stay in place where there is no agent instead of being guarded by an `if` at each call site.
+
+- **Self time on the trace waterfall.** What a hop spent that none of its children — inner spans *or* downstream hops — accounts for. Shown only where there is recorded detail, because "100% self" on an uninstrumented hop is an absence of instrumentation rather than a finding.
+
+- **`ext.SpanStore`**, an optional companion to `ext.Store` alongside `AppLogStore` and `TraceStore`, found by type assertion for the same reason: `Store` is implemented outside this module and cannot grow methods. Implemented for sqlite, postgres and clickhouse, all three exercised by the shared conformance suite against real servers — including that erasure takes the spans with it.
+
+### Fixed
+
+- **The embedded `Agent.AdminHandler` never wired application logs.** An embedded agent answered 501 to `/api/applogs` while the identical config worked under `optictrace run`. Both app logs and spans are now resolved there by type assertion, so there is no second wiring site to forget.
+
+### Changed
+
+- `internal/telcap` now holds the per-request cap and the UTF-8 truncation that app logs and spans both need, rather than a second copy in each. Two copies of one mechanism drift, and the copy nobody exercises drifts first.
+- The README no longer says OpticTrace has no spans for a database call — that was the documented boundary until this release.
+- `examples/springboot-shop` gained a real H2 database, an instrumented repository, a nested index refresh, an interpolated statement whose email is stored redacted, and a deliberate N+1 — left in because it is what the breakdown exists to find.
+
 ## [0.14.0] — 2026-08-20
 
 ### Added
@@ -343,7 +377,8 @@ Measured with `make bench` (12th Gen Intel i5-1235U, Go 1.25):
 - Control-plane authentication is available but **off by default**.
 - Homebrew publishing is configured but disabled until a `homebrew-tap` repository exists.
 
-[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/dwarka-prasad/optictrace/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/dwarka-prasad/optictrace/compare/v0.11.0...v0.12.0

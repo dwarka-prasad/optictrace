@@ -94,6 +94,16 @@ public final class TraceContext {
         return ctx == null ? Map.of() : Map.of(HEADER, ctx.header());
     }
 
+    /**
+     * A random id of the given HEX LENGTH — 16 for a span, 32 for a trace.
+     *
+     * <p>Exposed because inner spans need ids of the same shape, and a second
+     * generator would be a second place for the length convention to drift.
+     */
+    static String randomHex(int hexChars) {
+        return hex(hexChars / 2);
+    }
+
     private static String hex(int bytes) {
         byte[] b = new byte[bytes];
         RNG.nextBytes(b);

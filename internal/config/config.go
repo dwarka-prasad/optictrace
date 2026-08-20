@@ -267,8 +267,12 @@ type Telemetry struct {
 	// AppLogs governs application log lines correlated to spans. Nil means
 	// the feature is off and the ingest endpoint refuses politely.
 	AppLogs *AppLogsCfg `yaml:"app_logs"`
-	Auth    *AdminAuth  `yaml:"auth"`
-	TLS     *AdminTLS   `yaml:"tls"`
+	// Spans governs inner spans — the database queries, cache lookups and
+	// outbound calls that happened while a request was being served. Nil
+	// means the feature is off and the ingest endpoint refuses politely.
+	Spans *SpansCfg  `yaml:"spans"`
+	Auth  *AdminAuth `yaml:"auth"`
+	TLS   *AdminTLS  `yaml:"tls"`
 }
 
 // AdminReachable reports whether AdminListen accepts connections from beyond
@@ -555,6 +559,87 @@ type AppLogSource struct {
 }
 
 // AppLogRedact is the log-line equivalent of a rule's redact block.
+// SpansCfg governs inner spans on the way into the store.
+//
+// The attributes are the risk, not the timings: a statement quotes its
+// parameters, a cache key embeds an account id, an outbound URL carries a
+// token in its query string. So the same treatment as app logs — scrubbed and
+// capped BEFORE persistence, because "clean it up later" is after the data is
+// already at rest.
+type SpansCfg struct {
+	Enabled bool `yaml:"enabled"`
+	// MinDuration drops operations faster than this. A 20µs cache hit
+	// repeated a thousand times is volume without information, and the point
+	// of a breakdown is almost always the slow thing. 0 keeps everything.
+	MinDuration time.Duration `yaml:"min_duration"`
+	// MaxPerRequest caps one request's contribution. An N+1 query inside a
+	// loop can otherwise write thousands of spans against a single request —
+	// and it is worth noting that the cap being HIT is itself the finding, so
+	// it is counted rather than silent. 0 uses the default; -1 means no cap.
+	MaxPerRequest int `yaml:"max_per_request"`
+	// MaxAttrBytes truncates an individual attribute value and the error
+	// text. Statements and stack traces are long, and their beginnings are
+	// the parts that identify them.
+	MaxAttrBytes int `yaml:"max_attr_bytes"`
+	// DropOrphans discards spans carrying no parent span id — work done
+	// outside any request, such as a scheduled job. Default true: they cannot
+	// be attributed to a request, and attaching them to whichever request
+	// happened to be in flight would cross-attribute tenants.
+	//
+	// Whatever this is set to, drops are counted in
+	// optictrace_spans_dropped_total.
+	DropOrphans *bool `yaml:"drop_orphans"`
+	// RetentionMaxAge expires spans independently of records. Spans run well
+	// above request volume and are rarely wanted for as long.
+	RetentionMaxAge time.Duration `yaml:"retention_max_age"`
+	// Redact scrubs spans before they are stored. Patterns are regexes
+	// applied to every attribute value and to the error text; Fields are
+	// attribute keys whose values are replaced wholesale.
+	Redact SpanRedact `yaml:"redact"`
+}
+
+// DropOrphanSpans reports whether spans with no parent should be discarded.
+// Defaults to true when unset: a span that belongs to no request cannot be
+// attributed, and attaching it to whichever request happened to be in flight
+// would cross-attribute tenants.
+func (sp *SpansCfg) DropOrphanSpans() bool {
+	if sp == nil || sp.DropOrphans == nil {
+		return true
+	}
+	return *sp.DropOrphans
+}
+
+// SpanRedact mirrors AppLogRedact deliberately: one shape for "scrub this free
+// text", so nobody has to learn two.
+type SpanRedact struct {
+	// Patterns are regexes. A pattern that fails to compile is a config
+	// error, not a silently-skipped rule.
+	Patterns []string `yaml:"patterns"`
+	// Fields are attribute keys whose values are replaced wholesale.
+	Fields []string `yaml:"fields"`
+}
+
+// validate checks the spans block at load time, for the same reason the
+// app-log block is checked: an agent that runs happily while the rule meant to
+// mask a statement never compiles is worse than one that refuses to start.
+func (sp *SpansCfg) validate() error {
+	if sp == nil {
+		return nil
+	}
+	for _, p := range sp.Redact.Patterns {
+		if _, err := regexp.Compile(p); err != nil {
+			return fmt.Errorf("telemetry.spans.redact.patterns: %q: %w", p, err)
+		}
+	}
+	if sp.MaxAttrBytes < 0 {
+		return fmt.Errorf("telemetry.spans.max_attr_bytes must not be negative")
+	}
+	if sp.MinDuration < 0 {
+		return fmt.Errorf("telemetry.spans.min_duration must not be negative")
+	}
+	return nil
+}
+
 type AppLogRedact struct {
 	// Patterns are regexes. A pattern that fails to compile is a config
 	// error, not a silently-skipped rule.
@@ -1035,6 +1120,9 @@ func (c *Config) Validate() error {
 		}
 	}
 	if err := validateHostPort("telemetry.admin_listen", c.Telemetry.AdminListen); err != nil {
+		return err
+	}
+	if err := c.Telemetry.Spans.validate(); err != nil {
 		return err
 	}
 	if err := c.Telemetry.AppLogs.validate(); err != nil {

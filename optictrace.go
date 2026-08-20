@@ -22,12 +22,14 @@ import (
 
 	"github.com/dwarka-prasad/optictrace/ext"
 	"github.com/dwarka-prasad/optictrace/internal/admin"
+	"github.com/dwarka-prasad/optictrace/internal/applog"
 	"github.com/dwarka-prasad/optictrace/internal/config"
 	"github.com/dwarka-prasad/optictrace/internal/engine"
 	"github.com/dwarka-prasad/optictrace/internal/export"
 	"github.com/dwarka-prasad/optictrace/internal/metrics"
 	"github.com/dwarka-prasad/optictrace/internal/proxy"
 	"github.com/dwarka-prasad/optictrace/internal/scan"
+	"github.com/dwarka-prasad/optictrace/internal/spans"
 	"github.com/dwarka-prasad/optictrace/internal/store"
 )
 
@@ -180,7 +182,39 @@ func scanDetectors(cfg *config.Config, logger *slog.Logger) []scan.Detector {
 // AdminHandler exposes /metrics, the dashboard, and query APIs for mounting
 // on a listener you control.
 func (a *Agent) AdminHandler(uiDir string) http.Handler {
+	// App logs and inner spans are resolved here rather than being fields on
+	// Agent, and by type assertion rather than a flag: a driver that cannot
+	// persist them is still a valid driver. This used to be omitted entirely,
+	// so an embedded agent silently answered 501 to both while the same config
+	// worked under `optictrace run` — exactly the kind of difference between
+	// two wiring sites that a type assertion removes.
+	appLogs, err := applog.New(a.cfg.Telemetry.AppLogs)
+	if err != nil {
+		a.logger.Error("invalid app-log policy", "error", err)
+	} else if err := appLogs.WithRules(a.cfg.Rules); err != nil {
+		a.logger.Error("invalid per-rule app-log policy", "error", err)
+	}
+	spanGov, err := spans.New(a.cfg.Telemetry.Spans)
+	if err != nil {
+		a.logger.Error("invalid span policy", "error", err)
+	}
+	var appLogStore store.AppLogStore
+	if appLogs != nil && appLogs.Enabled() {
+		if als, ok := a.reader.(store.AppLogStore); ok {
+			appLogStore = als
+		}
+	}
+	var spanStore store.SpanStore
+	if spanGov != nil && spanGov.Enabled() {
+		if ss, ok := a.reader.(store.SpanStore); ok {
+			spanStore = ss
+		}
+	}
 	return (&admin.Server{
+		AppLogs:         appLogs,
+		AppLogStore:     appLogStore,
+		Spans:           spanGov,
+		SpanStore:       spanStore,
 		Logger:          a.logger,
 		Collector:       a.collector,
 		Reader:          a.reader,

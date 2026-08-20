@@ -89,6 +89,27 @@ CREATE TABLE IF NOT EXISTS app_logs (
 -- fastest-growing table in the store.
 CREATE INDEX IF NOT EXISTS idx_app_logs_span  ON app_logs(span_id, ts);
 CREATE INDEX IF NOT EXISTS idx_app_logs_trace ON app_logs(trace_id, ts);
+
+-- Inner spans: the operations that ran while a request was served.
+CREATE TABLE IF NOT EXISTS spans (
+	id          BIGSERIAL PRIMARY KEY,
+	ts          BIGINT NOT NULL,   -- when the operation STARTED
+	service     TEXT NOT NULL DEFAULT '',
+	trace_id    TEXT NOT NULL DEFAULT '',
+	span_id     TEXT NOT NULL DEFAULT '',
+	parent_span TEXT NOT NULL DEFAULT '',
+	name        TEXT NOT NULL DEFAULT '',
+	kind        TEXT NOT NULL DEFAULT '',
+	duration_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+	error       TEXT NOT NULL DEFAULT '',
+	attrs       JSONB NOT NULL DEFAULT '{}'::jsonb,
+	route       TEXT NOT NULL DEFAULT '',
+	source      TEXT NOT NULL DEFAULT '',
+	truncated   BOOLEAN NOT NULL DEFAULT false
+);
+CREATE INDEX IF NOT EXISTS idx_spans_parent ON spans(parent_span, ts);
+CREATE INDEX IF NOT EXISTS idx_spans_trace  ON spans(trace_id, ts);
+CREATE INDEX IF NOT EXISTS idx_spans_name   ON spans(ts, name);
 CREATE INDEX IF NOT EXISTS idx_app_logs_ts    ON app_logs(ts);
 -- app_logs shipped in v0.9.0 without route, so an existing store needs it
 -- added. Postgres has IF NOT EXISTS for this, so no error matching is needed.
@@ -500,6 +521,14 @@ func (s *PostgresStore) Purge(ctx context.Context, label, value string, before t
 	logQuery += `)`
 	if _, err := tx.ExecContext(ctx, logQuery, args...); err != nil {
 		return 0, fmt.Errorf("purge app logs: %w", err)
+	}
+
+	// And the inner spans: a statement's attributes can hold the customer's
+	// email as surely as a log line can, so erasing the request while keeping
+	// the query it ran is not erasure.
+	spanQuery := strings.Replace(logQuery, "DELETE FROM app_logs", "DELETE FROM spans", 1)
+	if _, err := tx.ExecContext(ctx, spanQuery, args...); err != nil {
+		return 0, fmt.Errorf("purge spans: %w", err)
 	}
 
 	res, err := tx.ExecContext(ctx, query, args...)

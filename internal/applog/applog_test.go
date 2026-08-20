@@ -109,17 +109,26 @@ func TestSpanCapBoundsOneRequest(t *testing.T) {
 
 // The per-span counter is the obvious place to leak memory: one entry per
 // request, forever. Two generations bound it.
-func TestSpanCounterMemoryIsBounded(t *testing.T) {
-	g := newGov(t, &config.AppLogsCfg{Enabled: true, MaxLinesPerSpan: 5})
-	g.maxSpans = 64
-	for i := 0; i < 10_000; i++ {
-		g.Admit(&ext.AppLog{SpanID: fmt.Sprintf("span-%d", i), Message: "x"})
+// The counter's memory bound is now telcap's, and is asserted there against
+// the map sizes directly. What matters HERE is that the per-span cap still
+// holds after many other spans have been seen — i.e. that forgetting old spans
+// does not also forget the cap for a span still in flight.
+func TestSpanCapSurvivesOtherTraffic(t *testing.T) {
+	g := newGov(t, &config.AppLogsCfg{Enabled: true, MaxLinesPerSpan: 3})
+	admit := func(span string) bool {
+		ok, _ := g.Admit(&ext.AppLog{SpanID: span, Message: "x"})
+		return ok
 	}
-	g.mu.Lock()
-	total := len(g.cur) + len(g.prev)
-	g.mu.Unlock()
-	if total > 2*g.maxSpans {
-		t.Errorf("tracked %d spans, want <= %d", total, 2*g.maxSpans)
+	for i := 0; i < 3; i++ {
+		if !admit("hot") {
+			t.Fatalf("line %d of 3 rejected", i+1)
+		}
+	}
+	for i := 0; i < 1000; i++ {
+		admit(fmt.Sprintf("other-%d", i))
+	}
+	if admit("hot") {
+		t.Error("cap forgotten for a span still in flight after other traffic")
 	}
 }
 

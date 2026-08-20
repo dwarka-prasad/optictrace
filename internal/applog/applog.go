@@ -12,11 +12,11 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-	"sync"
 
 	"github.com/dwarka-prasad/optictrace/ext"
 	"github.com/dwarka-prasad/optictrace/internal/config"
 	"github.com/dwarka-prasad/optictrace/internal/engine"
+	"github.com/dwarka-prasad/optictrace/internal/telcap"
 )
 
 // Defaults chosen so that turning the feature on without tuning it cannot
@@ -52,16 +52,8 @@ type Governor struct {
 	patterns    []*regexp.Regexp
 	redactField map[string]bool
 
-	// Per-span line counts, memory-bounded by design. An unbounded map keyed
-	// by span id is a slow leak: every request that ever logged would be
-	// remembered forever. Two generations are kept and the older is dropped
-	// wholesale once the newer fills, so the count is exact for recent spans
-	// and forgotten for old ones — which is the right trade, since the cap
-	// exists to stop a burst, not to be an audited total.
-	mu       sync.Mutex
-	cur      map[string]int
-	prev     map[string]int
-	maxSpans int
+	// Per-span line counts, memory-bounded by design — see telcap.Counter.
+	counter *telcap.Counter
 
 	// routes are per-rule overrides, checked in config order so that later
 	// rules win the same way they do everywhere else in optic.yaml.
@@ -94,9 +86,7 @@ type effective struct {
 // special case.
 func New(cfg *config.AppLogsCfg) (*Governor, error) {
 	g := &Governor{
-		maxSpans:    defaultMaxTrackedSpans,
-		cur:         map[string]int{},
-		prev:        map[string]int{},
+		counter:     telcap.NewCounter(defaultMaxTrackedSpans),
 		redactField: map[string]bool{},
 	}
 	if cfg == nil || !cfg.Enabled {
@@ -265,7 +255,7 @@ func (g *Governor) Admit(l *ext.AppLog) (bool, Reason) {
 		return false, ReasonEmpty
 	}
 	if g.maxBytes > 0 && len(l.Message) > g.maxBytes {
-		l.Message = truncateUTF8(l.Message, g.maxBytes)
+		l.Message = telcap.TruncateUTF8(l.Message, g.maxBytes)
 		l.Truncated = true
 	}
 
@@ -297,37 +287,5 @@ func (g *Governor) scrub(l *ext.AppLog, eff effective) {
 // allow reports whether this span may store another line, and counts it.
 // maxLines is the resolved cap, which a per-rule block may have lowered.
 func (g *Governor) allow(span string, maxLines int) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	n, ok := g.cur[span]
-	if !ok {
-		if p, hit := g.prev[span]; hit {
-			n = p
-		}
-	}
-	if n >= maxLines {
-		return false
-	}
-	if len(g.cur) >= g.maxSpans && !ok {
-		g.prev, g.cur = g.cur, make(map[string]int, g.maxSpans)
-	}
-	g.cur[span] = n + 1
-	return true
+	return g.counter.Allow(span, maxLines)
 }
-
-// truncateUTF8 cuts to at most max bytes without splitting a rune, so a
-// truncated stack trace is still valid UTF-8 and still renders.
-func truncateUTF8(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	cut := max
-	for cut > 0 && !utf8Start(s[cut]) {
-		cut--
-	}
-	return s[:cut]
-}
-
-// utf8Start reports whether b begins a rune (i.e. is not a continuation byte).
-func utf8Start(b byte) bool { return b&0xC0 != 0x80 }

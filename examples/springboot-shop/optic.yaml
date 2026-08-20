@@ -39,6 +39,23 @@ telemetry:
         - '\b\d{13,19}\b'                 # card-shaped digit runs
         - '[\w.+-]+@[\w-]+\.[\w.]+'       # email addresses
       fields: [authorization, password, card_number, email]
+  # Inner spans: the queries, cache lookups and outbound calls made while a
+  # request is served. The ATTRIBUTES are the risk here, not the timings — a
+  # statement quotes its parameters, so it is redacted before storage exactly
+  # like a log line.
+  spans:
+    enabled: true
+    min_duration: 0s          # this demo wants the sub-millisecond cache hits visible
+    max_per_request: 200
+    max_attr_bytes: 4096
+    retention_max_age: 72h
+    drop_orphans: true
+    redact:
+      patterns:
+        - '\b\d{13,19}\b'                 # card-shaped digit runs
+        - '[\w.+-]+@[\w-]+\.[\w.]+'       # email addresses in a WHERE clause
+      fields: [cache.key]
+
   billing:
     consumer_label: tenant
     currency: USD

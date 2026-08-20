@@ -5,9 +5,11 @@ import Link from 'next/link';
 import { AlertTriangle, GitBranch, Layers, ScrollText, Search, X } from 'lucide-react';
 import {
   fetchAppLogs,
+  fetchInnerSpans,
   fetchTrace,
   fetchTraces,
   type AppLogLine,
+  type InnerSpan,
   type LogRecord,
   type TraceSummary,
 } from '@/lib/api';
@@ -209,6 +211,7 @@ export default function Traces() {
 function TracePanel({ trace, onClose }: { trace: TraceSummary; onClose: () => void }) {
   const [hops, setHops] = useState<LogRecord[] | null>(null);
   const [lines, setLines] = useState<AppLogLine[]>([]);
+  const [inner, setInner] = useState<InnerSpan[]>([]);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
@@ -216,11 +219,13 @@ function TracePanel({ trace, onClose }: { trace: TraceSummary; onClose: () => vo
     Promise.all([
       fetchTrace(trace.trace_id),
       fetchAppLogs({ trace: trace.trace_id, limit: 500 }).catch(() => ({ lines: [] as AppLogLine[] })),
+      fetchInnerSpans(trace.trace_id).catch(() => ({ spans: [] as InnerSpan[] })),
     ])
-      .then(([hs, ls]) => {
+      .then(([hs, ls, sp]) => {
         if (!live) return;
         setHops(hs);
         setLines(ls.lines);
+        setInner(sp.spans);
       })
       .catch((e) => live && setErr(e instanceof Error ? e.message : String(e)));
     return () => {
@@ -237,8 +242,15 @@ function TracePanel({ trace, onClose }: { trace: TraceSummary; onClose: () => vo
   // the root's own window: a hop that outlived its parent — a fire-and-forget
   // call, or two machines with skewed clocks — would otherwise run off the
   // right edge instead of being visible as the anomaly it is.
-  const t0 = hops?.length ? Math.min(...hops.map(startOf)) : 0;
-  const t1 = hops?.length ? Math.max(...hops.map((h) => new Date(h.time).getTime())) : 0;
+  // Inner spans are bounded by their hop in principle and not always in
+  // practice — a clock a millisecond out of step, or work that outlived the
+  // response — so they are included in the extent rather than assumed to fit.
+  const innerStarts = inner.map((s) => new Date(s.start).getTime());
+  const innerEnds = inner.map((s) => new Date(s.start).getTime() + s.duration_ms);
+  const t0 = hops?.length ? Math.min(...hops.map(startOf), ...innerStarts) : 0;
+  const t1 = hops?.length
+    ? Math.max(...hops.map((h) => new Date(h.time).getTime()), ...innerEnds)
+    : 0;
   const span = Math.max(1, t1 - t0);
 
   const bySpan = useMemo(() => new Map((hops ?? []).map((h) => [h.span_id ?? '', h])), [hops]);
@@ -261,6 +273,43 @@ function TracePanel({ trace, onClose }: { trace: TraceSummary; onClose: () => vo
     return m;
   }, [lines]);
 
+  // Inner spans indexed by their parent, and a depth for each so a query
+  // inside a transaction reads as nested rather than as a sibling of the
+  // request. An orphan whose parent is not in this trace is shown against the
+  // hop it names rather than hidden — silently dropping it would misrepresent
+  // the work.
+  const innerByParent = useMemo(() => {
+    const m = new Map<string, InnerSpan[]>();
+    inner.forEach((s) => m.set(s.parent_span_id, [...(m.get(s.parent_span_id) ?? []), s]));
+    m.forEach((v) => v.sort((a, b) => +new Date(a.start) - +new Date(b.start)));
+    return m;
+  }, [inner]);
+
+  /** What a hop spent on its own, after its direct children are subtracted.
+   *
+   *  Children are both the inner spans it recorded AND the downstream hops it
+   *  called — counting only one of them would attribute a fan-out's time to
+   *  the caller's own code, or the reverse. Returns null when a hop has no
+   *  recorded children, because "all of it was self" is not a finding, it is
+   *  an absence of instrumentation. */
+  const selfTime = (h: LogRecord): number | null => {
+    const ownSpans = innerByParent.get(h.span_id ?? '') ?? [];
+    const childHops = (hops ?? []).filter((x) => x.parent_span_id === h.span_id);
+    if (ownSpans.length === 0 && childHops.length === 0) return null;
+    const accounted =
+      ownSpans.reduce((n, s) => n + s.duration_ms, 0) +
+      childHops.reduce((n, x) => n + x.duration_ms, 0);
+    return Math.max(0, h.duration_ms - accounted);
+  };
+
+  /** Flattens the inner-span tree under one hop, depth-first, in start order. */
+  const innerTree = (parent: string, depth = 0, guard = new Set<string>()): { s: InnerSpan; depth: number }[] =>
+    (innerByParent.get(parent) ?? []).flatMap((s) => {
+      if (guard.has(s.span_id)) return []; // cycles cannot happen; a UI must not hang if they do
+      guard.add(s.span_id);
+      return [{ s, depth }, ...innerTree(s.span_id, depth + 1, guard)];
+    });
+
   return (
     <div className="fixed inset-0 z-20 flex justify-end bg-black/50" onClick={onClose}>
       <div
@@ -280,10 +329,15 @@ function TracePanel({ trace, onClose }: { trace: TraceSummary; onClose: () => vo
           </button>
         </div>
 
-        <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-5">
           <Stat label="wall clock" value={`${(span).toFixed(0)}ms`} />
           <Stat label="hops" value={String(trace.spans)} icon={<Layers className="h-3 w-3" />} />
           <Stat label="services" value={String(trace.services)} />
+          <Stat
+            label="operations"
+            value={inner.length ? String(inner.length) : '—'}
+            icon={<Layers className="h-3 w-3" />}
+          />
           <Stat
             label="log lines"
             value={trace.log_lines < 0 ? '—' : String(trace.log_lines)}
@@ -326,6 +380,16 @@ function TracePanel({ trace, onClose }: { trace: TraceSummary; onClose: () => vo
                     {h.duration_ms.toFixed(1)}ms
                   </span>
                 </div>
+                {/* Self time: what this hop spent that no child accounts for —
+                    its own code, or work nobody has instrumented yet. Shown
+                    only when there IS recorded detail, because "100% self" on
+                    an uninstrumented hop says nothing. */}
+                {selfTime(h) !== null && (
+                  <div className="mt-0.5 text-[10px] text-[var(--muted)]">
+                    self {selfTime(h)!.toFixed(1)}ms · in recorded work{' '}
+                    {(h.duration_ms - selfTime(h)!).toFixed(1)}ms
+                  </div>
+                )}
                 <div className="relative mt-1.5 h-2 overflow-hidden rounded bg-[var(--border)]/50">
                   <div
                     className={`absolute h-full rounded ${
@@ -335,6 +399,59 @@ function TracePanel({ trace, onClose }: { trace: TraceSummary; onClose: () => vo
                     title={`+${(start - t0).toFixed(0)}ms → +${(start - t0 + h.duration_ms).toFixed(0)}ms`}
                   />
                 </div>
+                {/* What ran inside this hop, on the same timeline. The bars
+                    are what turn "this request took 300ms" into "280 of them
+                    were one query". */}
+                {innerTree(h.span_id ?? '').map(({ s: op, depth }) => {
+                  const opStart = new Date(op.start).getTime();
+                  const opLeft = ((opStart - t0) / span) * 100;
+                  const opWidth = Math.max(0.6, (op.duration_ms / span) * 100);
+                  return (
+                    <div key={op.id} className="mt-1.5" style={{ paddingLeft: `${12 + depth * 12}px` }}>
+                      <div className="flex items-center gap-2 text-[11px]">
+                        <span className={`w-12 shrink-0 rounded px-1 text-center text-[9px] uppercase tracking-wide ${kindTone(op.kind)}`}>
+                          {op.kind || 'op'}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate font-mono">{op.name}</span>
+                        {op.error && (
+                          <span className="shrink-0 text-[10px] text-[var(--bad)]" title={op.error}>
+                            failed
+                          </span>
+                        )}
+                        <span className="w-14 shrink-0 text-right tabular-nums text-[var(--muted)]">
+                          {fmtOpMs(op.duration_ms)}
+                        </span>
+                      </div>
+                      <div className="relative mt-1 h-1.5 overflow-hidden rounded bg-[var(--border)]/40">
+                        <div
+                          className={`absolute h-full rounded ${op.error ? 'bg-[var(--bad)]' : kindBar(op.kind)}`}
+                          style={{ left: `${opLeft}%`, width: `${opWidth}%` }}
+                          title={`+${(opStart - t0).toFixed(0)}ms → +${(opStart - t0 + op.duration_ms).toFixed(0)}ms`}
+                        />
+                      </div>
+                      {op.attrs && Object.keys(op.attrs).length > 0 && (
+                        <details className="mt-1">
+                          {/* One identifying line visible, the rest behind a
+                              disclosure. An N+1 is fifteen near-identical
+                              operations; showing every attribute of each turns
+                              the finding into a wall nobody reads. */}
+                          <summary className="cursor-pointer truncate font-mono text-[10px] text-[var(--muted)] hover:text-[var(--text)]">
+                            {identifyingAttr(op.attrs) ?? `${Object.keys(op.attrs).length} attributes`}
+                          </summary>
+                          <div className="mt-1 space-y-0.5 font-mono text-[10px] text-[var(--muted)]">
+                            {Object.entries(op.attrs).map(([k, v]) => (
+                              <div key={k} className="flex gap-2">
+                                <span className="w-24 shrink-0 text-right">{k}</span>
+                                <span className="min-w-0 flex-1 break-all text-[var(--text)]">{v}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </details>
+                      )}
+                    </div>
+                  );
+                })}
+
                 {hopLines.length > 0 && (
                   <details className="mt-2">
                     <summary className="cursor-pointer text-[10px] text-[var(--muted)] hover:text-[var(--text)]">
@@ -389,6 +506,56 @@ function Stat({ label, value, icon }: { label: string; value: string; icon?: Rea
       <div className="mt-0.5 tabular-nums">{value}</div>
     </div>
   );
+}
+
+/** Kind badges. Colour carries the class of operation, so a waterfall of
+ *  fifteen bars is readable without reading fifteen names. */
+/** A sub-0.05ms operation rounds to "0.0ms", which reads as a broken timer
+ *  rather than a fast cache hit. Say what is actually true instead. */
+function fmtOpMs(ms: number) {
+  return ms < 0.05 ? '<0.1ms' : `${ms.toFixed(1)}ms`;
+}
+
+/** The attribute that identifies an operation, for the collapsed summary.
+ *  Ordered by how much it tells you: the statement, then the target, then the
+ *  key. Falls back to nothing so the caller can show a count instead. */
+function identifyingAttr(attrs: Record<string, string>): string | null {
+  for (const k of ['db.statement', 'http.url', 'cache.key', 'queue.topic']) {
+    if (attrs[k]) return attrs[k];
+  }
+  return null;
+}
+
+function kindTone(kind?: string) {
+  switch (kind) {
+    case 'db':
+      return 'bg-sky-400/15 text-sky-300';
+    case 'cache':
+      return 'bg-violet-400/15 text-violet-300';
+    case 'http':
+    case 'rpc':
+      return 'bg-emerald-400/15 text-emerald-300';
+    case 'queue':
+      return 'bg-amber-400/15 text-amber-300';
+    default:
+      return 'bg-white/5 text-[var(--muted)]';
+  }
+}
+
+function kindBar(kind?: string) {
+  switch (kind) {
+    case 'db':
+      return 'bg-sky-400/70';
+    case 'cache':
+      return 'bg-violet-400/70';
+    case 'http':
+    case 'rpc':
+      return 'bg-emerald-400/70';
+    case 'queue':
+      return 'bg-amber-400/70';
+    default:
+      return 'bg-[var(--muted)]/60';
+  }
 }
 
 function levelTone(level: string) {

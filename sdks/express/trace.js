@@ -63,4 +63,9 @@ function outboundHeaders(extra = {}) {
   return ctx ? { ...extra, [HEADER]: header(ctx) } : { ...extra };
 }
 
-module.exports = { HEADER, fromHeader, header, run, current, outboundHeaders };
+/** A random id of the given HEX LENGTH — 16 for a span, 32 for a trace.
+ *  Exposed because inner spans need ids of the same shape, and a second
+ *  generator would be a second place for the convention to drift. */
+const randomHex = (hexChars) => hex(hexChars / 2);
+
+module.exports = { HEADER, fromHeader, header, run, current, outboundHeaders, randomHex };

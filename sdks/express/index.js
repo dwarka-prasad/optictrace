@@ -231,3 +231,4 @@ module.exports.optictrace = optictrace;
 module.exports.outboundHeaders = trace.outboundHeaders;
 module.exports.currentSpan = trace.current;
 module.exports.LogShipper = require('./logs').LogShipper;
+module.exports.SpanRecorder = require('./spans').SpanRecorder;

@@ -30,6 +30,7 @@ import yaml
 
 from .engine import Engine, Policy, REDACTED, first_string  # noqa: F401 (public API)
 from .logs import OpticTraceLogHandler
+from .spans import InnerSpan, SpanRecorder
 from .trace import HEADER as TRACEPARENT, TraceContext, current as current_span, from_header, outbound_headers
 
 __all__ = [
@@ -38,6 +39,8 @@ __all__ = [
     "Policy",
     "REDACTED",
     "OpticTraceLogHandler",
+    "SpanRecorder",
+    "InnerSpan",
     "TraceContext",
     "TRACEPARENT",
     "current_span",

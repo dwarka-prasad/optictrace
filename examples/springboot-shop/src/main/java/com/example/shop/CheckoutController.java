@@ -30,10 +30,13 @@ public class CheckoutController {
 
     private final RestTemplate http;
     private final HttpServletRequest inbound;
+    private final ProductRepository products;
 
-    public CheckoutController(RestTemplate http, HttpServletRequest inbound) {
+    public CheckoutController(RestTemplate http, HttpServletRequest inbound,
+                              ProductRepository products) {
         this.http = http;
         this.inbound = inbound;   // a Spring request-scoped proxy
+        this.products = products;
     }
 
     @PostMapping("/api/v1/orders")
@@ -72,6 +75,12 @@ public class CheckoutController {
             return ResponseEntity.status(e.getStatusCode())
                     .body(Map.of("error", "payment failed", "order_ref", orderRef));
         }
+
+        // Deliberately an N+1: one query per related sku. It is here because
+        // it is what the span breakdown exists to find — the per-request
+        // multiplier gives it away where a latency chart cannot.
+        products.stockFor(java.util.List.of("SKU-100", "SKU-200", "SKU-300", "SKU-400"));
+        products.saveOrder(orderRef, product.sku(), req.qty(), amount, req.customer().email());
 
         log.info("order confirmed: " + orderRef);
         return ResponseEntity.status(201).body(Map.of(

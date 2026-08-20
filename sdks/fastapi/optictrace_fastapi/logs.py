@@ -52,9 +52,13 @@ class OpticTraceLogHandler(logging.Handler):
         flush_interval: float = 0.5,
         batch_size: int = 200,
         timeout: float = 5.0,
+        path: str = "/api/applogs/ingest",
     ):
         super().__init__()
-        self.url = agent_url.rstrip("/") + "/api/applogs/ingest"
+        # The path is a parameter so inner spans can ship through this same
+        # batching, bounded queue and delivery counters. A second shipper would
+        # drift from this one, and the copy nobody exercises drifts first.
+        self.url = agent_url.rstrip("/") + path
         self.service = service
         self.timeout = timeout
         self.batch_size = batch_size
@@ -92,6 +96,17 @@ class OpticTraceLogHandler(logging.Handler):
             line["fields"] = fields
         try:
             self._q.put_nowait(line)
+        except queue.Full:
+            self.dropped += 1
+
+    def ship(self, payload: dict) -> None:
+        """Queues an already-built payload, dropping visibly when full.
+
+        Used by the span recorder, which needs this handler's batching and
+        counters but builds its own shape.
+        """
+        try:
+            self._q.put_nowait(payload)
         except queue.Full:
             self.dropped += 1
 

@@ -93,6 +93,31 @@ ENGINE = MergeTree
 ORDER BY (span_id, ts, id)
 SETTINGS index_granularity = 8192`
 
+// One statement per const, executed on its own: this driver's Exec takes a
+// single statement, which is why the app-log schema is already separate.
+const chSpanSchema = `
+CREATE TABLE IF NOT EXISTS spans (
+	id          Int64,
+	ts          Int64,
+	service     String,
+	trace_id    String,
+	span_id     String,
+	parent_span String,
+	name        String,
+	kind        String,
+	duration_ms Float64,
+	error       String,
+	attrs       String,
+	route       String,
+	source      String,
+	truncated   UInt8
+)
+ENGINE = MergeTree
+-- parent_span leads: "what ran inside this hop" is the waterfall's query and
+-- the only lookup that has to be fast on a table growing faster than logs.
+ORDER BY (parent_span, ts, id)
+SETTINGS index_granularity = 8192`
+
 // NewClickHouse opens (and migrates) a ClickHouse-backed store. dsn is a
 // clickhouse-go URL: clickhouse://user:pass@host:9000/database
 func NewClickHouse(dsn string) (*ClickHouseStore, error) {
@@ -120,6 +145,10 @@ func NewClickHouse(dsn string) (*ClickHouseStore, error) {
 	if _, err := db.ExecContext(ctx, chAppLogSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply app-log schema: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, chSpanSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("apply span schema: %w", err)
 	}
 	// Columns added after the initial release. ClickHouse has IF NOT EXISTS
 	// for this, so no error-string matching is needed.
@@ -680,6 +709,13 @@ func (s *ClickHouseStore) Purge(ctx context.Context, label, value string, before
 			`ALTER TABLE app_logs DELETE WHERE trace_id IN (`+
 				strings.Join(placeholders, ",")+`)`+syncMutations, ids...); err != nil {
 			return 0, fmt.Errorf("purge app logs: %w", err)
+		}
+		// And the inner spans: a statement's attributes can hold the
+		// customer's email as surely as a log line can.
+		if _, err := s.db.ExecContext(ctx,
+			`ALTER TABLE spans DELETE WHERE trace_id IN (`+
+				strings.Join(placeholders, ",")+`)`+syncMutations, ids...); err != nil {
+			return 0, fmt.Errorf("purge spans: %w", err)
 		}
 	}
 

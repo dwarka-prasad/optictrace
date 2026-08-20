@@ -1,6 +1,7 @@
 package com.example.shop;
 
 import io.github.dwarkaprasad.optictrace.OpticTraceFilter;
+import io.github.dwarkaprasad.optictrace.OpticTraceSpans;
 import io.github.dwarkaprasad.optictrace.OpticTraceLogHandler;
 import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Value;
@@ -66,6 +67,19 @@ public class OpticTraceConfig {
         // like redaction worked when nothing had been sent.
         parent.setLevel(Level.FINE);
         parent.addHandler(new OpticTraceLogHandler(agentUrl, serviceName));
+    }
+
+    /**
+     * Records the operations that run while a request is served — the queries,
+     * the cache lookups, the calls out.
+     *
+     * <p>Separate from the filter on purpose: the filter records the exchange,
+     * this records what happened inside it, and a service can adopt one
+     * without the other.
+     */
+    @Bean(destroyMethod = "close")
+    public OpticTraceSpans optictraceSpans() {
+        return new OpticTraceSpans(agentUrl, serviceName);
     }
 
     @Bean
