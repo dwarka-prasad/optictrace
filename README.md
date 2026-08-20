@@ -10,7 +10,7 @@ Prometheus dimensions.
 
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/status-v0.14.0-brightgreen)](#roadmap)
+[![Status](https://img.shields.io/badge/status-v0.15.0-brightgreen)](#roadmap)
 
 **[optictrace product page →](https://dwarka-prasad.github.io/optictrace/)**
 
@@ -395,6 +395,7 @@ rules stay live.
 | Label cardinality guard | ✅ | Caps distinct values per custom label (default 500); overflow collapses to `__over_limit__` and is counted |
 | Postgres driver | ✅ | Multi-node store with JSONB aggregation and `percentile_cont`; shares a conformance suite with SQLite |
 | ClickHouse driver | ✅ | Column store for high-volume retention; `quantileExact` and `argMin` aggregation, and it runs the same conformance suite as SQLite and Postgres |
+| Inner spans (db · cache · outbound) | ✅ | Operations inside a request, with **governed attributes** — a statement is redacted before storage — and a per-request multiplier that makes an N+1 visible |
 | OpenTelemetry export | ✅ | `type: otlp` exporter emits spans over OTLP/HTTP JSON; no SDK dependency |
 
 ### Storage at scale
@@ -557,6 +558,9 @@ for a complete workflow. This repo dogfoods it in
 | `POST /api/ingest` | Accept governed records from SDKs |
 | `POST /api/applogs/ingest` | Accept application log lines, correlated by span id |
 | `GET /api/applogs` | Lines a request logged (`?span=` / `?trace=` / `?level=`) |
+| `GET /api/spans` | Operations inside a request (`?trace=` / `?parent=` / `?kind=` / `?errors=1` / `?min_ms=`) |
+| `GET /api/spans/breakdown` | Where a window's time went, by operation (`?route=`) |
+| `GET /api/spans/stats` | Span counts by kind and service |
 | `GET /api/system` | Agent health, store size, exporter stats |
 
 ### Metrics exposed
@@ -572,6 +576,9 @@ for a complete workflow. This repo dogfoods it in
 | `optictrace_sdk_ingested_total` | counter | — |
 | `optictrace_app_logs_stored_total` | counter | — |
 | `optictrace_app_logs_dropped_total` | counter | `reason` (orphan, level, span_cap) |
+| `optictrace_spans_stored_total` | counter | — |
+| `optictrace_spans_dropped_total` | counter | `reason` (orphan, too_fast, request_cap) |
+| `optictrace_span_duration_seconds` | histogram | `name`, `kind`, `service` |
 | `optictrace_exported_total` | counter | `exporter` |
 | `optictrace_export_failed_total` | counter | `exporter` |
 | `optictrace_export_dropped_total` | counter | `exporter` |
@@ -982,12 +989,108 @@ losing correlation is a nuisance, failing a request over a bad header would be
 a fault.
 
 **What this does and does not give you.** Each hop is one span covering the
-whole exchange OpticTrace saw. It is not a substitute for in-process tracing —
-there are no spans for a database call or a function inside your service. Point
-the OTLP exporter at Jaeger or Tempo for that, and it will use these same ids
-so the two views line up. What OpticTrace adds is the **governed payload at
-every hop**: an APM shows you timings, this shows you the redacted request body
-you are actually allowed to look at.
+whole exchange OpticTrace saw. **Inner spans** (below) break that hop down into
+the operations inside it, which used to be the line where you were sent to an
+APM. What is still not here is automatic instrumentation: nothing hooks your
+database driver for you, so an operation appears because someone named it.
+Point the OTLP exporter at Jaeger or Tempo if you want a full APM alongside —
+it uses these same ids, so the two views line up. What OpticTrace adds is the
+**governed payload at every level**: an APM shows you timings, this shows you
+the redacted request body — and the redacted statement — you are actually
+allowed to look at.
+
+### Inside one hop: what the request actually did
+
+A hop tells you a request took 300ms. It does not tell you that 280 of them
+were one query. Inner spans do:
+
+```
+POST /api/v1/orders                                    285ms   self 10ms
+  ├── db.query products      SELECT ... WHERE sku = ?    18ms   rows=1
+  ├── cache.get product      product:SKU-100             0.2ms  hit=false
+  ├── db.query stock         SELECT stock ... WHERE ?     0.3ms  ×4  ← N+1
+  ├── db.insert order        INSERT INTO orders ...       9.8ms
+  │     └── db.index refresh ANALYZE TABLE orders        2.2ms
+  └── http POST acquirer     https://acquirer-eu/charge  41ms   status=200
+```
+
+Two things make this different from every other tracing library:
+
+**The attributes are governed.** A statement quotes its parameters, a cache key
+embeds an account id, an outbound URL carries a token in its query string. Span
+attributes run through redaction, byte caps and a level filter *before* they are
+stored — the same treatment as a log line, for the same reason. A driver that
+interpolates its SQL puts the customer's email in the one field a breakdown most
+wants to show; here it arrives `[REDACTED]`.
+
+**The per-request multiplier is a first-class figure.** The breakdown reports
+`count` and `requests` separately, so `count/requests` is visible. Four thousand
+calls to one query looks like busy traffic until you know it was a hundred
+requests:
+
+| operation | kind | count | requests | ×/req | total | p95 |
+|---|---|---:|---:|---:|---:|---:|
+| `http POST acquirer` | http | 11 | 11 | 1.0 | 363.7ms | 43.2ms |
+| `db.insert order` | db | 11 | 11 | 1.0 | 46.5ms | 9.8ms |
+| **`db.query stock`** | db | **44** | **11** | **4.0** | 32.0ms | 1.2ms |
+| `db.query products` | db | 12 | 12 | 1.0 | 23.0ms | 18.1ms |
+
+Turn it on, then name the operations you care about:
+
+```yaml
+telemetry:
+  spans:
+    enabled: true
+    min_duration: 1ms       # a 20µs cache hit ×1000 is volume, not information
+    max_per_request: 200    # the cap being HIT is itself the finding
+    max_attr_bytes: 4096
+    retention_max_age: 72h
+    redact:
+      patterns:
+        - '\b\d{13,19}\b'                 # card-shaped digit runs
+        - '[\w.+-]+@[\w-]+\.[\w.]+'       # emails in a WHERE clause
+      fields: [cache.key]
+```
+
+```go
+ctx, sp := spans.Start(ctx, "db.query", "db")
+sp.Set("db.statement", "SELECT * FROM orders WHERE id = $1")   // the TEMPLATE
+defer sp.End()
+```
+
+```java
+try (InnerSpan sp = spans.start("db.query", "db")) {
+    sp.set("db.statement", SQL).setInt("db.rows", rows.size());
+}
+```
+
+```python
+with spans.start("db.query", "db") as sp:
+    sp.set("db.statement", SQL).set_int("db.rows", len(rows))
+```
+
+```js
+await spans.observe('db.query', 'db', (sp) => {
+  sp.set('db.statement', SQL);
+  return pool.query(SQL, [id]);
+});
+```
+
+A failed operation is kept however fast it was — "it returned in 200µs" and "it
+returned in 200µs with an error" are not the same event. Work outside a request
+is dropped by default and counted, because attaching it to whichever request
+happened to be in flight would cross-attribute tenants. `optictrace purge`
+deletes a tenant's spans with their records in one transaction: erasing the
+request while keeping the query it ran is not erasure.
+
+Storage is optional in the same way app logs are — `ext.SpanStore` is a separate
+interface from `ext.Store`, so a third-party driver without it is still a
+complete driver. All three bundled drivers implement it.
+
+<sub>Go's `spans.Transport(nil)` wraps an `http.RoundTripper`, so outbound calls
+are timed **and** propagated without a call site knowing: a downstream call that
+is timed but not propagated is a gap someone has to guess about, and one that is
+propagated but not timed leaves the caller's own view of it missing.</sub>
 
 
 ### What the request logged
@@ -1011,6 +1114,17 @@ optictrace run -config optic.yaml -exec "python app.py"     # its stdout/stderr
 
 ```yaml
 telemetry:
+  spans:                             # operations inside a request (off by default)
+    enabled: true
+    min_duration: 1ms                # drop trivially fast operations
+    max_per_request: 200             # -1 for no cap; the cap being hit is a finding
+    max_attr_bytes: 4096
+    drop_orphans: true               # work outside any request
+    retention_max_age: 72h
+    redact:                          # attributes are free text — a statement quotes its parameters
+      patterns: ['\b\d{13,19}\b']
+      fields: [cache.key]
+
   app_logs:
     sources:
       - { type: file, path: /var/log/app.jsonl }   # rotation followed
@@ -1363,7 +1477,7 @@ the agent itself — no separate frontend deployment.
 |---|---|
 | **Overview** | Golden signals; **p95 drawn against the average**; succeeded/rejected/failed split apart; traffic by tenant; **capture & sampling**; top routes; which rules are firing |
 | **Routes** | Every route with sortable P50/P95/P99, error rates, traffic volume |
-| **Traces** | One row per request however many services it touched, then a **waterfall** on a shared timeline with each hop's log lines under it |
+| **Traces** | One row per request however many services it touched, then a **waterfall** on a shared timeline — every hop, the operations inside each hop, and the log lines each wrote — with **self time** per hop |
 | **Inspector** | Searchable/filterable exchanges; redacted fields highlighted; CSV/JSONL export |
 | **Logs** | Application log lines across requests — filter by level, service or text; every line links back to the request that wrote it |
 | **Usage** | Per-consumer requests, data, compute, meters and estimated cost |
@@ -1588,6 +1702,12 @@ release since then added. What follows is what is *not* done.
   middleware inside the service, where the messages are typed.
 - **A rules UI.** The config is the interface, and it is reviewable in a pull request.
   A form that generates YAML makes the file the second source of truth.
+- **Automatic instrumentation of database drivers.** Wrapping a driver per
+  language, per version, is a maintenance surface larger than the rest of this
+  project — and a wrapper that silently stops matching a driver's internals is
+  worse than no wrapper. Inner spans are named explicitly; Go's `Transport`
+  wrapper exists because an `http.RoundTripper` is one stable interface, not
+  twenty.
 - **Sampling that drops records.** Sampling gates the stored *body*; the record is always
   written. A tool whose own counts move when you change a sampling rate cannot be used to
   answer questions about traffic.
@@ -1652,6 +1772,8 @@ internal/ruletest/  optic.test.yaml runner (pure engine, no server)
 internal/spec/      traffic→OpenAPI inference, spec-vs-traffic linter, TS SDK gen
 internal/mock/      stateful mock server (+ optional Claude-generated responses)
 internal/applog/    application-log governance: level floor, caps, redaction
+internal/spans/     inner-span governance: attribute redaction, caps, duration floor
+internal/telcap/    the per-request cap and UTF-8 truncation both of them share
 internal/scaffold/  optic.yaml generation from an OpenAPI or Swagger document
 internal/admin/     admin API + dashboard hosting
 ui/                 Next.js dashboard (static export)

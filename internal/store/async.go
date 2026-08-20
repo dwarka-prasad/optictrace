@@ -22,7 +22,10 @@ type AsyncWriter struct {
 	// arrive at many lines per request, so keeping them as long as records
 	// usually means keeping far more data than anyone intended.
 	appLogMaxAge time.Duration
-	pruneTick    time.Duration
+	// spanMaxAge expires inner spans on their own horizon, for the same
+	// reason: they run well above request volume.
+	spanMaxAge time.Duration
+	pruneTick  time.Duration
 }
 
 type AsyncOption func(*AsyncWriter)
@@ -47,6 +50,12 @@ func WithMaxAge(d time.Duration) AsyncOption {
 // a no-op unless the store implements ext.AppLogStore.
 func WithAppLogMaxAge(d time.Duration) AsyncOption {
 	return func(w *AsyncWriter) { w.appLogMaxAge = d }
+}
+
+// WithSpanMaxAge sets the retention horizon for inner spans. It is a no-op
+// unless the store implements ext.SpanStore.
+func WithSpanMaxAge(d time.Duration) AsyncOption {
+	return func(w *AsyncWriter) { w.spanMaxAge = d }
 }
 
 func NewAsyncWriter(s LogStore, queueSize int, logger *slog.Logger, opts ...AsyncOption) *AsyncWriter {
@@ -118,6 +127,18 @@ func (w *AsyncWriter) run() {
 						w.logger.Warn("app log prune failed", "error", err)
 					} else if n > 0 {
 						w.logger.Info("pruned application logs", "lines", n, "older_than", cutoff)
+					}
+					cancel()
+				}
+			}
+			if w.spanMaxAge > 0 {
+				if ss, ok := w.store.(SpanStore); ok {
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					cutoff := time.Now().Add(-w.spanMaxAge)
+					if n, err := ss.PruneSpansBefore(ctx, cutoff); err != nil {
+						w.logger.Warn("span prune failed", "error", err)
+					} else if n > 0 {
+						w.logger.Info("pruned inner spans", "spans", n, "older_than", cutoff)
 					}
 					cancel()
 				}

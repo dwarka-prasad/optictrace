@@ -1,5 +1,6 @@
 package com.example.shop;
 
+import io.github.dwarkaprasad.optictrace.OpticTraceSpans;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -15,6 +16,12 @@ public class PaymentsController {
 
     private static final Logger log = Logger.getLogger("com.example.shop.payments");
 
+    private final OpticTraceSpans spans;
+
+    public PaymentsController(OpticTraceSpans spans) {
+        this.spans = spans;
+    }
+
     @PostMapping("/api/v1/payments/charge")
     public ResponseEntity<?> charge(@RequestBody Model.ChargeRequest req) throws InterruptedException {
         // A real service logs like this while debugging and forgets to take it
@@ -23,7 +30,14 @@ public class PaymentsController {
         log.fine("charging card " + req.card().number() + " for " + req.amount());
         log.info("charge requested for " + req.orderRef());
 
-        Thread.sleep(ThreadLocalRandom.current().nextInt(10, 50));
+        // The acquirer call: the hop that usually owns a payment's wall clock,
+        // and the one a latency chart cannot separate from the rest.
+        try (OpticTraceSpans.InnerSpan sp = spans.start("http POST acquirer", "http")) {
+            sp.set("http.method", "POST")
+                    .set("http.url", "https://acquirer-eu.example/charge");
+            Thread.sleep(ThreadLocalRandom.current().nextInt(10, 50));
+            sp.setInt("http.status", 200);
+        }
 
         if (req.amount() > 900 && Math.random() < 0.5) {
             log.severe("charge declined: limit_exceeded for " + req.orderRef());

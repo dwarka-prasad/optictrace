@@ -78,6 +78,32 @@ CREATE TABLE IF NOT EXISTS app_logs (
 -- "what did this request log" is the entire point, and it is a point lookup
 -- over the fastest-growing table in the store.
 CREATE INDEX IF NOT EXISTS idx_app_logs_span  ON app_logs(span_id, ts);
+
+-- Inner spans: the operations that ran while a request was served. Separate
+-- table from logs for the same reason app_logs is — a different cardinality
+-- (many per exchange) and its own retention horizon.
+CREATE TABLE IF NOT EXISTS spans (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	ts          INTEGER NOT NULL,   -- unix milliseconds, when the operation STARTED
+	service     TEXT NOT NULL DEFAULT '',
+	trace_id    TEXT NOT NULL DEFAULT '',
+	span_id     TEXT NOT NULL DEFAULT '',
+	parent_span TEXT NOT NULL DEFAULT '',
+	name        TEXT NOT NULL DEFAULT '',
+	kind        TEXT NOT NULL DEFAULT '',
+	duration_ms REAL NOT NULL DEFAULT 0,
+	error       TEXT NOT NULL DEFAULT '',
+	attrs       TEXT NOT NULL DEFAULT '',
+	route       TEXT NOT NULL DEFAULT '',
+	source      TEXT NOT NULL DEFAULT '',
+	truncated   INTEGER NOT NULL DEFAULT 0
+);
+-- "what ran inside this hop" is the waterfall's query, and it is a point
+-- lookup over a table that grows faster than logs.
+CREATE INDEX IF NOT EXISTS idx_spans_parent ON spans(parent_span, ts);
+CREATE INDEX IF NOT EXISTS idx_spans_trace  ON spans(trace_id, ts);
+-- The breakdown groups by name over a window and sorts on duration.
+CREATE INDEX IF NOT EXISTS idx_spans_name   ON spans(ts, name, duration_ms);
 CREATE INDEX IF NOT EXISTS idx_app_logs_trace ON app_logs(trace_id, ts);
 CREATE INDEX IF NOT EXISTS idx_app_logs_ts    ON app_logs(ts);
 `
@@ -627,6 +653,14 @@ func (s *SQLiteStore) Purge(ctx context.Context, label, value string, before tim
 	logQuery += `)`
 	if _, err := tx.ExecContext(ctx, logQuery, logArgs...); err != nil {
 		return 0, fmt.Errorf("purge app logs: %w", err)
+	}
+
+	// And the inner spans, for exactly the same reason: a statement's
+	// attributes can hold the customer's email as surely as a log line can,
+	// and erasing the request while keeping the query it ran is not erasure.
+	spanQuery := strings.Replace(logQuery, "DELETE FROM app_logs", "DELETE FROM spans", 1)
+	if _, err := tx.ExecContext(ctx, spanQuery, logArgs...); err != nil {
+		return 0, fmt.Errorf("purge spans: %w", err)
 	}
 
 	res, err := tx.ExecContext(ctx, query, args...)

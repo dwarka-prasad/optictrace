@@ -553,6 +553,67 @@ logger.InfoContext(ctx, <span class="s">"charge captured"</span>, <span class="s
     </div>
 
     <div class="tbl-scroll">
+    <div class="stack">
+      <header><h3>Optional: name the operations inside a request</h3><span class="badge ok">all five</span></header>
+      <p class="lede-sm">
+        Everything above records the HTTP exchange. <strong>Inner spans</strong> break one
+        hop down into the work inside it, so a request that took 300ms can say that 280 of
+        them were one query. It is opt-in twice over: the policy has to be on, and each
+        operation appears because someone named it — nothing hooks your database driver.
+      </p>
+<pre>telemetry:
+  spans:
+    enabled: <span class="k">true</span>
+    min_duration: 1ms        <span class="c"># a 20µs cache hit ×1000 is volume, not information</span>
+    max_per_request: <span class="k">200</span>   <span class="c"># the cap being HIT is itself the finding — usually an N+1</span>
+    max_attr_bytes: <span class="k">4096</span>
+    retention_max_age: 72h
+    redact:                  <span class="c"># attributes are free text, and a statement quotes its parameters</span>
+      patterns:
+        - <span class="s">'\b\d{13,19}\b'</span>
+        - <span class="s">'[\w.+-]+@[\w-]+\.[\w.]+'</span>
+      fields: [cache.key]</pre>
+<pre><span class="c">// Go — the context carries the nesting</span>
+ctx, sp := spans.Start(ctx, <span class="s">"db.query"</span>, <span class="s">"db"</span>)
+sp.Set(<span class="s">"db.statement"</span>, <span class="s">"SELECT * FROM orders WHERE id = $1"</span>)
+<span class="k">defer</span> sp.End()
+
+<span class="c">// and every outbound call, timed AND propagated, with no call site changes</span>
+client := &amp;http.Client{Transport: spans.Transport(<span class="k">nil</span>)}</pre>
+<pre><span class="c">// Java — try-with-resources closes the span</span>
+<span class="k">try</span> (InnerSpan sp = spans.start(<span class="s">"db.query"</span>, <span class="s">"db"</span>)) {
+    sp.set(<span class="s">"db.statement"</span>, SQL).setInt(<span class="s">"db.rows"</span>, rows.size());
+}</pre>
+<pre><span class="c"># Python — a context manager; an exception is recorded and re-raised</span>
+<span class="k">with</span> spans.start(<span class="s">"db.query"</span>, <span class="s">"db"</span>) <span class="k">as</span> sp:
+    sp.set(<span class="s">"db.statement"</span>, SQL).set_int(<span class="s">"db.rows"</span>, len(rows))</pre>
+<pre><span class="c">// Node — observe() establishes the scope that makes operations nest</span>
+<span class="k">await</span> spans.observe(<span class="s">'db.query'</span>, <span class="s">'db'</span>, (sp) =&gt; {
+  sp.set(<span class="s">'db.statement'</span>, SQL);
+  <span class="k">return</span> pool.query(SQL, [id]);
+});</pre>
+      <p class="note">
+        <b>Pass the statement TEMPLATE, not the interpolated one.</b> The agent redacts
+        what arrives — a driver that interpolates its parameters puts the customer's email
+        in the one attribute a breakdown most wants to show, and it is stored
+        <code>[REDACTED]</code> — but it cannot un-send it. The safest secret is the one
+        that was never transmitted.
+      </p>
+      <p class="note">
+        <b>Node needs <code>observe()</code> for nesting</b>, or an explicit
+        <code>{ parent }</code>. There is no way to leave an
+        <code>AsyncLocalStorage</code> scope imperatively, so <code>start()</code> alone
+        cannot establish one for whatever runs next. The other four nest from
+        <code>start()</code> because their languages let a scope be popped.
+      </p>
+      <p class="note good">
+        A failed operation is kept however fast it was — "it returned in 200µs" and "it
+        returned in 200µs with an error" are not the same event. Work outside a request is
+        dropped by default and counted, and <code>optictrace purge</code> deletes a
+        tenant's spans with their records in one transaction.
+      </p>
+    </div>
+
     <table class="matrix">
       <caption class="eyebrow" style="text-align:left;margin-bottom:0.6rem">What each route gives you</caption>
       <thead>
@@ -566,6 +627,7 @@ logger.InfoContext(ctx, <span class="s">"charge captured"</span>, <span class="s
         <tr><td>Tail sampling (<code>keep_errors</code>, <code>keep_slower_than</code>)</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td></tr>
         <tr><td>W3C trace context</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td></tr>
         <tr><td><code>trace.response_header</code></td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td></tr>
+        <tr><td>Inner spans (db · cache · outbound)</td><td class="n">— <span class="n">names the exchange only</span></td><td class="y">✓ + auto outbound</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td></tr>
         <tr><td>Application log shipping</td><td class="y">✓ <span class="n">via <code>-exec</code> / file</span></td><td class="y">✓ slog</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓ JUL</td></tr>
         <tr><td>Masks data inside your process</td><td class="n">—</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td></tr>
         <tr><td>Needs no code change</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>

@@ -37,6 +37,13 @@ type (
 	TraceSummary = ext.TraceSummary
 	TraceFilter  = ext.TraceFilter
 	TraceStore   = ext.TraceStore
+	// Span is one operation inside a request. SpanStore is OPTIONAL for the
+	// same reason the two above are.
+	Span          = ext.Span
+	SpanFilter    = ext.SpanFilter
+	SpanStore     = ext.SpanStore
+	SpanSummary   = ext.SpanSummary
+	SpanBreakdown = ext.SpanBreakdown
 )
 
 const (

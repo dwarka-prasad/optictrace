@@ -27,7 +27,10 @@ class LogShipper {
    * @param {number} [opts.batchSize=200]
    */
   constructor(agentUrl, service, opts = {}) {
-    this.url = String(agentUrl).replace(/\/+$/, '') + '/api/applogs/ingest';
+    // The path is an option so inner spans can ship through this same
+    // batching, bounded queue and delivery counters. A second shipper would
+    // drift from this one, and the copy nobody exercises drifts first.
+    this.url = String(agentUrl).replace(/\/+$/, '') + (opts.path ?? '/api/applogs/ingest');
     this.service = service;
     this.maxQueue = opts.maxQueue ?? 10_000;
     this.batchSize = opts.batchSize ?? 200;
@@ -43,6 +46,16 @@ class LogShipper {
 
     this.timer = setInterval(() => this.flush(), opts.flushMs ?? 500);
     if (this.timer.unref) this.timer.unref();   // never hold the process open
+  }
+
+  /** Queues an already-built payload, dropping visibly when the bound is hit. */
+  ship(payload) {
+    if (this.queue.length >= this.maxQueue) {
+      this.dropped += 1;
+      return;
+    }
+    this.queue.push(payload);
+    if (this.queue.length >= this.batchSize) this.flush();
   }
 
   log(level, message, fields) {

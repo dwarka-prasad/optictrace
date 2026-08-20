@@ -243,19 +243,40 @@ func (h *LogHandler) Stats() (sent, failed, dropped int64, lastErr error) {
 
 // Close drains the queue. The last lines before a shutdown are usually the
 // ones explaining it.
-func (h *LogHandler) Close() error {
-	s := h.sink
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
+func (h *LogHandler) Close() error { return h.sink.close() }
+
+// enqueue queues one payload, dropping visibly when the bound is reached.
+// Lives on the sink because inner spans ship through the same one — a second
+// copy of "queue, drop, count" would drift from this one.
+func (h *logSink) enqueue(payload map[string]any) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		h.dropped++
+		return
+	}
+	if len(h.queue) >= h.maxQueue {
+		h.dropped++
+		return
+	}
+	h.queue = append(h.queue, payload)
+}
+
+// close drains what is queued and stops the worker. Idempotent: a caller with
+// both a deferred Close and an explicit one must not block on a closed
+// channel.
+func (h *logSink) close() error {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
 		return nil
 	}
-	s.closed = true
-	s.mu.Unlock()
+	h.closed = true
+	h.mu.Unlock()
 
-	close(s.stop)
+	close(h.stop)
 	select {
-	case <-s.done:
+	case <-h.done:
 	case <-time.After(5 * time.Second):
 	}
 	return nil

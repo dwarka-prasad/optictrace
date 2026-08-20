@@ -82,6 +82,199 @@ func RunStoreSuite(t *testing.T, open OpenFunc) {
 	// Trace listing is OPTIONAL in the same way, and skips for a driver that
 	// does not implement ext.TraceStore.
 	t.Run("traces", func(t *testing.T) { testTraces(t, open) })
+
+	// Inner spans, likewise optional.
+	t.Run("spans", func(t *testing.T) { testSpans(t, open) })
+	t.Run("spans_erasure", func(t *testing.T) { testSpanErasure(t, open) })
+}
+
+// spanStore returns the driver's span side, or skips the sub-test.
+func spanStore(t *testing.T, s ext.Store) ext.SpanStore {
+	t.Helper()
+	ss, ok := s.(ext.SpanStore)
+	if !ok {
+		t.Skip("driver does not implement ext.SpanStore (optional)")
+	}
+	return ss
+}
+
+// Span builds a representative operation, exported so a driver's own tests can
+// reuse the shape the suite exercises.
+func Span(at time.Time, parent, name, kind string, ms float64) ext.Span {
+	return ext.Span{
+		Start: at, Service: "api", TraceID: "trace-1", SpanID: name + "-id",
+		ParentSpanID: parent, Name: name, Kind: kind, DurationMS: ms,
+		Attrs: map[string]string{"db.statement": "SELECT 1", "db.rows": "1"},
+		Route: "/api/**", Source: "test",
+	}
+}
+
+// Every driver must answer the same three questions about inner spans: what
+// ran inside this hop, where did the time go, and how much is stored.
+func testSpans(t *testing.T, open OpenFunc) {
+	ctx := context.Background()
+	s := open(t)
+	ss := spanStore(t, s)
+
+	base := time.Now().Add(-time.Minute)
+	batch := []ext.Span{
+		Span(base, "hop-1", "db.query", "db", 12),
+		Span(base.Add(20*time.Millisecond), "hop-1", "cache.get", "cache", 0.4),
+		Span(base.Add(30*time.Millisecond), "hop-2", "db.query", "db", 40),
+	}
+	// Distinct span ids: the fixture reuses names on purpose, because a
+	// breakdown groups by NAME and must still count requests apart.
+	batch[0].SpanID, batch[1].SpanID, batch[2].SpanID = "s1", "s2", "s3"
+	batch[2].Error = "deadlock detected"
+	if err := ss.SaveSpans(ctx, batch); err != nil {
+		t.Fatalf("save spans: %v", err)
+	}
+
+	if n, err := ss.CountSpans(ctx); err != nil || n != 3 {
+		t.Fatalf("count = %d (%v), want 3", n, err)
+	}
+
+	// The waterfall's query: what ran inside ONE hop.
+	inHop, total, err := ss.QuerySpans(ctx, ext.SpanFilter{ParentSpanID: "hop-1"})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if total != 2 || len(inHop) != 2 {
+		t.Fatalf("hop-1 has %d spans (total %d), want 2", len(inHop), total)
+	}
+	if !inHop[0].Start.Before(inHop[1].Start) {
+		t.Error("spans must come back oldest-first — a request's work is read in the order it happened")
+	}
+	if inHop[0].Attrs["db.statement"] != "SELECT 1" {
+		t.Errorf("attributes not round-tripped: %v", inHop[0].Attrs)
+	}
+
+	// Errors-only, which is how someone finds the failing operation.
+	failed, n, err := ss.QuerySpans(ctx, ext.SpanFilter{ErrorsOnly: true})
+	if err != nil {
+		t.Fatalf("query errors: %v", err)
+	}
+	if n != 1 || len(failed) != 1 || failed[0].Error == "" {
+		t.Errorf("errors-only returned %d spans (total %d)", len(failed), n)
+	}
+
+	// Slow-only. The point of a breakdown is usually the slow thing.
+	slow, _, err := ss.QuerySpans(ctx, ext.SpanFilter{MinDurationMS: 10})
+	if err != nil {
+		t.Fatalf("query slow: %v", err)
+	}
+	if len(slow) != 2 {
+		t.Errorf("min duration 10ms matched %d spans, want 2", len(slow))
+	}
+
+	// Kind filter, so a chart can ask for just the database work.
+	dbOnly, _, err := ss.QuerySpans(ctx, ext.SpanFilter{Kind: "db"})
+	if err != nil {
+		t.Fatalf("query kind: %v", err)
+	}
+	if len(dbOnly) != 2 {
+		t.Errorf("kind=db matched %d spans, want 2", len(dbOnly))
+	}
+
+	// The breakdown. Requests must be counted apart from Count, because
+	// Count/Requests is the per-request multiplier — the shape an N+1 makes,
+	// and invisible if only the total is reported.
+	rows, err := ss.SpanBreakdown(ctx, base.Add(-time.Hour), "", 10)
+	if err != nil {
+		t.Fatalf("breakdown: %v", err)
+	}
+	byName := map[string]ext.SpanBreakdown{}
+	for _, r := range rows {
+		byName[r.Name] = r
+	}
+	q := byName["db.query"]
+	if q.Count != 2 {
+		t.Errorf("db.query count = %d, want 2", q.Count)
+	}
+	if q.Requests != 2 {
+		t.Errorf("db.query requests = %d, want 2 (two different hops ran it)", q.Requests)
+	}
+	if q.Errors != 1 {
+		t.Errorf("db.query errors = %d, want 1", q.Errors)
+	}
+	if q.TotalMS < 51 || q.TotalMS > 53 {
+		t.Errorf("db.query total = %vms, want ~52", q.TotalMS)
+	}
+	if q.MaxMS < 39 || q.MaxMS > 41 {
+		t.Errorf("db.query max = %vms, want ~40", q.MaxMS)
+	}
+	// Drivers compute percentiles differently — ordered OFFSET,
+	// percentile_cont, quantileExact — so the assertion is a band.
+	if q.P95MS < 12 || q.P95MS > 41 {
+		t.Errorf("db.query p95 = %vms, want between the two samples", q.P95MS)
+	}
+
+	sum, err := ss.SpanStats(ctx, base.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if sum.Total != 3 || sum.Errors != 1 {
+		t.Errorf("stats: %+v", sum)
+	}
+	if sum.RequestsWithSpans != 2 {
+		t.Errorf("requests with spans = %d, want 2 — the denominator for "+
+			"'how much of my traffic can I break down'", sum.RequestsWithSpans)
+	}
+	if sum.ByKind["db"] != 2 || sum.ByKind["cache"] != 1 {
+		t.Errorf("by kind: %v", sum.ByKind)
+	}
+
+	// Retention, on the spans' own horizon. The cutoff sits between the first
+	// span and the second, so exactly one is expected to go — a cutoff past
+	// all three would pass with prune deleting everything.
+	if n, err := ss.PruneSpansBefore(ctx, base.Add(10*time.Millisecond)); err != nil {
+		t.Fatalf("prune: %v", err)
+	} else if n != 1 {
+		t.Errorf("pruned %d spans, want 1", n)
+	}
+	if n, _ := ss.CountSpans(ctx); n != 2 {
+		t.Errorf("%d spans left after pruning, want 2", n)
+	}
+}
+
+// Erasure has to take the spans with it. A tenant's requests deleted while the
+// statements those requests ran survive is not erasure — and a statement is a
+// likely place for the personal data to be sitting, because a driver that
+// interpolates its parameters puts it there without anyone deciding to.
+func testSpanErasure(t *testing.T, open OpenFunc) {
+	ctx := context.Background()
+	s := open(t)
+	ss := spanStore(t, s)
+
+	rec := Record(200, 5, "/api/orders", "acme")
+	rec.TraceID, rec.SpanID = "trace-erase", "hop-erase"
+	mustSave(t, s, rec)
+	other := Record(200, 5, "/api/orders", "globex")
+	other.TraceID, other.SpanID = "trace-keep", "hop-keep"
+	mustSave(t, s, other)
+
+	doomed := Span(time.Now(), "hop-erase", "db.query", "db", 5)
+	doomed.SpanID, doomed.TraceID = "erase-1", "trace-erase"
+	doomed.Attrs = map[string]string{"db.statement": "SELECT * FROM users WHERE email = 'a@b.com'"}
+	kept := Span(time.Now(), "hop-keep", "db.query", "db", 5)
+	kept.SpanID, kept.TraceID = "keep-1", "trace-keep"
+	if err := ss.SaveSpans(ctx, []ext.Span{doomed, kept}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	if _, err := s.Purge(ctx, "tenant", "acme", time.Time{}); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	left, _, err := ss.QuerySpans(ctx, ext.SpanFilter{})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(left) != 1 {
+		t.Fatalf("%d spans survived purge, want 1", len(left))
+	}
+	if left[0].TraceID != "trace-keep" {
+		t.Errorf("purge removed the wrong tenant's spans: %s", left[0].TraceID)
+	}
 }
 
 // traceStore returns the driver's trace side, or skips the sub-test.

@@ -34,6 +34,18 @@
     <!-- The OpticTrace servlet SDK. Installed to the local repository from
          ../../sdks/java with `mvn install`; it is not on Maven Central
          yet. -->
+    <!-- A real database, so the db spans below time an actual query rather
+         than a sleep. H2 in memory keeps the example one command to run. -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-jdbc</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.h2database</groupId>
+      <artifactId>h2</artifactId>
+      <scope>runtime</scope>
+    </dependency>
+
     <dependency>
       <groupId>io.github.dwarka-prasad</groupId>
       <artifactId>optictrace-servlet</artifactId>

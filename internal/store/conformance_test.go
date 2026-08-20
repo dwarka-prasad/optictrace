@@ -49,10 +49,10 @@ func drivers(t *testing.T) []driverFactory {
 				if err != nil {
 					t.Fatalf("open postgres: %v", err)
 				}
-				// Each test starts from clean tables. Both of them: the suite
-				// makes exact count assertions, and a leftover app log line
-				// fails an assertion about records for no obvious reason.
-				if _, err := s.db.Exec(`TRUNCATE logs, app_logs RESTART IDENTITY`); err != nil {
+				// Each test starts from clean tables. ALL of them: the suite
+				// makes exact count assertions, and a leftover app log line or
+				// span fails an assertion about records for no obvious reason.
+				if _, err := s.db.Exec(`TRUNCATE logs, app_logs, spans RESTART IDENTITY`); err != nil {
 					t.Fatalf("truncate: %v", err)
 				}
 				t.Cleanup(func() { s.Close() })
@@ -70,7 +70,7 @@ func drivers(t *testing.T) []driverFactory {
 				}
 				// Each test starts from clean tables. TRUNCATE is synchronous
 				// for MergeTree, unlike ALTER ... DELETE.
-				for _, tbl := range []string{"logs", "app_logs"} {
+				for _, tbl := range []string{"logs", "app_logs", "spans"} {
 					if _, err := s.db.Exec(`TRUNCATE TABLE IF EXISTS ` + tbl); err != nil {
 						t.Fatalf("truncate %s: %v", tbl, err)
 					}

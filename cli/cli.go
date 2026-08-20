@@ -60,6 +60,7 @@ import (
 	"github.com/dwarka-prasad/optictrace/internal/ruletest"
 	"github.com/dwarka-prasad/optictrace/internal/scaffold"
 	"github.com/dwarka-prasad/optictrace/internal/scan"
+	"github.com/dwarka-prasad/optictrace/internal/spans"
 	"github.com/dwarka-prasad/optictrace/internal/spec"
 	"github.com/dwarka-prasad/optictrace/internal/store"
 	"github.com/dwarka-prasad/optictrace/internal/suggest"
@@ -1004,6 +1005,9 @@ func run(configPath, uiDir, execCmd string) {
 		if al := cfg.Telemetry.AppLogs; al != nil && al.RetentionMaxAge > 0 {
 			asyncOpts = append(asyncOpts, store.WithAppLogMaxAge(al.RetentionMaxAge))
 		}
+		if sp := cfg.Telemetry.Spans; sp != nil && sp.RetentionMaxAge > 0 {
+			asyncOpts = append(asyncOpts, store.WithSpanMaxAge(sp.RetentionMaxAge))
+		}
 		writer = store.NewAsyncWriter(sqlStore, cfg.Telemetry.Store.QueueSize, logger, asyncOpts...)
 		logger.Info("payload store ready", "driver", cfg.Telemetry.Store.Driver)
 	}
@@ -1034,6 +1038,30 @@ func run(configPath, uiDir, execCmd string) {
 		} else {
 			logger.Warn("application logs are enabled but the store driver does not support them — "+
 				"lines will be refused",
+				"driver", cfg.Telemetry.Store.Driver)
+		}
+	}
+
+	// --- inner spans ------------------------------------------------------
+	// Same two independent conditions as app logs, reported the same way: the
+	// policy has to be on and the driver has to support it, and "your config
+	// is off" must not look like "your driver cannot do this".
+	spanGov, err := spans.New(cfg.Telemetry.Spans)
+	if err != nil {
+		logger.Error("invalid span policy", "error", err)
+		os.Exit(1)
+	}
+	var spanStore store.SpanStore
+	if spanGov.Enabled() {
+		if ss, ok := reader.(store.SpanStore); ok {
+			spanStore = ss
+			logger.Info("inner spans enabled",
+				"min_duration", cfg.Telemetry.Spans.MinDuration,
+				"max_per_request", cfg.Telemetry.Spans.MaxPerRequest,
+				"drop_orphans", cfg.Telemetry.Spans.DropOrphanSpans())
+		} else {
+			logger.Warn("inner spans are enabled but the store driver does not support them — "+
+				"spans will be refused",
 				"driver", cfg.Telemetry.Store.Driver)
 		}
 	}
@@ -1191,6 +1219,8 @@ func run(configPath, uiDir, execCmd string) {
 			Detectors:       scanDetectors(cfg, logger),
 			AppLogs:         appLogs,
 			AppLogStore:     appLogStore,
+			Spans:           spanGov,
+			SpanStore:       spanStore,
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}

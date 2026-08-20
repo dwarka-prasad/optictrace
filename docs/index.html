@@ -364,14 +364,16 @@
     <div class="shots">
       <figure class="shot-item">
         <img class="shot" src="assets/dashboard-traces.png" loading="lazy"
-             alt="Traces page with a failed checkout open: a waterfall of three hops on one timeline — the order returning 502 across the full 66ms, a 1.8ms catalog read near the start, and a 44.8ms payment charge that failed — each with the log lines it wrote, including a debug line whose card number reads [REDACTED] and an error naming the unreachable acquirer.">
+             alt="Traces page with a checkout open: a waterfall on one shared timeline showing the order hop, the four database queries, the insert with an index refresh nested inside it, and a cache lookup under the catalog hop — each operation with its statement, and the customer email inside an interpolated INSERT shown as REDACTED.">
         <figcaption>
-          <h3>Traces</h3>
+          <h3>Traces, down to the query</h3>
           One row per request, however many services it touched — then a waterfall on a
-          shared timeline. Offsets matter as much as widths: this checkout&rsquo;s two
-          inner calls ran one after the other, so the payment leg owns the wall clock.
-          The lines each hop logged sit underneath it, filed by span rather than matched
-          by timestamp.
+          shared timeline: every hop, <strong>every operation inside each hop</strong>, and
+          the log lines each wrote. Four identical <code>db.query stock</code> calls in one
+          request is an N+1 you can see. The <code>self</code> figure separates a
+          hop&rsquo;s own code from the work it delegated, and the interpolated
+          <code>INSERT</code> shows a customer email stored <code>[REDACTED]</code> —
+          span attributes are governed before storage, exactly like a log line.
         </figcaption>
       </figure>
 
@@ -522,6 +524,17 @@ storefront  POST /api/v1/orders            200  span=83c03ddd parent=-
         with each hop&rsquo;s log lines under it — so a request made of two 40ms calls
         reads as either nearly optimal or 40ms of avoidable waiting, which is a
         distinction a list of durations cannot make.
+      </p>
+      <p>
+        <strong>And inside one hop.</strong> A hop tells you a request took 300ms; it does
+        not tell you that 280 of them were one query. Name an operation — a query, a cache
+        lookup, a call out — and it appears on the same timeline, nested under the hop that
+        ran it. Two things separate this from any other tracing library: the
+        <strong>attributes are governed</strong>, so a statement that quotes its parameters
+        is redacted before storage rather than cleaned up afterwards; and the breakdown
+        reports <em>count</em> and <em>requests</em> apart, so the per-request multiplier
+        is visible — four thousand calls to one query reads as busy traffic until you know
+        it was a hundred requests.
       </p>
       <p>
         That <code>[debug]</code> line is a service logging its own card number while

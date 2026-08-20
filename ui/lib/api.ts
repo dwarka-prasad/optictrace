@@ -443,3 +443,85 @@ export function bucketMillis(bucket: string): number {
   const n = Number(m[1]);
   return n * { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[m[2] as 'ms' | 's' | 'm' | 'h'];
 }
+
+/** One operation inside a request: a query, a cache lookup, an outbound call.
+ *
+ *  `start` is when the operation BEGAN — deliberately a different field name
+ *  from a record's `time`, which is when an exchange FINISHED. The two cannot
+ *  be reconciled, so they are not named alike. */
+export interface InnerSpan {
+  id: number;
+  start: string;
+  service: string;
+  trace_id: string;
+  span_id: string;
+  parent_span_id: string;
+  name: string;
+  kind?: string;
+  duration_ms: number;
+  error?: string;
+  attrs?: Record<string, string>;
+  source?: string;
+  truncated?: boolean;
+}
+
+/** Operations inside one trace, oldest first.
+ *
+ *  Answers 501 when the feature is off or the driver cannot persist spans;
+ *  that is not an error worth a banner, so the caller gets a flag. */
+export async function fetchInnerSpans(
+  traceId: string,
+  limit = 500,
+): Promise<{ spans: InnerSpan[]; supported: boolean }> {
+  if (!traceId) return { spans: [], supported: true };
+  const res = await fetch(
+    `${API_BASE}/api/spans?trace=${encodeURIComponent(traceId)}&limit=${limit}`,
+    { cache: 'no-store' },
+  );
+  if (res.status === 501 || res.status === 404) return { spans: [], supported: false };
+  if (!res.ok) throw new Error(`spans: ${res.status}`);
+  const body = (await res.json()) as { spans: InnerSpan[] | null };
+  return { spans: body.spans ?? [], supported: true };
+}
+
+/** Where a window's time actually went, grouped by operation. */
+export interface SpanBreakdownRow {
+  name: string;
+  kind?: string;
+  /** Times it ran across the window. */
+  count: number;
+  /** Distinct requests that ran it — count/requests is the per-request
+   *  multiplier, and a multiplier of 40 on one named query is what an N+1
+   *  looks like from the outside. */
+  requests: number;
+  errors: number;
+  total_ms: number;
+  avg_ms: number;
+  p95_ms: number;
+  max_ms: number;
+}
+
+export async function fetchSpanBreakdown(
+  window: string,
+  route?: string,
+  limit = 20,
+): Promise<{ breakdown: SpanBreakdownRow[]; supported: boolean }> {
+  const params = new URLSearchParams({ window, limit: String(limit) });
+  if (route) params.set('route', route);
+  const res = await fetch(`${API_BASE}/api/spans/breakdown?${params}`, { cache: 'no-store' });
+  if (res.status === 501 || res.status === 404) return { breakdown: [], supported: false };
+  if (!res.ok) throw new Error(`breakdown: ${res.status}`);
+  const body = (await res.json()) as { breakdown: SpanBreakdownRow[] | null };
+  return { breakdown: body.breakdown ?? [], supported: true };
+}
+
+export interface SpanSummary {
+  total: number;
+  by_kind: Record<string, number>;
+  by_service: Record<string, number>;
+  requests_with_spans: number;
+  errors: number;
+}
+
+export const fetchSpanStats = (window: string) =>
+  get<SpanSummary>(`/api/spans/stats?window=${window}`);

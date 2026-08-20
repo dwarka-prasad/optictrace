@@ -14,10 +14,16 @@ public class CatalogController {
 
     private static final Logger log = Logger.getLogger("com.example.shop.catalog");
 
+    private final ProductRepository products;
+
+    public CatalogController(ProductRepository products) {
+        this.products = products;
+    }
+
     @GetMapping("/api/v1/catalog/{sku}")
     public ResponseEntity<?> product(@PathVariable String sku) throws InterruptedException {
         log.fine("catalog lookup for " + sku);
-        Model.Product p = Model.catalog().get(sku);
+        Model.Product p = products.find(sku).orElse(null);
         if (p == null) {
             // An error worth keeping even on a sampled route — that is what
             // keep_errors is for.

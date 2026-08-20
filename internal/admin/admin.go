@@ -40,6 +40,7 @@ import (
 	"github.com/dwarka-prasad/optictrace/internal/export"
 	"github.com/dwarka-prasad/optictrace/internal/metrics"
 	"github.com/dwarka-prasad/optictrace/internal/scan"
+	"github.com/dwarka-prasad/optictrace/internal/spans"
 	"github.com/dwarka-prasad/optictrace/internal/spec"
 	"github.com/dwarka-prasad/optictrace/internal/store"
 )
@@ -56,12 +57,17 @@ type Server struct {
 	// it is a valid driver, so this may be nil while Reader is not.
 	AppLogs     *applog.Governor
 	AppLogStore store.AppLogStore
-	Writer      *store.AsyncWriter // ingest path
-	Dispatcher  *export.Dispatcher // output plugins (may be nil)
-	ConfigPath  string
-	Reload      func() error // hot-reload hook installed by main
-	UIDir       string       // static dashboard directory (optional)
-	Version     string
+	// Spans governs inner spans — the queries, cache lookups and outbound
+	// calls made while serving a request. SpanStore is the optional store
+	// side, so this may be nil while Reader is not.
+	Spans      *spans.Governor
+	SpanStore  store.SpanStore
+	Writer     *store.AsyncWriter // ingest path
+	Dispatcher *export.Dispatcher // output plugins (may be nil)
+	ConfigPath string
+	Reload     func() error // hot-reload hook installed by main
+	UIDir      string       // static dashboard directory (optional)
+	Version    string
 	// AuthToken protects every endpoint when non-empty. HealthOpen keeps
 	// /healthz reachable for orchestrator probes.
 	AuthToken  string
@@ -155,6 +161,17 @@ func (s *Server) Handler() http.Handler {
 	// Counts only — no message text — so it sits behind the stats grant
 	// rather than the payload one.
 	routeFunc("GET /api/applogs/stats", ext.CapReadStats, s.appLogStats)
+	// Inner spans. Ingest is machine-to-machine, so it shares CapIngest.
+	// Reading them returns attributes — a statement, a cache key, an outbound
+	// URL — which is application payload by any reasonable reading, so it sits
+	// behind the payload grant rather than the stats one.
+	routeFunc("POST /api/spans/ingest", ext.CapIngest, s.ingestSpans)
+	routeFunc("GET /api/spans", ext.CapReadPayload, s.querySpans)
+	// Counts and timings only — no attribute text — so these sit behind the
+	// stats grant. The breakdown names operations, which is the same class of
+	// information as a route name.
+	routeFunc("GET /api/spans/stats", ext.CapReadStats, s.spanStats)
+	routeFunc("GET /api/spans/breakdown", ext.CapReadStats, s.spanBreakdown)
 	routeFunc("/", ext.CapUI, s.ui)
 
 	// Routes contributed by extensions — a login callback, a role API, an
@@ -1160,6 +1177,154 @@ func (s *Server) traces(w http.ResponseWriter, r *http.Request) {
 		traces = []store.TraceSummary{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"traces": traces, "total": total})
+}
+
+// ingestSpans accepts one span or a batch of them.
+//
+// Governance runs here, before the store sees anything: attributes are
+// redacted and capped on the way in, not cleaned up later — "later" is after
+// the data is at rest. Every drop is counted with its reason, because a span
+// discarded silently is one nobody knows they are missing.
+func (s *Server) ingestSpans(w http.ResponseWriter, r *http.Request) {
+	if s.Spans == nil || !s.Spans.Enabled() {
+		httpError(w, http.StatusNotImplemented,
+			"inner spans are not enabled — set telemetry.spans.enabled")
+		return
+	}
+	if s.SpanStore == nil {
+		httpError(w, http.StatusNotImplemented,
+			"inner spans are enabled but this store driver cannot persist them")
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	if err != nil {
+		httpError(w, http.StatusBadRequest, "read body: "+err.Error())
+		return
+	}
+	var batch []store.Span
+	trimmed := bytes.TrimLeft(body, " \t\r\n")
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		if err := json.Unmarshal(body, &batch); err != nil {
+			httpError(w, http.StatusBadRequest, "invalid span batch: "+err.Error())
+			return
+		}
+	} else {
+		var one store.Span
+		if err := json.Unmarshal(body, &one); err != nil {
+			httpError(w, http.StatusBadRequest, "invalid span: "+err.Error())
+			return
+		}
+		batch = []store.Span{one}
+	}
+
+	kept := make([]store.Span, 0, len(batch))
+	drops := map[string]int{}
+	for i := range batch {
+		sp := &batch[i]
+		if sp.Start.IsZero() {
+			sp.Start = time.Now()
+		}
+		if sp.Source == "" {
+			sp.Source = "ingest"
+		}
+		if ok, why := s.Spans.Admit(sp); ok {
+			kept = append(kept, *sp)
+		} else {
+			drops[string(why)]++
+		}
+	}
+	if len(kept) > 0 {
+		if err := s.SpanStore.SaveSpans(r.Context(), kept); err != nil {
+			httpError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	if s.Collector != nil {
+		s.Collector.SpansStored(len(kept))
+		for why, n := range drops {
+			s.Collector.SpansDropped(why, n)
+		}
+		for i := range kept {
+			s.Collector.SpanObserved(kept[i].Name, kept[i].Kind, kept[i].Service,
+				kept[i].DurationMS/1000)
+		}
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"stored": len(kept), "dropped": len(batch) - len(kept), "reasons": drops,
+	})
+}
+
+func (s *Server) querySpans(w http.ResponseWriter, r *http.Request) {
+	if s.SpanStore == nil {
+		httpError(w, http.StatusNotImplemented, "inner spans are not configured")
+		return
+	}
+	q := r.URL.Query()
+	f := store.SpanFilter{
+		TraceID:      q.Get("trace"),
+		SpanID:       q.Get("span"),
+		ParentSpanID: q.Get("parent"),
+		Service:      q.Get("service"),
+		Kind:         q.Get("kind"),
+		Search:       q.Get("q"),
+		ErrorsOnly:   q.Get("errors") == "1" || q.Get("errors") == "true",
+	}
+	f.MinDurationMS, _ = strconv.ParseFloat(q.Get("min_ms"), 64)
+	f.Limit, _ = strconv.Atoi(q.Get("limit"))
+	f.Offset, _ = strconv.Atoi(q.Get("offset"))
+	if f.Limit <= 0 || f.Limit > 2000 {
+		f.Limit = 500
+	}
+	if window := q.Get("window"); window != "" {
+		f.Since = time.Now().Add(-parseDurationDefault(window, time.Hour))
+	}
+	list, total, err := s.SpanStore.QuerySpans(r.Context(), f)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if list == nil {
+		list = []store.Span{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"spans": list, "total": total})
+}
+
+func (s *Server) spanStats(w http.ResponseWriter, r *http.Request) {
+	if s.SpanStore == nil {
+		// Not an error: spans are optional, and a dashboard asking about a
+		// feature nobody turned on should render an empty panel, not a banner.
+		writeJSON(w, http.StatusOK, &store.SpanSummary{
+			ByKind: map[string]int64{}, ByService: map[string]int64{},
+		})
+		return
+	}
+	window := parseDurationDefault(r.URL.Query().Get("window"), time.Hour)
+	sum, err := s.SpanStore.SpanStats(r.Context(), time.Now().Add(-window))
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, sum)
+}
+
+// spanBreakdown answers "where did this route's time go".
+func (s *Server) spanBreakdown(w http.ResponseWriter, r *http.Request) {
+	if s.SpanStore == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"breakdown": []store.SpanBreakdown{}})
+		return
+	}
+	q := r.URL.Query()
+	window := parseDurationDefault(q.Get("window"), time.Hour)
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	rows, err := s.SpanStore.SpanBreakdown(r.Context(), time.Now().Add(-window), q.Get("route"), limit)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if rows == nil {
+		rows = []store.SpanBreakdown{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"breakdown": rows, "route": q.Get("route")})
 }
 
 // analysisRows is the row bound for the analysis endpoints, resolved. App logs
