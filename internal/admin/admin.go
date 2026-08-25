@@ -574,13 +574,17 @@ func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 	// Streamed, not materialised: these are full records including bodies,
 	// and this endpoint is reachable without a token in the default posture.
 	sc := scan.NewScannerWith(since, s.Detectors)
-	if err := s.Reader.RecentFunc(r.Context(), since, s.AnalysisMaxRows, func(rec *store.Record) error {
+	limit := s.analysisRows()
+	var recordsRead int
+	if err := s.Reader.RecentFunc(r.Context(), since, limit, func(rec *store.Record) error {
 		sc.Add(rec)
+		recordsRead++
 		return nil
 	}); err != nil {
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	truncated := limit > 0 && recordsRead >= limit
 	// Application logs are the other half of the surface, and the riskier one:
 	// a payload is structured and can be masked by path, a log line is free
 	// text. Scanning records but not lines would look where the data is
@@ -645,6 +649,9 @@ func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 		"high":              high,
 		"medium":            med,
 		"findings":          report.Findings,
+		// True when the analysis row cap stopped the scan early (same as CLI warning).
+		"truncated":        truncated,
+		"analysis_max_rows": limit,
 	})
 }
 
@@ -666,7 +673,7 @@ func (s *Server) inferSpec(w http.ResponseWriter, r *http.Request) {
 	// Streamed for the same reason as /api/scan.
 	inf := spec.NewInferrer(service)
 	seen := 0
-	if err := s.Reader.RecentFunc(r.Context(), time.Now().Add(-window), s.AnalysisMaxRows,
+	if err := s.Reader.RecentFunc(r.Context(), time.Now().Add(-window), s.analysisRows(),
 		func(rec *store.Record) error {
 			seen++
 			inf.Add(rec)
