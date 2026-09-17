@@ -650,7 +650,7 @@ func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 		"medium":            med,
 		"findings":          report.Findings,
 		// True when the analysis row cap stopped the scan early (same as CLI warning).
-		"truncated":        truncated,
+		"truncated":         truncated,
 		"analysis_max_rows": limit,
 	})
 }
